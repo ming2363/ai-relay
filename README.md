@@ -7,6 +7,8 @@
 ![Node.js 18+](https://img.shields.io/badge/node-18%2B-339933)
 ![Official CLIs](https://img.shields.io/badge/made%20with-official%20CLIs-111111)
 
+<p align="center"><img src="docs/images/hero.png" alt="Claude leads Codex, Antigravity, and Grok" width="100%"></p>
+
 Claude leads a team made of the AI memberships you already pay for. It scores each task on quality and remaining quota, then gives the work to the model that fits. Codex, Antigravity, and Grok run through their own official CLIs. No API key, and no proxy.
 
 ## ✨ Highlights
@@ -20,6 +22,8 @@ Claude leads a team made of the AI memberships you already pay for. It scores ea
 ## 🧠 How it works
 
 You talk to Claude. In auto mode Claude is the lead and the other models are workers. A worker never sees this chat. `relay` builds a brief, picks a model, and runs that vendor's official CLI. Claude checks the result and records a verdict. The verdict changes that model's reliability score next time.
+
+<p align="center"><img src="docs/images/flow-en.gif" alt="A brief leaves Claude, the five weights grow, and the top worker returns a verified result" width="100%"></p>
 
 ```mermaid
 flowchart TD
@@ -35,6 +39,8 @@ flowchart TD
 ```
 
 The score is a weighted geometric mean of five terms. One weak term pulls the total down. With the default weights, fit and reliability outweigh a merely fuller quota, as long as the worker is still above the 15% floor.
+
+<p align="center"><img src="docs/images/scoring.gif" alt="Codex 0.955 beats Grok 0.923 after fit, reliability, quota, speed, and load" width="100%"></p>
 
 ```mermaid
 pie showData
@@ -108,7 +114,23 @@ Seven roles:
 
 A usual feature path is `read`, then `implement`, then a `review` from another vendor. Claude checks each step and records `relay verdict`.
 
-When Claude's own 5-hour window drops below `claudeConserveBelow` (default 20%), the lead only splits and reviews, and dispatches the execution. The injected hint also tells the lead to suggest `/codex:transfer` below 5%.
+Auto mode also watches how much of Claude's own quota is left, and narrows what the lead executes. See [Claude-aware throttling](#claude-aware-throttling).
+
+### Claude-aware throttling
+
+In auto mode, relay takes the minimum remaining ratio across Claude's pools and windows. That ratio picks a gear. A gear changes how much the lead executes. The acceptance standard stays the same.
+
+| Gear | When | What the lead does |
+|---|---|---|
+| Normal | At least 50% left, or the quota is unknown | The usual split: big chunks go out, small edits and short answers stay |
+| Throttle | Below 50%, and still at least 20% | The lead keeps to the request, the split, the brief, the check, and the report. Reading more than two files, debugging, implementation, review, and any question that needs the code are dispatched. Reading and short answers go to the worker with the most quota left. Briefs and reports stay short |
+| Conserve | Below 20% | Reading code, debugging, implementation, review, and fixes are dispatched whenever a worker can take them. The lead keeps the split, writes a clear brief, and checks strictly. The report stays short, and the conclusion stays complete. Below 5%, the lead suggests `/codex:transfer` |
+
+**Quality floor, in every gear.** The lead personally checks acceptance and spot-checks the conclusions that matter. Work that no worker is good at, or that needs this conversation to judge, stays with the lead. A result that misses the acceptance checks is sent back or finished by the lead.
+
+While throttling or conserving, a turn in which the lead reads files more than 8 times (`selfReadMax`, default 8, including search) gets a reminder to dispatch the rest of the reading and debugging with `relay pick read`, and to read what the workers found.
+
+`claudeThrottleBelow` defaults to `0.5`. `claudeConserveBelow` defaults to `0.2`. Both are set in `providers.json`.
 
 ### Routing
 
@@ -282,14 +304,14 @@ Per provider, `fullAccessEnabled` overrides `workerFullAccess`, and `caps` decla
 | Field | Default | What it does |
 |---|---|---|
 | `routes` | See the plugin default | Ordered candidates per role, shaped `provider:pool:model` or with a 4th fit segment |
-| `scoreWeights` | 3 / 3 / 1 / 0.5 / 0.5 | Weights of the geometric mean: fit, reliability, quota, speed, load |
+| `scoreWeights` | 3 / 3 / 0.25 / 0.5 / 0.5 | Weights of the geometric mean: fit, reliability, quota, speed, load |
 | `minRemaining` | `0.15` | Remaining quota below this skips the worker |
 | `lowRemaining` | `0.3` | Below this, the quota term is multiplied by 0.7. The worker can still be picked |
 | `selfEditMaxLines` | `40` | If the lead writes more than this many lines in one turn, a hook reminds it to consider dispatching. The conversation page shows the count. The edit is not blocked |
 | `fullAccessEnabled` | Follows `workerFullAccess` (`true`) | Per-worker switch. On: agy adds `--dangerously-skip-permissions`, Grok adds `--always-approve`. Off: that worker cannot run commands. Codex ignores it and stays in the official sandbox |
 | `caps` | Per provider | Base `web` and `exec` before the full-access switch. `## 需要的能力` filters on the effective capability |
 
-Related knobs in the same file: `claudeConserveBelow` (default `0.2`) and `staleMinutes` (default `15`). A quota reading older than that is marked stale. `quotaDb` points at an optional AIQuota5h database.
+Related knobs in the same file: `claudeThrottleBelow` (default `0.5`), `claudeConserveBelow` (default `0.2`), `selfReadMax` (default `8`), and `staleMinutes` (default `15`). A quota reading older than that is marked stale. `quotaDb` points at an optional AIQuota5h database.
 
 ## ➕ Adding a new provider
 
@@ -369,6 +391,10 @@ A read-only dispatch does not get a write mode. A writable dispatch has to name 
 
 From each product, on this machine. Claude reads the current session. Codex reads local session records. agy runs `/usage`. Grok calls the grok.com billing API with the CLI login token, in memory only. AIQuota5h is optional and fills a window the built-in reader missed. A provider you add yourself shows unknown quota until a reader exists. Refresh from the panel, or run `relay quota`.
 
+**Why does `relay run auto` stop when Codex is the first choice?**
+
+Codex is not started by `relay run`. It goes through the official Codex plugin, so the lead hands over the brief with the Agent tool and `subagent_type` set to `codex:codex-rescue`. When `relay run auto` ranks Codex first, it stops and prints that instruction. The next worker is used only if you pass `--skip-codex`. A write target outside the current project skips Codex on its own, because the sandbox cannot write there.
+
 ## 🤝 Contributing
 
 Issues and pull requests are welcome.
@@ -386,6 +412,12 @@ Core tests:
 
 ```bash
 node --test plugins/ai-relay/scripts/score.test.mjs plugins/ai-relay/scripts/quota.test.mjs
+```
+
+The GIFs in this README are generated with:
+
+```bash
+python3 docs/scripts/make_gifs.py
 ```
 
 The orchestration rules live in `plugins/ai-relay/skills/orchestrate/SKILL.md`. Keep the README in line with that file and with `config/providers.default.json` when a weight, a command, or a retention period changes.

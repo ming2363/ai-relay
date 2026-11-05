@@ -7,6 +7,8 @@
 ![Node.js 18+](https://img.shields.io/badge/node-18%2B-339933)
 ![官方 CLI](https://img.shields.io/badge/made%20with-official%20CLIs-111111)
 
+<p align="center"><img src="docs/images/hero.png" alt="Claude 主管带领 Codex、Antigravity 和 Grok" width="100%"></p>
+
 把你已经付费的 AI 会员组成一支团队。你在模型菜单里选的 Claude 当主管，按质量和剩余额度把任务分给最合适的模型。Codex、Antigravity 和 Grok 走各自的官方命令行，不需要 API key，也不经过中转。
 
 ## ✨ 亮点
@@ -20,6 +22,8 @@
 ## 🧠 工作原理
 
 你只和 Claude 对话。自动模式下，Claude 是主管，其他模型是员工。员工看不到这段对话。`relay` 负责组装派单、打分，并调用那家的官方 CLI。Claude 验收结果，记下结论。这个结论会改变该模型下一次的可靠度。
+
+<p align="center"><img src="docs/images/flow-zh.gif" alt="派单从主管飞出，五项权重长出后，得分最高的员工把结果送回验收" width="100%"></p>
 
 ```mermaid
 flowchart TD
@@ -35,6 +39,8 @@ flowchart TD
 ```
 
 分数是五项的加权几何平均。某一项差，总分会被拉下来。默认权重下，只要额度还在 15% 以上，更擅长、更可靠的模型不会输给一个只是额度更满的模型。
+
+<p align="center"><img src="docs/images/scoring.gif" alt="五项加权之后 Codex 0.955，Grok 0.923，Codex 胜出" width="100%"></p>
 
 ```mermaid
 pie showData
@@ -108,7 +114,23 @@ Codex 插件的启停要新会话才完全生效。当前会话里，钩子会�
 
 常见的功能路径是 `read`，然后 `implement`，再换一家厂商做 `review`。主管逐步验收，并用 `relay verdict` 记下结论。
 
-Claude 自己的 5 小时额度低于 `claudeConserveBelow`（默认 20%）时，主管只做拆解和审核，执行全部外派。注入的提示还会要求：低于 5% 时建议你使用 `/codex:transfer`。
+自动模式还会看 Claude 自己还剩多少额度，并收紧主管亲自执行的范围。规则见[按 Claude 额度节流](#按-claude-额度节流)。
+
+### 按 Claude 额度节流
+
+自动模式下，relay 取 Claude 各额度池、各窗口剩余比例的最小值，用来分档。分档只改变主管亲自做多少，验收标准不动。
+
+| 档 | 何时 | 主管怎么做 |
+|---|---|---|
+| 正常 | 剩余不低于 50%，或额度未知 | 仍按平时的倾向：成块的活外派，小改动和短问答自己做 |
+| 节流 | 低于 50%，且仍不低于 20% | 主管留下理解需求、拆任务、写派单、验收和汇报。读代码超过 2 个文件、排查、实现、审查，以及要看代码才能回答的问题，都外派。阅读和短问答派给额度最充足的员工。派单和汇报写短 |
+| 省 Claude | 低于 20% | 读代码、排查、实现、审查和修补，只要有员工能做就外派。主管留下拆解、写清派单和严格验收。汇报写短，结论写全。低于 5% 时建议使用 `/codex:transfer` |
+
+**质量底线，每一档都一样。** 验收和关键结论的抽查由主管亲自做。员工都不擅长，或者要靠这段对话才能判断的活，主管自己做。对不上验收标准的结果退回重派，或由主管补上。
+
+节流或省 Claude 时，主管这一轮读文件超过 8 次（`selfReadMax`，默认 8，含搜索），钩子会提醒把剩下的阅读和排查外派（`relay pick read`），主管改看员工的结论。
+
+`claudeThrottleBelow` 默认 `0.5`，`claudeConserveBelow` 默认 `0.2`，都在 `providers.json` 里。
 
 ### 路由
 
@@ -282,14 +304,14 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/relay.mjs" status
 | 字段 | 默认 | 作用 |
 |---|---|---|
 | `routes` | 见插件默认配置 | 每个角色的候选人顺序，格式是 `厂商:额度池:模型`，也可以再加第 4 段擅长度 |
-| `scoreWeights` | 3 / 3 / 1 / 0.5 / 0.5 | 几何平均的权重：擅长度、可靠度、额度、速度、负载 |
+| `scoreWeights` | 3 / 3 / 0.25 / 0.5 / 0.5 | 几何平均的权重：擅长度、可靠度、额度、速度、负载 |
 | `minRemaining` | `0.15` | 剩余额度低于这个比例就跳过 |
 | `lowRemaining` | `0.3` | 低于这个比例时，额度项乘以 0.7。这个员工仍可能被选中 |
 | `selfEditMaxLines` | `40` | 主管一轮里亲手写的行数超过这个数，钩子会提醒考虑外派。对话页会显示这个数。改动本身不会被拦住 |
 | `fullAccessEnabled` | 跟随 `workerFullAccess`（`true`） | 单家开关。打开时，agy 加上 `--dangerously-skip-permissions`，Grok 加上 `--always-approve`。关掉后，这家不能执行命令。Codex 不受这个开关影响，始终留在官方沙箱里 |
 | `caps` | 按厂商 | 最高权限生效前的 `web` 和 `exec`。`## 需要的能力` 按生效后的能力过滤 |
 
-同一个文件里还有 `claudeConserveBelow`（默认 `0.2`）和 `staleMinutes`（默认 `15`）。额度读数老于这个分钟数会标成过期。`quotaDb` 指向可选的 AIQuota5h 数据库。
+同一个文件里还有 `claudeThrottleBelow`（默认 `0.5`）、`claudeConserveBelow`（默认 `0.2`）、`selfReadMax`（默认 `8`）和 `staleMinutes`（默认 `15`）。额度读数老于这个分钟数会标成过期。`quotaDb` 指向可选的 AIQuota5h 数据库。
 
 ## ➕ 添加新厂商
 
@@ -369,6 +391,10 @@ Codex 由官方插件固定在沙箱里，只能写当前项目。目录在项�
 
 从各家产品在本机读取。Claude 读当前会话，Codex 读本地会话记录，agy 跑 `/usage`，Grok 用 CLI 登录令牌在内存里查 grok.com 计费接口。AIQuota5h 是可选备用，只补自查缺了的窗口。你后来加的厂商，在接上读取方式之前显示额度未知。在面板里刷新，或运行 `relay quota`。
 
+**为什么 Codex 首选时 `relay run auto` 会停下？**
+
+Codex 不由 `relay run` 启动，而是走官方 Codex 插件。主管要用 Agent 工具把派单交给它，`subagent_type` 设为 `codex:codex-rescue`。`relay run auto` 算出首选是 Codex 时会停下来并打印这段提示。确有理由不用 Codex 时，加上 `--skip-codex`，才会改派第二名。要写的目录在当前项目以外时，Codex 受沙箱限制写不进去，挑选时会被自动跳过。
+
 ## 🤝 参与贡献
 
 欢迎提 issue 和 pull request。
@@ -386,6 +412,12 @@ plugins/ai-relay-status/     底栏按钮和侧边面板，hooks/register.tsx
 
 ```bash
 node --test plugins/ai-relay/scripts/score.test.mjs plugins/ai-relay/scripts/quota.test.mjs
+```
+
+README 里的动图由下面的脚本生成：
+
+```bash
+python3 docs/scripts/make_gifs.py
 ```
 
 编排规则在 `plugins/ai-relay/skills/orchestrate/SKILL.md`。权重、命令或保留天数有变化时，请同时改这份 README 和 `config/providers.default.json`。
