@@ -346,7 +346,16 @@ function cmdRun(opts) {
   let reason = "";
 
   if (!provName || provName === "auto") {
-    const r = route(cfg, rows, role, undefined, { needs });
+    // 可写任务按目标目录判断沙箱：Codex 写不到项目外的目录时自动跳过
+    const target = path.resolve(opts.cwd || process.cwd());
+    const workspace = workspaceRoot(process.env.CLAUDE_PROJECT_DIR || process.cwd());
+    const r = route(cfg, rows, role, undefined, { needs, write: !!opts.write, target, workspace });
+    // 首选是 Codex 时不悄悄改派：Codex 要走 Agent 工具（官方插件），交给主管去派
+    if (!opts.model && !opts.skipCodex && r.choice?.via === "codex-plugin") {
+      recordPick(role, r);
+      console.error(`首选是 Codex（${r.choice.reason}）。请用 Agent 工具 subagent_type=codex:codex-rescue 把这张派单交给它；确有理由不用 Codex 时，加 --skip-codex 改派第二名。`);
+      process.exit(3);
+    }
     // 只考虑能由 ai-relay 直接调用的候选
     const c = [r.choice, ...r.alternatives].find((x) => x && x.via === "relay" && (!opts.model || x.model === opts.model));
     if (!c) {
@@ -361,7 +370,7 @@ function cmdRun(opts) {
     provName = c.provider;
     model = c.model;
     pool = c.pool;
-    reason = c === r.choice ? pickReason(r) : opts.model ? `指定模型 ${opts.model}；${c.reason}` : `首选 ${r.choice.provider} 需走 Codex 插件，改用 ${c.provider}；${c.reason}`;
+    reason = c === r.choice ? pickReason(r) : opts.model ? `指定模型 ${opts.model}；${c.reason}` : `主管选择跳过 ${r.choice.provider}（--skip-codex），改用 ${c.provider}；${c.reason}`;
   }
 
   const prov = cfg.providers[provName];
@@ -806,6 +815,7 @@ function help() {
   run <厂商名|auto> --role r [--model m] [--write] [--scope 路径1,路径2] [--background] [--cwd 目录] [--with id1,id2] [--diff] [--force] [--needs web,exec] [-- 派单]
                                   调用官方 CLI 执行任务；派单走标准输入或 --prompt-file，必须含「目标」「验收标准」
                                   自动附上项目上下文和共享背景；--with 附前序结果，--diff 附当前改动
+                                  auto 的首选是 Codex 时会停下，提示用 Agent 工具交给 Codex；加 --skip-codex 才改派第二名
                                   可写任务按写入范围并行，范围重叠会被拒绝
                                   --needs 指定所需能力（web 联网，exec 执行命令）；省略时从派单「需要的能力」读取。点名厂商若缺少能力会拒绝
   brief [--context --cwd 目录]     派单模板；--context 预览会自动附上的项目上下文和共享背景

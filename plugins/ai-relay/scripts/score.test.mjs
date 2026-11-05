@@ -74,7 +74,7 @@ test("2. 两个候选 fit 不同但额度相同时，靠前的胜出", () => {
   assert.ok(res.choice.score > res.alternatives[0].score);
 });
 
-test("3. 快重置的额度更多的候选能反超靠前候选", () => {
+test("3. 默认权重下额度不能反超更擅长的候选；调高额度权重后才会反超", () => {
   const cfg = {
     minRemaining: 0.15,
     lowRemaining: 0.3,
@@ -97,10 +97,15 @@ test("3. 快重置的额度更多的候选能反超靠前候选", () => {
     { provider: "antigravity", pool_id: "gemini", window_key: "5h", remaining_fraction: 1.0, reset_at: now + 1800000, allowance: "available", updated_at: now },
   ];
 
+  // 默认权重（额度 0.25，最低）：更擅长的 codex 保持第一
   const res = scoreRoute(cfg, rows, "implement", { now });
-  assert.equal(res.choice?.provider, "agy");
-  assert.equal(res.alternatives[0]?.provider, "codex");
-  assert.ok(res.choice.score > res.alternatives[0].score);
+  assert.equal(res.choice?.provider, "codex");
+  assert.equal(res.alternatives[0]?.provider, "agy");
+
+  // 用户把额度权重调高（例如 3）时，快重置且额度满的 agy 反超
+  const res2 = scoreRoute({ ...cfg, scoreWeights: { quota: 3 } }, rows, "implement", { now });
+  assert.equal(res2.choice?.provider, "agy");
+  assert.ok(res2.choice.score > res2.alternatives[0].score);
 });
 
 test("4. history 里有 verdict fail 的候选可靠度下降", () => {

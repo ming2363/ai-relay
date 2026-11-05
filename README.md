@@ -41,7 +41,7 @@ pie showData
     title Score weights
     "Fit 3" : 3
     "Reliability 3" : 3
-    "Quota 1" : 1
+    "Quota 0.25" : 0.25
     "Speed 0.5" : 0.5
     "Load 0.5" : 0.5
 ```
@@ -118,7 +118,7 @@ When Claude's own 5-hour window drops below `claudeConserveBelow` (default 20%),
 |---|---|---|
 | Fit | 3 | Earlier in the route list scores higher: 1.0, then −0.15 per step, floor 0.4. A 4th segment sets the value, for example `agy:gemini:gemini-3.8-flash-high:0.75` |
 | Reliability | 3 | History plus your verdicts (`pass` / `partial` / `fail`). The same role counts in full. Other roles count half |
-| Quota | 1 | More remaining scores higher. A high balance that resets soon scores higher, because unused quota expires. Under 30% the quota term is multiplied by 0.7. **Under 15% the worker is skipped** |
+| Quota | 0.25 (lowest) | More remaining scores higher. A high balance that resets soon scores higher, because unused quota expires. Under 30% the quota term is multiplied by 0.7. **Under 15% the worker is skipped** |
 | Speed | 0.5 | A longer history of run time scores lower |
 | Load | 0.5 | More tasks already running on that vendor scores lower, so parallel work spreads out |
 
@@ -253,7 +253,7 @@ User config is `~/.claude/ai-relay/providers.json`. The first run copies it from
   "scoreWeights": {
     "fit": 3,
     "reliability": 3,
-    "quota": 1,
+    "quota": 0.25,
     "speed": 0.5,
     "load": 0.5
   },

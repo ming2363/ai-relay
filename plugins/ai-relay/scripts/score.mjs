@@ -14,7 +14,8 @@ const WINDOW_LABEL = {
 const DEFAULT_SCORE_WEIGHTS = {
   fit: 3,
   reliability: 3,
-  quota: 1,
+  // 额度权重最低：额度只要不低于 15%（硬门槛），就不该压过更擅长、更可靠的模型
+  quota: 0.25,
   speed: 0.5,
   load: 0.5,
 };
