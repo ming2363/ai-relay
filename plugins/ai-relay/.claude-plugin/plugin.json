@@ -1,0 +1,8 @@
+{
+  "name": "ai-relay",
+  "version": "0.11.0",
+  "description": "在 Claude 中按额度调度 Codex / Antigravity / Grok 官方 CLI，一键切回纯 Claude",
+  "author": {
+    "name": "zhangming"
+  }
+}

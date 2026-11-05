@@ -1,0 +1,30 @@
+{
+  "name": "ai-relay",
+  "owner": {
+    "name": "zhangming"
+  },
+  "metadata": {
+    "description": "Turn every AI subscription you already pay for into one team led by Claude",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "ai-relay",
+      "description": "Claude as the manager: dispatches work to Codex, Antigravity (Gemini) and Grok through their official CLIs, routed by quality and remaining quota",
+      "version": "0.11.0",
+      "author": {
+        "name": "zhangming"
+      },
+      "source": "./plugins/ai-relay"
+    },
+    {
+      "name": "ai-relay-status",
+      "description": "Footer button and side panel: quota bars, every conversation's division of labor across projects, and provider controls",
+      "version": "0.14.0",
+      "author": {
+        "name": "zhangming"
+      },
+      "source": "./plugins/ai-relay-status"
+    }
+  ]
+}

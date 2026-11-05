@@ -1,0 +1,183 @@
+{
+  "version": 1,
+  "quotaDb": "~/Library/Application Support/AIQuota5h/state.sqlite",
+  "minRemaining": 0.15,
+  "lowRemaining": 0.3,
+  "staleMinutes": 15,
+  "claudeConserveBelow": 0.2,
+  "jobTimeoutMinutes": 30,
+  "selfEditMaxLines": 40,
+  "workerFullAccess": true,
+  "scoreWeights": {
+    "fit": 3,
+    "reliability": 3,
+    "quota": 1,
+    "speed": 0.5,
+    "load": 0.5
+  },
+  "providers": {
+    "claude": {
+      "label": "Claude Pro（主控）",
+      "self": true,
+      "quota": {
+        "provider": "claude",
+        "pools": [
+          "claude-subscription"
+        ]
+      }
+    },
+    "codex": {
+      "label": "Codex · ChatGPT Plus",
+      "via": "codex-plugin",
+      "quota": {
+        "provider": "codex",
+        "pools": [
+          "codex"
+        ]
+      },
+      "pools": {
+        "codex": [
+          "default",
+          "gpt-6.1-terra",
+          "spark"
+        ]
+      },
+      "sandbox": "workspace",
+      "caps": {
+        "web": false,
+        "exec": true
+      }
+    },
+    "agy": {
+      "label": "Antigravity Pro",
+      "via": "relay",
+      "quota": {
+        "provider": "antigravity"
+      },
+      "cli": {
+        "bin": "agy",
+        "prompt": [
+          "--print",
+          "{prompt}"
+        ],
+        "model": [
+          "--model",
+          "{model}"
+        ],
+        "read": [],
+        "write": [
+          "--mode",
+          "accept-edits"
+        ],
+        "cwd": null,
+        "fullAccess": [
+          "--dangerously-skip-permissions"
+        ]
+      },
+      "pools": {
+        "gemini-argon": [
+          "gemini-4-argon-high",
+          "gemini-4-argon-medium",
+          "gemini-4-argon-low"
+        ],
+        "claude-gpt": [
+          "claude-opus-5-5-high",
+          "claude-opus-5-5-medium",
+          "claude-opus-5-5-low",
+          "claude-sonnet-5-5-high",
+          "claude-sonnet-5-5-medium",
+          "claude-sonnet-5-5-low",
+          "gpt-oss-120b-medium"
+        ],
+        "gemini": [
+          "gemini-3.8-flash-high",
+          "gemini-3.8-flash-medium",
+          "gemini-3.8-flash-low"
+        ]
+      },
+      "caps": {
+        "web": true,
+        "exec": false
+      }
+    },
+    "grok": {
+      "label": "SuperGrok",
+      "via": "relay",
+      "quota": {
+        "provider": "grok"
+      },
+      "cli": {
+        "bin": "grok",
+        "prompt": [
+          "-p",
+          "{prompt}"
+        ],
+        "model": [
+          "--model",
+          "{model}"
+        ],
+        "read": [
+          "--permission-mode",
+          "plan"
+        ],
+        "write": [],
+        "cwd": [
+          "--cwd",
+          "{cwd}"
+        ],
+        "fullAccess": [
+          "--always-approve"
+        ]
+      },
+      "pools": {
+        "supergrok-weekly": [
+          "default"
+        ]
+      },
+      "caps": {
+        "web": true,
+        "exec": false
+      }
+    }
+  },
+  "routes": {
+    "implement": [
+      "codex:codex:default",
+      "grok:supergrok-weekly:default",
+      "agy:claude-gpt:claude-sonnet-5-5-high",
+      "agy:gemini:gemini-3.8-flash-high"
+    ],
+    "debug": [
+      "codex:codex:default",
+      "grok:supergrok-weekly:default",
+      "agy:gemini-argon:gemini-4-argon-high",
+      "agy:claude-gpt:claude-opus-5-5-high",
+      "agy:gemini:gemini-3.8-flash-high"
+    ],
+    "review": [
+      "grok:supergrok-weekly:default",
+      "agy:gemini-argon:gemini-4-argon-high",
+      "agy:gemini:gemini-3.8-flash-high",
+      "codex:codex:default"
+    ],
+    "read": [
+      "agy:gemini:gemini-3.8-flash-high",
+      "agy:gemini-argon:gemini-4-argon-medium",
+      "grok:supergrok-weekly:default"
+    ],
+    "deep": [
+      "agy:gemini-argon:gemini-4-argon-high",
+      "agy:claude-gpt:claude-opus-5-5-high",
+      "codex:codex:default"
+    ],
+    "quick": [
+      "agy:gemini:gemini-3.8-flash-medium",
+      "grok:supergrok-weekly:default"
+    ],
+    "claude-backup": [
+      "agy:claude-gpt:claude-opus-5-5-high",
+      "agy:gemini-argon:gemini-4-argon-high",
+      "codex:codex:default"
+    ]
+  }
+}

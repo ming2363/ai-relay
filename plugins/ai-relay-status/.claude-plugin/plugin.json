@@ -1,0 +1,6 @@
+{
+  "name": "ai-relay-status",
+  "version": "0.14.0",
+  "description": "在输入框上方常驻显示 ai-relay 当前模式与各家额度，并可一键切换模式",
+  "types": "./types/index.d.ts"
+}

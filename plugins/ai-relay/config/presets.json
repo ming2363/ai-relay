@@ -1,0 +1,94 @@
+{
+  "kimi": {
+    "title": "Kimi Code CLI",
+    "label": "Kimi 会员",
+    "bin": "kimi",
+    "install": "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash，装好后运行 kimi 并输入 /login 登录",
+    "cli": {
+      "prompt": [
+        "--quiet",
+        "-p",
+        "{prompt}"
+      ],
+      "model": [
+        "-m",
+        "{model}"
+      ],
+      "read": [
+        "--plan"
+      ],
+      "write": [],
+      "cwd": [
+        "-w",
+        "{cwd}"
+      ]
+    },
+    "models": [
+      "default"
+    ],
+    "roles": [
+      "read",
+      "review"
+    ],
+    "note": "Kimi 的无交互模式会自动批准所有工具调用（包括终端命令），只读靠计划模式；relay 会用 git 快照检查是否误改文件"
+  },
+  "qwen": {
+    "title": "Qwen Code",
+    "label": "通义千问会员",
+    "bin": "qwen",
+    "install": "npm install -g @qwen-code/qwen-code@latest，装好后运行 qwen 登录",
+    "cli": {
+      "prompt": [
+        "-p",
+        "{prompt}"
+      ],
+      "model": [
+        "-m",
+        "{model}"
+      ],
+      "read": [
+        "--approval-mode",
+        "plan"
+      ],
+      "write": [
+        "--approval-mode",
+        "auto-edit"
+      ],
+      "cwd": null
+    },
+    "models": [
+      "default"
+    ],
+    "roles": [
+      "read",
+      "review"
+    ],
+    "note": "只读用 plan 模式，可写用 auto-edit（只自动批准改文件，不批准终端命令）"
+  },
+  "custom": {
+    "title": "自定义",
+    "label": "",
+    "bin": "",
+    "install": "",
+    "cli": {
+      "prompt": [
+        "-p",
+        "{prompt}"
+      ],
+      "model": [
+        "--model",
+        "{model}"
+      ],
+      "read": [],
+      "write": [],
+      "cwd": null
+    },
+    "models": [
+      "default"
+    ],
+    "roles": [
+      "read"
+    ],
+    "note": "任何能用一条命令无交互执行任务、把结果输出到终端的官方 CLI 都可以接入"
+  }
+}

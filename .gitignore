@@ -1,0 +1,5 @@
+.DS_Store
+node_modules/
+*.log
+# Claude Code 为编辑器生成的类型文件，不入库
+plugins/*/.claude-plugin/types/
