@@ -127,6 +127,41 @@ export function providerPools(prov) {
   return Object.keys(prov.pools || {});
 }
 
+// Claude 自身额度分档，供自动模式节流：
+//   0 正常或额度未知；1 低于 claudeThrottleBelow（默认 0.5）；2 低于 claudeConserveBelow（默认 0.2）
+// remaining 是主模型各额度池、各窗口剩余比例的最小值
+// 1 档且有员工的某个额度池剩余 ≥ 0.5 时，附上这些员工的显示名 richHelpers
+export function claudeThrottle(cfg, rows) {
+  const self = Object.values(cfg.providers || {}).find((p) => p && p.self);
+  let remaining = null;
+  if (self?.quota) {
+    const known = providerPools(self)
+      .map((pool) => poolStatus(cfg, rows, self.quota.provider, pool).remaining)
+      .filter((r) => r !== null);
+    if (known.length) remaining = Math.min(...known);
+  }
+  const conserveBelow = cfg.claudeConserveBelow ?? 0.2;
+  const throttleBelow = cfg.claudeThrottleBelow ?? 0.5;
+  let level = 0;
+  if (remaining !== null) {
+    if (remaining < conserveBelow) level = 2;
+    else if (remaining < throttleBelow) level = 1;
+  }
+  const out = { level, remaining };
+  if (level !== 1) return out;
+  const richHelpers = [];
+  for (const [name, prov] of Object.entries(cfg.providers || {})) {
+    if (!prov || prov.self || !isEnabled(prov) || !prov.quota) continue;
+    const rich = providerPools(prov).some((pool) => {
+      const r = poolStatus(cfg, rows, prov.quota.provider, pool).remaining;
+      return r !== null && r >= 0.5;
+    });
+    if (rich) richHelpers.push(prov.label || name);
+  }
+  if (richHelpers.length) out.richHelpers = richHelpers;
+  return out;
+}
+
 // 某模型属于哪个额度池
 export function poolOfModel(prov, model) {
   for (const [pool, models] of Object.entries(prov.pools || {})) {
@@ -239,8 +274,8 @@ export function savePrompt(sessionId, prompt) {
   if (!sessionId) return;
   ensureStateDir();
   fs.writeFileSync(path.join(STATE_DIR, "prompts", `${sessionId}.txt`), String(prompt || "").slice(0, 4000));
-  // 每条新消息重新统计主模型亲手改动的行数
-  fs.writeFileSync(selfEditFile(sessionId), JSON.stringify({ lines: 0, warned: false }));
+  // 每条新消息重新统计主模型亲手改动的行数和读文件次数
+  fs.writeFileSync(selfEditFile(sessionId), JSON.stringify({ lines: 0, warned: false, reads: 0, readWarned: false }));
   // 每天自动清理一次历史数据
   cleanupIfDue();
 }
@@ -679,16 +714,19 @@ export function pickReason(pick) {
   return `${c.reason || ""}${skipped.length ? `；跳过 ${skipped.join("、")}` : ""}`;
 }
 
-// ---------- 主模型亲手改动的统计（自动模式下用来提醒外派） ----------
+// ---------- 主模型亲手改动与读文件的统计（自动模式下用来提醒外派） ----------
 function selfEditFile(sessionId) {
   return path.join(STATE_DIR, "prompts", `${sessionId}.edits.json`);
 }
 
 export function readSelfEdits(sessionId) {
   try {
-    return JSON.parse(fs.readFileSync(selfEditFile(sessionId), "utf8"));
+    const data = JSON.parse(fs.readFileSync(selfEditFile(sessionId), "utf8"));
+    if (typeof data.reads !== "number") data.reads = 0;
+    if (typeof data.readWarned !== "boolean") data.readWarned = false;
+    return data;
   } catch {
-    return { lines: 0, warned: false };
+    return { lines: 0, warned: false, reads: 0, readWarned: false };
   }
 }
 

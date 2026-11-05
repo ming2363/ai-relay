@@ -1,7 +1,7 @@
-// UserPromptSubmit 钩子：记录用户输入，并按模式注入额度摘要与编排提示
+// UserPromptSubmit 钩子：记录用户输入，并按模式注入额度摘要、编排提示和 Claude 额度节流
 import fs from "node:fs";
 import {
-  RELAY_SCRIPT, ULW_RE, MENTION_RE, loadConfig, getMode, readQuotaRows, poolStatus,
+  RELAY_SCRIPT, ULW_RE, MENTION_RE, loadConfig, getMode, readQuotaRows, claudeThrottle,
   compactStatus, savePrompt, fmtPct, mentionsProvider,
 } from "./lib.mjs";
 
@@ -31,16 +31,25 @@ function main() {
   } else {
     lines.push("[ai-relay] 用户提到了其他模型/外派。外派方法见 Skill「ai-relay:orchestrate」，只做用户点名的那部分。");
   }
-  lines.push(`relay 脚本：node "${RELAY_SCRIPT}"`);
-  lines.push(`额度：\n${compactStatus(cfg, rows)}`);
-
-  const claude = cfg.providers.claude;
-  if (claude && rows) {
-    const st = poolStatus(cfg, rows, claude.quota.provider, claude.quota.pools[0]);
-    if (st.remaining !== null && st.remaining < (cfg.claudeConserveBelow || 0.2)) {
-      lines.push(`⚠️ Claude 自身额度只剩 ${fmtPct(st.remaining)}：进入省 Claude 状态——你只做拆解与审核，执行全部外派；低于 5% 时提醒用户用 /codex:transfer 交接。`);
+  // 自动模式按 Claude 剩余额度追加一档；0 档不追加。原「省 Claude」提示并入 2 档
+  if (mode === "auto") {
+    const t = claudeThrottle(cfg, rows);
+    // 质量底线：任何档位都不放松，节流只减少主管亲自执行的部分
+    const qualityFloor = "质量优先，节流不降标准：验收和关键结论的抽查必须亲自做；员工都不擅长、或需要本会话上下文才能判断的活，主管自己做。";
+    if (t.level >= 1) lines.push(`[质量底线] ${qualityFloor}`);
+    if (t.level === 1) {
+      const who = t.richHelpers?.length ? `（其他家充足：${t.richHelpers.join("、")}）` : "";
+      lines.push(
+        `[节流] Claude 额度只剩 ${fmtPct(t.remaining)}${who}。主管只做：理解需求、拆任务、写派单、验收、汇报。读代码超过 2 个文件、排查、实现、审查、需要看代码才能回答的问题，都外派（阅读 / 快速问答类派给额度最充足的模型）。派单和汇报都写短。`,
+      );
+    } else if (t.level === 2) {
+      lines.push(
+        `⚠️ Claude 自身额度只剩 ${fmtPct(t.remaining)}：进入省 Claude 状态——执行类的活（读代码、排查、实现、审查、修补）尽量外派，主管专注拆解、写清派单和严格验收；汇报写短但结论要完整。低于 5% 时建议用户用 /codex:transfer 交接，不要降低标准硬做。`,
+      );
     }
   }
+  lines.push(`relay 脚本：node "${RELAY_SCRIPT}"`);
+  lines.push(`额度：\n${compactStatus(cfg, rows)}`);
 
   process.stdout.write(
     JSON.stringify({ hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: lines.join("\n") } }),
