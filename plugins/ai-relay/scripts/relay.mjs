@@ -3,16 +3,22 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
 import {
   RELAY_SCRIPT, JOBS_DIR, MODES, PLUGIN_ROOT, STATE_DIR, ROLE_TEXT, isEnabled, loadConfig, quotaSource, readHistory, getMode, setMode, readQuotaRows, poolStatus,
-  providerPools, poolOfModel, fmtPool, fmtTime, resolveBin, ensureStateDir,
+  providerPools, poolOfModel, resolveModel, fmtPool, fmtTime, resolveBin, ensureStateDir,
   allJobRecords, setVerdict, VERDICTS, recordPick, pickReason, capsOf, fullAccessOn, fullAccessSupported, cleanup, storageUsage, RETENTION_DAYS,
-  runningWriters, scopesOverlap, normScope, isPathInScope, withWriteLock, gitSnapshot,
+  runningWriters, scopesOverlap, normScope, isPathInScope, withWriteLock, gitSnapshot, claimPendingDispatch,
   parseGitStatusPath, parseGitStatusPaths, diffSnapshots, checkOutOfScope, workspaceRoot,
+  getWorkspaceActivityMtime,
 } from "./lib.mjs";
 import { refreshCache, refreshGrok, loadCache } from "./quota.mjs";
 import { scoreRoute } from "./score.mjs";
+import {
+  getModels, loadModelsCache, findModelPool, setProviderDefaultModel, buildModelPools,
+} from "./models.mjs";
+import { usageForJob, backfill, attachLiveUsage, getSessionActivityMtime } from "./usage.mjs";
 import {
   BRIEF_TEMPLATE, checkBrief, roleOfBrief, buildDispatchPrompt, readSharedContext, writeSharedContext, clearSharedContext,
   attachJobs, gitDiff, projectContext, scopeOfBrief, needsOfBrief, helpRequestOf,
@@ -30,7 +36,7 @@ const CODEX_PLUGIN_ID = "codex@openai-codex";
 
 function parseArgs(argv) {
   const opts = { _: [] };
-  const valueFlags = new Set(["--role", "--model", "--cwd", "--prompt-file", "--timeout", "--provider", "--json-spec", "--preset", "--claude-json", "--limit", "--with", "--scope", "--target", "--needs"]);
+  const valueFlags = new Set(["--role", "--model", "--cwd", "--prompt-file", "--timeout", "--provider", "--json-spec", "--preset", "--claude-json", "--limit", "--with", "--scope", "--target", "--needs", "--idle-timeout", "--max-runtime"]);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--") {
@@ -167,8 +173,12 @@ function cmdPick(opts) {
   const c = r.choice;
   console.log(`${role} → ${c.provider} / ${c.pool} / ${c.model}  [${fmtPool(c.status)}]`);
   console.log(`  理由：${c.reason}`);
-  if (c.via === "codex-plugin") console.log("→ 用 Codex 官方插件执行：Agent 工具 subagent_type=codex:codex-rescue，prompt 按派单模板写（relay brief 查看）");
-  else console.log(`→ relay run ${c.provider} --role ${role} --model ${c.model} --cwd <项目根> <<'RELAY_EOF' …派单… RELAY_EOF`);
+  if (c.via === "codex-plugin") {
+    const modelHint = c.model && c.model !== "default" ? `；Agent prompt 开头加 --model ${c.model}` : "";
+    console.log(`→ 用 Codex 官方插件执行：Agent 工具 subagent_type=codex:codex-rescue，prompt 按派单模板写（relay brief 查看）${modelHint}`);
+  } else {
+    console.log(`→ relay run ${c.provider} --role ${role} --model ${c.model} --cwd <项目根> <<'RELAY_EOF' …派单… RELAY_EOF`);
+  }
   for (const a of r.alternatives) console.log(`  备选：${a.provider} / ${a.model}  [${fmtPool(a.status)}]  ${a.reason}`);
   for (const s of r.skipped) console.log(`  跳过：${s.provider} / ${s.model}  ${s.why}  [${fmtPool(s.status)}]`);
 }
@@ -179,11 +189,12 @@ function buildCommand(cfg, job) {
   const cli = prov.cli;
   const bin = resolveBin(cli.bin);
   if (!bin) throw new Error(`找不到 ${cli.bin} 命令，请确认已安装并登录`);
+  const actualModel = resolveModel(cfg, job.provider, job.pool || poolOfModel(prov, job.model), job.model);
   // 占位符只按整个参数匹配，避免任务文本里的 {model} 之类被误替换
-  const vars = { "{prompt}": job.wrappedPrompt, "{model}": job.model, "{cwd}": job.cwd };
+  const vars = { "{prompt}": job.wrappedPrompt, "{model}": actualModel, "{cwd}": job.cwd };
   const fill = (arr) => (arr || []).map((s) => (s in vars ? vars[s] : s));
   const args = [];
-  if (job.model && job.model !== "default") args.push(...fill(cli.model));
+  if (actualModel && actualModel !== "default") args.push(...fill(cli.model));
   args.push(...fill(job.write ? cli.write : cli.read));
   if (cli.cwd) args.push(...fill(cli.cwd));
   // 员工最高权限（默认开）：不再逐个批准命令；安全靠派单里的硬性规则和事后的越界检查
@@ -192,21 +203,24 @@ function buildCommand(cfg, job) {
   return { bin, args };
 }
 
-function jobPath(id, ext = "json") {
-  return path.join(JOBS_DIR, `${id}.${ext}`);
+function jobPath(id, ext = "json", customDir = null) {
+  return path.join(customDir || JOBS_DIR, `${id}.${ext}`);
 }
 
 function saveJob(job) {
-  fs.writeFileSync(jobPath(job.id), JSON.stringify(job, null, 2));
+  const dir = job._jobsDir || JOBS_DIR;
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(jobPath(job.id, "json", dir), JSON.stringify(job, null, 2));
 }
 
-function loadJob(id) {
+function loadJob(id, customDir = null) {
+  const dir = customDir || JOBS_DIR;
   if (id === "last") {
-    const files = fs.readdirSync(JOBS_DIR).filter((f) => f.endsWith(".json")).sort();
+    const files = fs.readdirSync(dir).filter((f) => f.endsWith(".json")).sort();
     if (!files.length) throw new Error("还没有任何任务");
     id = files[files.length - 1].replace(/\.json$/, "");
   }
-  return JSON.parse(fs.readFileSync(jobPath(id), "utf8"));
+  return JSON.parse(fs.readFileSync(jobPath(id, "json", dir), "utf8"));
 }
 
 function loadAnyJob(id) {
@@ -234,32 +248,173 @@ function loadAnyJob(id) {
   return { ...job, output, helpRequest: job.helpRequest || helpRequestOf(output) };
 }
 
-// 真正执行 CLI（前台或后台 worker 共用）
-function executeJob(job) {
-  const cfg = loadConfig();
-  let bin, args;
-  try {
-    ({ bin, args } = buildCommand(cfg, job));
-  } catch (e) {
-    // 启动前就失败（找不到命令等）：记为失败，免得一直占着"运行中"挡住后续可写任务
-    Object.assign(job, { status: "failed", finishedAt: new Date().toISOString(), error: String(e.message || e) });
-    saveJob(job);
-    throw e;
+export function formatTimeoutReason(job) {
+  if (job?.timeoutReason === "idle") {
+    const min = job.idleTimeoutMin || 20;
+    return `连续 ${min} 分钟无活动`;
   }
+  if (job?.timeoutReason === "max") {
+    return "超过总上限";
+  }
+  return "";
+}
+
+// 真正执行 CLI（前台或后台 worker 共用）
+export async function executeJob(job, testOpts = {}) {
+  const cfg = loadConfig();
+  const idleTimeoutMin = Number(job.idleTimeoutMin ?? cfg.idleTimeoutMin ?? 20);
+  const maxRuntimeMin = Number(job.maxRuntimeMin ?? cfg.maxRuntimeMin ?? cfg.jobTimeoutMinutes ?? 240);
+  const idleTimeoutMs = job.idleTimeoutMs ?? testOpts.idleTimeoutMs ?? (idleTimeoutMin * 60_000);
+  const maxRuntimeMs = job.maxRuntimeMs ?? testOpts.maxRuntimeMs ?? (maxRuntimeMin * 60_000);
+  const checkIntervalMs = job.checkIntervalMs ?? testOpts.checkIntervalMs ?? 60_000;
+
+  job.idleTimeoutMin = idleTimeoutMin;
+  job.maxRuntimeMin = maxRuntimeMin;
+
+  let bin, args;
+  if (testOpts.bin || job._bin) {
+    bin = testOpts.bin || job._bin;
+    args = testOpts.args || job._args || [];
+  } else {
+    try {
+      ({ bin, args } = buildCommand(cfg, job));
+    } catch (e) {
+      // 启动前就失败（找不到命令等）：记为失败，免得一直占着"运行中"挡住后续可写任务
+      Object.assign(job, { status: "failed", finishedAt: new Date().toISOString(), error: String(e.message || e) });
+      saveJob(job);
+      throw e;
+    }
+  }
+
   const before = gitSnapshot(job.cwd);
-  const res = spawnSync(bin, args, {
+  const child = spawn(bin, args, {
     cwd: job.cwd,
-    encoding: "utf8",
-    maxBuffer: 64 * 1024 * 1024,
-    timeout: (cfg.jobTimeoutMinutes || 30) * 60_000,
     stdio: ["ignore", "pipe", "pipe"],
+    detached: process.platform !== "win32",
   });
+
+  job.childPid = child.pid;
+  if (!job.pid) job.pid = child.pid;
+  saveJob(job);
+
+  const startMs = Date.now();
+  let lastOutputTime = startMs;
+  let lastActivityTime = startMs;
+  const stdoutChunks = [];
+  const stderrChunks = [];
+  let stdoutLen = 0;
+  let stderrLen = 0;
+  const MAX_BUF = 64 * 1024 * 1024;
+
+  child.stdout?.on("data", (chunk) => {
+    lastOutputTime = Date.now();
+    if (stdoutLen < MAX_BUF) {
+      stdoutChunks.push(chunk);
+      stdoutLen += chunk.length;
+    }
+  });
+
+  child.stderr?.on("data", (chunk) => {
+    lastOutputTime = Date.now();
+    if (stderrLen < MAX_BUF) {
+      stderrChunks.push(chunk);
+      stderrLen += chunk.length;
+    }
+  });
+
+  let timedOut = false;
+  let timeoutReason = null;
+  let killTimer = null;
+
+  function terminateChild(reason) {
+    if (timedOut) return;
+    timedOut = true;
+    timeoutReason = reason;
+    try {
+      process.kill(-child.pid, "SIGTERM");
+    } catch {
+      try { process.kill(child.pid, "SIGTERM"); } catch {}
+    }
+    killTimer = setTimeout(() => {
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {
+        try { process.kill(child.pid, "SIGKILL"); } catch {}
+      }
+    }, 2000);
+    killTimer.unref?.();
+  }
+
+  function checkActivity() {
+    const now = Date.now();
+    // 1. 超过总时长上限
+    if (now - startMs >= maxRuntimeMs) {
+      terminateChild("max");
+      return;
+    }
+    // 2. 取三者最新活动时间
+    const t1 = lastOutputTime;
+    const t2 = getSessionActivityMtime(job, testOpts);
+    const t3 = getWorkspaceActivityMtime(job.cwd, 2000);
+    const latest = Math.max(t1, t2 || 0, t3 || 0);
+    if (latest > lastActivityTime) {
+      lastActivityTime = latest;
+    }
+    // 3. 连续无活动超时
+    if (now - lastActivityTime >= idleTimeoutMs) {
+      terminateChild("idle");
+      return;
+    }
+  }
+
+  const checkInterval = setInterval(checkActivity, checkIntervalMs);
+  checkInterval.unref?.();
+
+  const maxTimer = setTimeout(() => {
+    terminateChild("max");
+  }, maxRuntimeMs);
+  maxTimer.unref?.();
+
+  const { code, signal, error } = await new Promise((resolve) => {
+    let settled = false;
+    child.on("error", (err) => {
+      if (!settled) {
+        settled = true;
+        resolve({ code: null, signal: null, error: err });
+      }
+    });
+    child.on("close", (exitCode, exitSignal) => {
+      if (!settled) {
+        settled = true;
+        resolve({ code: exitCode, signal: exitSignal, error: null });
+      }
+    });
+  });
+
+  clearInterval(checkInterval);
+  clearTimeout(maxTimer);
+  if (killTimer) clearTimeout(killTimer);
+
   const after = gitSnapshot(job.cwd);
-  const output = (res.stdout || "") + (res.stderr ? `\n[stderr]\n${res.stderr}` : "");
-  fs.writeFileSync(jobPath(job.id, "log"), output);
-  job.exitCode = res.status;
-  job.status = res.error?.code === "ETIMEDOUT" ? "timeout" : res.status === 0 ? "done" : "failed";
+  const stdoutStr = Buffer.concat(stdoutChunks).toString("utf8");
+  const stderrStr = Buffer.concat(stderrChunks).toString("utf8");
+  const output = stdoutStr + (stderrStr ? `\n[stderr]\n${stderrStr}` : "");
+  fs.writeFileSync(jobPath(job.id, "log", job._jobsDir), output);
+
+  job.exitCode = code;
+  if (timedOut) {
+    job.status = "timeout";
+    job.timeoutReason = timeoutReason;
+  } else if (error) {
+    job.status = "failed";
+    job.error = String(error.message || error);
+  } else {
+    job.status = code === 0 ? "done" : "failed";
+  }
   job.finishedAt = new Date().toISOString();
+
+  const usage = usageForJob(job, testOpts);
+  if (usage) job.usage = usage;
   if (before !== null && after !== null) {
     job.changedFiles = diffSnapshots(before, after);
   }
@@ -272,20 +427,29 @@ function executeJob(job) {
   // 两个 CLI 在权限被拒时仍可能返回退出码 0，这里单独标出
   job.permissionDenied = /permission required|auto-denied|cannot (ask|prompt) for/i.test(output);
   // 权限被拒后中断、没有产出：即使退出码为 0 也算失败
-  if (job.status === "done" && job.permissionDenied && !(res.stdout || "").trim()) job.status = "failed";
+  if (job.status === "done" && job.permissionDenied && !stdoutStr.trim()) job.status = "failed";
   // 日志落盘后再抽协助请求，result / jobs 都能读到同一份
   job.helpRequest = helpRequestOf(output);
   saveJob(job);
   return job;
 }
 
-function printJob(job) {
+export function printJob(job) {
   const modelText = job.model && job.model !== "default" ? " / " + job.model : "";
-  const exitText = job.exitCode !== undefined ? `（退出码 ${job.exitCode}）` : "";
+  const exitText = job.exitCode !== undefined && job.exitCode !== null ? `（退出码 ${job.exitCode}）` : "";
+  let statusText = job.status;
+  if (job.status === "timeout") {
+    const reasonText = formatTimeoutReason(job);
+    statusText = `timeout${reasonText ? `（${reasonText}）` : ""}`;
+  }
   const head = [
-    `任务 ${job.id} · ${job.provider}${modelText} · ${job.role || "未注明角色"} · ${job.write ? "可写" : "只读"} · 状态 ${job.status}${exitText}`,
+    `任务 ${job.id} · ${job.provider}${modelText} · ${job.role || "未注明角色"} · ${job.write ? "可写" : "只读"} · 状态 ${statusText}${exitText}`,
     `目录：${job.cwd}`,
   ];
+  if (job.status === "timeout") {
+    const reasonDesc = formatTimeoutReason(job);
+    head.push(`⚠️ 任务超时：${reasonDesc || "已达到运行上限"}`);
+  }
   if (job.provider !== "codex") {
     if (job.changedFiles?.length) {
       head.push(`git 工作区变化：\n  ${job.changedFiles.join("\n  ")}`);
@@ -303,7 +467,7 @@ function printJob(job) {
   let out = job.output;
   if (out === undefined) {
     try {
-      out = fs.readFileSync(jobPath(job.id, "log"), "utf8");
+      out = fs.readFileSync(jobPath(job.id, "log", job._jobsDir), "utf8");
     } catch {
       out = "";
     }
@@ -312,13 +476,25 @@ function printJob(job) {
     const shown = out.length > OUTPUT_CAP ? "…（前文已省略，完整日志见下方路径）\n" + out.slice(-OUTPUT_CAP) : out;
     console.log("\n----- 输出 -----\n" + shown.trim());
   }
-  console.log(`\n完整日志：${jobPath(job.id, "log")}`);
+  console.log(`\n完整日志：${jobPath(job.id, "log", job._jobsDir)}`);
   if (job.status !== "running" && !job.verdict) console.log(`验收后记录结论：node "${RELAY_SCRIPT}" verdict ${job.id} pass|partial|fail -- <一句话说明>`);
   if (job.verdict) console.log(`验收结论：${job.verdict}${job.verdictNote ? "（" + job.verdictNote + "）" : ""}`);
 }
 
-function cmdRun(opts) {
+async function cmdRun(opts) {
+  if (opts.help) {
+    help();
+    return;
+  }
   const cfg = loadConfig();
+  const idleTimeoutMin = opts.idleTimeout ? Number(opts.idleTimeout) : (cfg.idleTimeoutMin ?? 20);
+  const maxRuntimeMin = opts.maxRuntime ? Number(opts.maxRuntime) : (cfg.maxRuntimeMin ?? cfg.jobTimeoutMinutes ?? 240);
+  if (Number.isNaN(idleTimeoutMin) || idleTimeoutMin <= 0) {
+    throw new Error("--idle-timeout 必须是正数（分钟）");
+  }
+  if (Number.isNaN(maxRuntimeMin) || maxRuntimeMin <= 0) {
+    throw new Error("--max-runtime 必须是正数（分钟）");
+  }
   const mode = getMode();
   if (mode === "off" && !opts.force) {
     console.error("ai-relay 当前为 off（纯 Claude）模式，不外派。需要时先执行 /ai-relay:relay manual");
@@ -353,18 +529,20 @@ function cmdRun(opts) {
     // 首选是 Codex 时不悄悄改派：Codex 要走 Agent 工具（官方插件），交给主管去派
     if (!opts.model && !opts.skipCodex && r.choice?.via === "codex-plugin") {
       recordPick(role, r);
-      console.error(`首选是 Codex（${r.choice.reason}）。请用 Agent 工具 subagent_type=codex:codex-rescue 把这张派单交给它；确有理由不用 Codex 时，加 --skip-codex 改派第二名。`);
+      const modelHint = r.choice.model && r.choice.model !== "default" ? `（Agent prompt 开头加 --model ${r.choice.model}）` : "";
+      console.error(`首选是 Codex（${r.choice.reason}）。请用 Agent 工具 subagent_type=codex:codex-rescue 把这张派单交给它${modelHint}；确有理由不用 Codex 时，加 --skip-codex 改派第二名。`);
       process.exit(3);
     }
     // 只考虑能由 ai-relay 直接调用的候选
-    const c = [r.choice, ...r.alternatives].find((x) => x && x.via === "relay" && (!opts.model || x.model === opts.model));
+    const c = [r.choice, ...r.alternatives].find((x) => x && x.via === "relay" && (!opts.model || x.model === opts.model || x.routeModel === opts.model));
     if (!c) {
       if (opts.model) {
         console.error(`模型 ${opts.model} 在角色 ${role} 下不可用或额度不足`);
         process.exit(3);
       }
       const first = r.choice;
-      console.error(first?.via === "codex-plugin" ? "首选是 Codex：请用 Agent 工具 subagent_type=codex:codex-rescue 执行" : `角色 ${role} 没有可用模型（额度不足）`);
+      const modelHint = first?.model && first.model !== "default" ? `（Agent prompt 开头加 --model ${first.model}）` : "";
+      console.error(first?.via === "codex-plugin" ? `首选是 Codex：请用 Agent 工具 subagent_type=codex:codex-rescue 执行${modelHint}` : `角色 ${role} 没有可用模型（额度不足）`);
       process.exit(3);
     }
     provName = c.provider;
@@ -385,7 +563,10 @@ function cmdRun(opts) {
     process.exit(3);
   }
   if (prov.via === "codex-plugin") {
-    console.error("Codex 走官方插件：请用 Agent 工具 subagent_type=codex:codex-rescue（或 /codex:rescue），审查用 /codex:review");
+    const codexPool = providerPools(prov)[0];
+    const codexModel = resolveModel(cfg, provName, codexPool, model || "default");
+    const modelHint = codexModel && codexModel !== "default" ? `（Agent prompt 开头加 --model ${codexModel}）` : "";
+    console.error(`Codex 走官方插件：请用 Agent 工具 subagent_type=codex:codex-rescue（或 /codex:rescue）${modelHint}，审查用 /codex:review`);
     process.exit(3);
   }
   if (prov.via !== "relay") throw new Error(`${provName} 不能由 ai-relay 调用`);
@@ -393,16 +574,23 @@ function cmdRun(opts) {
   if (!reason) {
     // 主模型点名了厂商：仍记下这个厂商在该角色下的打分，便于事后对照
     const r = route(cfg, rows, role, provName, { needs });
-    const same = [r.choice, ...r.alternatives].find((x) => x && (!model || x.model === model));
+    const same = [r.choice, ...r.alternatives].find((x) => x && (!model || x.model === model || x.routeModel === model));
     if (!model && r.choice) ({ model, pool } = r.choice);
+    else if (same && !pool) ({ model, pool } = same);
     reason = `主模型指定 ${provName}${same ? `；${same.reason}` : ""}`;
   }
   if (!model) {
     console.error(`${provName} 在角色 ${role} 下没有可用模型（不在路由或额度不足）；可用 --model 指定该厂商的模型`);
     process.exit(3);
   }
-  pool = pool || poolOfModel(prov, model);
-  if (!pool) throw new Error(`模型 ${model} 不在 ${provName} 的配置里，可选：${Object.values(prov.pools).flat().join(", ")}`);
+  const modelsCache = loadModelsCache(STATE_DIR);
+  pool = pool || findModelPool(prov, provName, model, modelsCache);
+  if (!pool) {
+    const cachedModels = (modelsCache?.providers?.[provName]?.models || []).filter((m) => m.pool).map((m) => m.id);
+    const allowed = [...new Set([...Object.values(prov.pools || {}).flat(), ...cachedModels])];
+    throw new Error(`模型 ${model} 不在 ${provName} 的配置里，可选：${allowed.join(", ")}`);
+  }
+  model = resolveModel(cfg, provName, pool, model);
 
   const st = poolStatus(cfg, rows, prov.quota.provider, pool);
   if (st.level === "blocked" && !opts.force) {
@@ -440,6 +628,8 @@ function cmdRun(opts) {
   const job = {
     id, provider: provName, pool, model, role, reason, write: !!opts.write, cwd, task,
     scope,
+    idleTimeoutMin,
+    maxRuntimeMin,
     withJobs: withJobs.map((j) => j.id),
     wrappedPrompt: buildDispatchPrompt({
       task, cwd, write: !!opts.write, role,
@@ -451,13 +641,21 @@ function cmdRun(opts) {
     status: "running", startedAt: new Date().toISOString(), quotaAtStart: fmtPool(st),
   };
 
+  // 真正落盘时才认领。写入范围冲突时任务不会创建，记录留给下一次。
+  // 优先 cwd 与 CLAUDE_PROJECT_DIR（没有则用进程 cwd）相同的记录，没有就取 30 秒内最新一条。
+  const persistNewJob = () => {
+    const sessionId = claimPendingDispatch(process.env.CLAUDE_PROJECT_DIR || process.cwd());
+    if (sessionId) job.sessionId = sessionId;
+    saveJob(job);
+  };
+
   if (opts.write) {
     let conflict = null;
     withWriteLock(cwd, () => {
-      const writers = runningWriters(cwd, Date.now(), cfg.jobTimeoutMinutes || 30);
+      const writers = runningWriters(cwd, Date.now(), maxRuntimeMin);
       conflict = writers.find((w) => scopesOverlap(w.scope, scope, cwd));
       if (!conflict) {
-        saveJob(job);
+        persistNewJob();
       }
     });
     if (conflict) {
@@ -466,7 +664,7 @@ function cmdRun(opts) {
       process.exit(6);
     }
   } else {
-    saveJob(job);
+    persistNewJob();
   }
 
   if (opts.background) {
@@ -480,19 +678,22 @@ function cmdRun(opts) {
     console.log(`查看结果：node "${RELAY_SCRIPT}" result ${id}`);
     return;
   }
-  printJob(executeJob(job));
+  printJob(await executeJob(job));
 }
 
-function cmdWorker(opts) {
+async function cmdWorker(opts) {
   const job = loadJob(opts._[1]);
   job.pid = process.pid;
   saveJob(job);
-  executeJob(job);
+  await executeJob(job);
 }
 
 function cmdJobs(opts) {
   const jobs = allJobRecords(Number(opts.limit || 15));
-  if (opts.json) return console.log(JSON.stringify(jobs, null, 2));
+  if (opts.json) {
+    attachLiveUsage(jobs);
+    return console.log(JSON.stringify(jobs, null, 2));
+  }
   if (!jobs.length) return console.log("还没有外派记录");
   const st = { running: "进行中", done: "完成", failed: "失败", timeout: "超时", cancelled: "已取消" };
   for (const j of jobs) {
@@ -513,7 +714,7 @@ async function cmdQuota(opts) {
   // Grok 要联网查 grok.com，单独异步刷新；厂商停用时不查
   if (cfg.providers.grok && isEnabled(cfg.providers.grok)) cache = await refreshGrok({ stateDir: STATE_DIR, force: !!opts.force });
   if (opts.json) return console.log(JSON.stringify(cache.sources, null, 2));
-  const name = { claude: "Claude（插件读取当前会话）", codex: "Codex（本地会话记录）", agy: "Antigravity（agy /usage）", grok: "Grok（grok.com 计费接口，用 CLI 登录令牌）" };
+  const name = { claude: "Claude（插件读取当前会话）", codex: "Codex（官方 app-server 实时额度，失败时用本地会话记录）", agy: "Antigravity（agy /usage）", grok: "Grok（grok.com 计费接口，用 CLI 登录令牌）" };
   for (const [k, v] of Object.entries(cache.sources)) {
     console.log(`${name[k] || k}：${v.error ? `失败 — ${v.error}` : `${v.rows.length} 个窗口`}，更新于 ${v.fetchedAt ? fmtTime(v.fetchedAt) : "从未"}`);
   }
@@ -659,6 +860,7 @@ function cmdProviders(opts) {
       bin,
       binFound: bin ? !!resolveBin(bin) : false,
       models: Object.values(prov.pools || {}).flat(),
+      modelPools: buildModelPools(cfg, name, prov),
       roles: providerRoles(cfg, name),
       note: prov.note || "",
       // 最高权限开关：只有配了 cli.fullAccess 的员工能开关
@@ -766,11 +968,13 @@ function cmdProviderTest(opts) {
   if (prov.via !== "relay") throw new Error(prov.via === "codex-plugin" ? "Codex 走官方插件，请用 /codex:setup 检查" : "主控 Claude 无需试运行");
   const cwd = path.join(STATE_DIR, "probe");
   fs.mkdirSync(cwd, { recursive: true });
-  const model = Object.values(prov.pools || {}).flat()[0] || "default";
+  const firstPool = providerPools(prov)[0];
+  const rawModel = Object.values(prov.pools || {}).flat()[0] || "default";
+  const model = resolveModel(cfg, name, firstPool, rawModel);
   const started = Date.now();
   let result;
   try {
-    const { bin, args } = buildCommand(cfg, { provider: name, model, write: false, cwd, wrappedPrompt: "这是连通性测试：不要读写任何文件，不要执行命令，只回复两个字：在线" });
+    const { bin, args } = buildCommand(cfg, { provider: name, pool: firstPool, model, write: false, cwd, wrappedPrompt: "这是连通性测试：不要读写任何文件，不要执行命令，只回复两个字：在线" });
     const res = spawnSync(bin, args, { cwd, encoding: "utf8", timeout: Number(opts.timeout || 120) * 1000, stdio: ["ignore", "pipe", "pipe"] });
     const out = `${res.stdout || ""}${res.stderr ? `\n${res.stderr}` : ""}`.trim();
     const timedOut = res.error?.code === "ETIMEDOUT";
@@ -787,7 +991,50 @@ function cmdProviderTest(opts) {
   if (!result.ok) process.exit(5);
 }
 
-function cmdProvider(opts) {
+// 设置某厂商某额度池的默认模型
+async function cmdProviderModel(opts) {
+  const [, , name, pool, modelId] = opts._;
+  const cfg = loadConfig();
+  let modelsCache = loadModelsCache(STATE_DIR);
+  const prov = cfg.providers?.[name];
+  const inCfgPool = (prov?.pools?.[pool] || []).filter((m) => m !== "default").includes(modelId);
+  if (prov && modelId && modelId !== "default" && !inCfgPool && !modelsCache?.providers?.[name]?.models?.length) {
+    modelsCache = await getModels(cfg, { stateDir: STATE_DIR });
+  }
+  setProviderDefaultModel(cfg, name, pool, modelId, modelsCache);
+  saveConfig(cfg);
+  console.log(`${name} 默认模型 → ${modelId === "default" ? "跟随 CLI 默认" : modelId}（下一单起生效）`);
+}
+
+// 拉取或查看各厂商官方 CLI 的可用模型清单
+async function cmdModels(opts) {
+  const cfg = loadConfig();
+  const cache = await getModels(cfg, { stateDir: STATE_DIR, refresh: !!opts.refresh });
+  if (opts.json) return console.log(JSON.stringify(cache, null, 2));
+  console.log(`模型清单（更新于 ${cache.updatedAt || "从未"}）：`);
+  for (const [name, p] of Object.entries(cache.providers || {})) {
+    const prov = cfg.providers?.[name];
+    console.log(`\n${prov?.label || name} [${name}]：${p.ok ? `${p.models.length} 个模型` : `失败 — ${p.error}`}（CLI 默认：${p.cliDefault || "无"}）`);
+    for (const m of p.models || []) {
+      const def = m.pool && resolveModel(cfg, name, m.pool, "default") === m.id ? " ★默认" : "";
+      console.log(`  - ${m.id}${m.label && m.label !== m.id ? ` (${m.label})` : ""}  [${m.pool || "未归池"}]${def}`);
+    }
+  }
+}
+
+// 回填历史外派任务的 token 用量
+function cmdUsage(opts) {
+  if (!opts.backfill) throw new Error("用法：relay usage --backfill [--redo] [--json]");
+  const res = backfill({ redo: !!opts.redo });
+  if (opts.json) return console.log(JSON.stringify(res, null, 2));
+  console.log(`回填完成：补上 ${res.filled} 条，匹配不到 ${res.unmatched} 条${res.skipped ? `（已有 usage 跳过 ${res.skipped} 条）` : ""}`);
+  for (const item of res.items) {
+    const u = item.usage;
+    console.log(`  ${item.id} (${item.provider}) → input=${u.input}, output=${u.output}, cacheRead=${u.cacheRead}, total=${u.total}, source=${u.source}`);
+  }
+}
+
+async function cmdProvider(opts) {
   const sub = opts._[1];
   switch (sub) {
     case "enable": return setEnabled(opts._[2], true);
@@ -796,7 +1043,8 @@ function cmdProvider(opts) {
     case "remove": return cmdProviderRemove(opts);
     case "test": return cmdProviderTest(opts);
     case "access": return setFullAccess(opts._[2], opts._[3]);
-    default: throw new Error("用法：provider enable|disable|remove|test <名称>，provider access <名称> on|off，或 provider add --json-spec '<JSON>' / provider add <名称> --preset kimi");
+    case "model": return await cmdProviderModel(opts);
+    default: throw new Error("用法：provider enable|disable|remove|test <名称>，provider access <名称> on|off，provider model <名称> <额度池> <模型id|default>，或 provider add --json-spec '<JSON>' / provider add <名称> --preset kimi");
   }
 }
 
@@ -807,22 +1055,26 @@ function help() {
   pick <角色> [--write --target 目录] [--needs web,exec]   按打分挑选模型（擅长度 × 额度 × 可靠度 × 速度），并给出理由
                                   要写的目录在当前项目外时传 --target，写不到的厂商（如 Codex）会被跳过
                                   --needs 只在具备这些能力的厂商里选（web 联网，exec 执行命令，逗号分隔）
-  providers [--json]              列出厂商：启用状态、命令是否已安装、参与哪些角色
+  models [--refresh] [--json]     拉取或查看各厂商官方 CLI 的可用模型清单（缓存 24 小时）
+  providers [--json]              列出厂商：启用状态、命令是否已安装、参与哪些角色、额度池默认模型
   provider enable|disable <名称>   启用 / 停用某厂商（停用后路由与外派都跳过它）
+  provider model <名称> <额度池> <模型id|default>   设置某额度池的默认模型（单池厂商写 default 恢复跟随 CLI 默认）
   provider add <名称> --preset kimi|qwen|custom   新增厂商（面板里用 --json-spec）
   provider remove <名称>           删除厂商并移出所有路由（配置先备份为 .bak）
   provider test <名称>             只读试运行一句话，确认命令可用
-  run <厂商名|auto> --role r [--model m] [--write] [--scope 路径1,路径2] [--background] [--cwd 目录] [--with id1,id2] [--diff] [--force] [--needs web,exec] [-- 派单]
+  run <厂商名|auto> --role r [--model m] [--write] [--scope 路径1,路径2] [--background] [--cwd 目录] [--with id1,id2] [--diff] [--force] [--needs web,exec] [--idle-timeout 分钟] [--max-runtime 分钟] [-- 派单]
                                   调用官方 CLI 执行任务；派单走标准输入或 --prompt-file，必须含「目标」「验收标准」
                                   自动附上项目上下文和共享背景；--with 附前序结果，--diff 附当前改动
                                   auto 的首选是 Codex 时会停下，提示用 Agent 工具交给 Codex；加 --skip-codex 才改派第二名
                                   可写任务按写入范围并行，范围重叠会被拒绝
                                   --needs 指定所需能力（web 联网，exec 执行命令）；省略时从派单「需要的能力」读取。点名厂商若缺少能力会拒绝
+                                  --idle-timeout 覆盖无活动超时（默认 20 分钟）；--max-runtime 覆盖总运行时长上限（默认 240 分钟）
   brief [--context --cwd 目录]     派单模板；--context 预览会自动附上的项目上下文和共享背景
   context set|show|clear [--cwd 目录]   本次任务的共享背景（同目录 6 小时内的派单自动附上）
   verdict <id|last> pass|partial|fail [-- 说明]   记录验收结论，影响以后的可靠度打分
   clean [--json]                  清理过期的历史数据并显示磁盘占用（平时每天自动清理一次）
   quota [--force] [--json]        刷新自带额度（Claude 由状态插件提供，Codex 读本地记录，agy 跑 /usage）
+  usage --backfill [--redo] [--json]   从本机 CLI 会话日志回填历史外派任务（agy / Grok）的 token 用量
   jobs [--json] [--limit n]       外派记录（含 Codex 子代理）
   wait <id…> | result <id|last> | cancel <id>`);
 }
@@ -844,16 +1096,18 @@ async function main() {
       case "status": return cmdStatus(opts);
       case "mode": return cmdMode(opts);
       case "pick": return cmdPick(opts);
+      case "models": return await cmdModels(opts);
       case "brief": return cmdBrief(opts);
       case "context": return cmdContext(opts);
       case "verdict": return cmdVerdict(opts);
       case "clean": return cmdClean(opts);
       case "providers": return cmdProviders(opts);
-      case "provider": return cmdProvider(opts);
-      case "run": return cmdRun(opts);
-      case "_worker": return cmdWorker(opts);
+      case "provider": return await cmdProvider(opts);
+      case "run": return await cmdRun(opts);
+      case "_worker": return await cmdWorker(opts);
       case "jobs": return cmdJobs(opts);
       case "quota": return await cmdQuota(opts);
+      case "usage": return cmdUsage(opts);
       case "wait": return await cmdWait(opts);
       case "result": return printJob(loadAnyJob(opts._[1] || "last"));
       case "cancel": return cmdCancel(opts);
@@ -865,4 +1119,7 @@ async function main() {
   }
 }
 
-main();
+const isDirectRun = process.argv[1] && (path.resolve(process.argv[1]) === fileURLToPath(import.meta.url) || path.basename(process.argv[1]) === "relay.mjs");
+if (isDirectRun) {
+  main();
+}

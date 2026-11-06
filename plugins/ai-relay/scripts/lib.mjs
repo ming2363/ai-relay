@@ -21,6 +21,86 @@ export function ensureStateDir() {
   fs.mkdirSync(path.join(STATE_DIR, "locks"), { recursive: true });
 }
 
+// Bash 的 PreToolUse 只把当前会话落到这里，不改命令。
+// relay 建任务时认领：自动模式下只回 updatedInput 可能被拒绝，所以不能靠改写命令传递会话。
+export const PENDING_DISPATCH_DIR = path.join(STATE_DIR, "pending-dispatch");
+const PENDING_CLAIM_MS = 30_000;
+const PENDING_KEEP_MS = 5 * 60_000;
+
+// 写一条待认领记录。sessionId 为空则不写。返回记录路径。
+export function writePendingDispatch({ sessionId, cwd, at = Date.now() } = {}) {
+  const id = String(sessionId ?? "").trim();
+  if (!id) return null;
+  fs.mkdirSync(PENDING_DISPATCH_DIR, { recursive: true });
+  const body = JSON.stringify({ sessionId: id, cwd: typeof cwd === "string" ? cwd : "", at });
+  for (let i = 0; i < 5; i++) {
+    const name = `${at}-${crypto.randomBytes(4).toString("hex")}.json`;
+    const file = path.join(PENDING_DISPATCH_DIR, name);
+    const tmp = path.join(PENDING_DISPATCH_DIR, `.${name}.tmp`);
+    try {
+      fs.writeFileSync(tmp, body, { flag: "wx" });
+      fs.renameSync(tmp, file);
+      return file;
+    } catch (e) {
+      try { fs.unlinkSync(tmp); } catch {}
+      if (e.code !== "EEXIST") throw e;
+    }
+  }
+  throw new Error("写待认领记录失败");
+}
+
+// 认领 30 秒内的一条记录：cwd 与 matchCwd 相同的优先，否则取最新。
+// 认领后立刻删除，避免被下一个任务再用。超过 5 分钟的顺手删掉。
+// 没有可认领的记录时返回空串。
+export function claimPendingDispatch(matchCwd, now = Date.now()) {
+  if (!fs.existsSync(PENDING_DISPATCH_DIR)) return "";
+  const target = String(matchCwd ?? "");
+  const fresh = [];
+  for (const name of fs.readdirSync(PENDING_DISPATCH_DIR)) {
+    const full = path.join(PENDING_DISPATCH_DIR, name);
+    let st;
+    try {
+      st = fs.statSync(full);
+    } catch {
+      continue;
+    }
+    if (!st.isFile()) continue;
+    if (!name.endsWith(".json")) {
+      if (now - st.mtimeMs > PENDING_KEEP_MS) {
+        try { fs.unlinkSync(full); } catch {}
+      }
+      continue;
+    }
+    let rec = null;
+    try {
+      rec = JSON.parse(fs.readFileSync(full, "utf8"));
+    } catch {}
+    const at = Number(rec?.at);
+    if (!rec || !Number.isFinite(at) || now - at > PENDING_KEEP_MS) {
+      try { fs.unlinkSync(full); } catch {}
+      continue;
+    }
+    if (now - at <= PENDING_CLAIM_MS) fresh.push({ full, rec, at });
+  }
+  const matched = fresh.filter((item) => String(item.rec.cwd ?? "") === target);
+  const pool = (matched.length ? matched : fresh).slice().sort((a, b) => b.at - a.at || (a.full < b.full ? 1 : -1));
+  for (const item of pool) {
+    const holding = `${item.full}.${process.pid}.claiming`;
+    try {
+      fs.renameSync(item.full, holding);
+    } catch {
+      continue;
+    }
+    let sessionId = "";
+    try {
+      sessionId = String(JSON.parse(fs.readFileSync(holding, "utf8")).sessionId ?? "").trim();
+    } catch {}
+    try { fs.unlinkSync(holding); } catch {}
+    if (sessionId) return sessionId;
+  }
+  return "";
+}
+
 // 用户配置放在 ~/.claude/ai-relay/providers.json，首次运行从插件默认配置复制，插件升级不会覆盖
 export function loadConfig() {
   ensureStateDir();
@@ -29,8 +109,63 @@ export function loadConfig() {
     fs.copyFileSync(path.join(PLUGIN_ROOT, "config", "providers.default.json"), userFile);
   }
   const cfg = JSON.parse(fs.readFileSync(userFile, "utf8"));
+  if (migrateModelFields(cfg)) {
+    // 升级写回前留一份 .bak，写失败不影响本次使用
+    try {
+      fs.copyFileSync(userFile, `${userFile}.bak`);
+      fs.writeFileSync(userFile, JSON.stringify(cfg, null, 2) + "\n");
+    } catch {}
+  }
+  // 超时配置：idleTimeoutMin 默认 20 分钟；maxRuntimeMin 默认 240 分钟。
+  // 旧配置 jobTimeoutMinutes 是"总时长 30 分钟一刀切"，正是新规则要取代的，不再沿用其值
+  if (cfg.idleTimeoutMin === undefined) {
+    cfg.idleTimeoutMin = 20;
+  }
+  if (cfg.maxRuntimeMin === undefined) {
+    cfg.maxRuntimeMin = 240;
+  }
+  cfg.jobTimeoutMinutes = cfg.maxRuntimeMin;
   cfg._file = userFile;
   return cfg;
+}
+
+// 旧配置升级（默认模型功能之前复制的用户配置不含这些字段）：
+// 内置厂商缺少的模型清单字段从默认配置补齐；某厂商本次刚补上 defaultModels 时，
+// 把路由里与池默认模型相同的条目改写成 default（解析结果不变，之后才会跟随用户选的默认模型）。
+// 只在补字段的那一次改写路由，避免以后改了默认模型又把单独指定的条目吞掉
+export function migrateModelFields(cfg, def) {
+  if (!def) {
+    try {
+      def = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, "config", "providers.default.json"), "utf8"));
+    } catch {
+      return false;
+    }
+  }
+  let changed = false;
+  const freshDefaults = new Set();
+  for (const [name, dp] of Object.entries(def.providers || {})) {
+    const p = cfg.providers?.[name];
+    if (!p) continue;
+    for (const key of ["modelList", "poolRules", "poolLabels", "defaultModels"]) {
+      if (dp[key] === undefined || p[key] !== undefined) continue;
+      p[key] = structuredClone(dp[key]);
+      changed = true;
+      if (key === "defaultModels") freshDefaults.add(name);
+    }
+  }
+  for (const [role, route] of Object.entries(cfg.routes || {})) {
+    if (!Array.isArray(route)) continue;
+    cfg.routes[role] = route.map((entry) => {
+      const parts = entry.split(":");
+      const [prov, pool, model] = parts;
+      if (!freshDefaults.has(prov) || model === "default") return entry;
+      if (cfg.providers[prov].defaultModels?.[pool] !== model) return entry;
+      parts[2] = "default";
+      changed = true;
+      return parts.join(":");
+    });
+  }
+  return changed;
 }
 
 export function getMode() {
@@ -168,6 +303,15 @@ export function poolOfModel(prov, model) {
     if (models.includes(model)) return pool;
   }
   return null;
+}
+
+// 解析实际模型：model 为 default 且 defaultModels[pool] 有值时返回该值，否则原样返回
+export function resolveModel(cfg, provName, pool, model) {
+  if (model === "default") {
+    const def = cfg?.providers?.[provName]?.defaultModels?.[pool];
+    if (def) return def;
+  }
+  return model;
 }
 
 // 按路由表挑选：额度充足的按顺序优先，其次额度未知，再次额度偏低；耗尽的剔除
@@ -417,6 +561,9 @@ export function allJobRecords(limit = Infinity) {
           scope: j.scope ?? null,
           pid: j.pid ?? null,
           helpRequest: j.helpRequest || "",
+          // 发起这次外派的 Claude 会话；旧任务没有，jobs --json 就不带这个字段
+          ...(typeof j.sessionId === "string" && j.sessionId.trim() ? { sessionId: j.sessionId.trim() } : {}),
+          ...(j.usage ? { usage: j.usage } : {}),
         };
       } catch {
         return null;
@@ -503,7 +650,7 @@ export function isPathInScope(filePath, scope, cwd) {
   return normList.some((s) => normFile === s || normFile.startsWith(s + "/"));
 }
 
-export function runningWriters(cwd, now = Date.now(), maxMinutes = 30) {
+export function runningWriters(cwd, now = Date.now(), maxMinutes = 240) {
   const targetCwd = path.resolve(cwd);
   const maxMs = maxMinutes * 60_000;
   return allJobRecords().filter((r) => {
@@ -664,6 +811,38 @@ export function checkOutOfScope(changedFiles, scope, cwd) {
     }
   }
   return out;
+}
+
+// 获取工作区被修改文件的最新修改时间（只看 git 已跟踪或新增文件的 mtime，限 limit 个以内，超出跳过返回 0）
+export function getWorkspaceActivityMtime(cwd, limit = 2000) {
+  if (!cwd) return 0;
+  try {
+    const raw = execFileSync("git", ["-C", cwd, "-c", "core.quotePath=false", "status", "--porcelain"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const lines = raw.split("\n").filter(Boolean);
+    const paths = new Set();
+    for (const line of lines) {
+      for (const p of parseGitStatusPaths(line)) {
+        paths.add(p);
+      }
+    }
+    if (paths.size === 0 || paths.size > limit) return 0;
+    let maxMtime = 0;
+    const now = Date.now();
+    for (const p of paths) {
+      try {
+        const full = path.resolve(cwd, p);
+        const st = fs.statSync(full);
+        const mtime = Math.min(st.mtimeMs, now);
+        if (mtime > maxMtime) maxMtime = mtime;
+      } catch {}
+    }
+    return maxMtime;
+  } catch {
+    return 0;
+  }
 }
 
 // 验收结论写回记录：pass 通过 / partial 部分通过 / fail 不通过；会影响以后给这个模型打的可靠度

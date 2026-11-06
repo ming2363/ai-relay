@@ -1,12 +1,27 @@
-// PreToolUse 钩子：按模式和额度拦截对 Codex 子代理的调用
+// PreToolUse 钩子：按模式和额度拦截对 Codex 子代理的调用；
+// Bash 里执行 relay run 时，把当前会话记成待认领记录，供面板按会话归外派
 import fs from "node:fs";
 import path from "node:path";
 import {
   ULW_RE, MENTION_RE, STATE_DIR, loadConfig, getMode, readQuotaRows, poolStatus,
   loadPrompt, fmtPool, isEnabled, appendHistory, lastPick, runningWriters, scopesOverlap,
-  normScope, withWriteLock, gitSnapshot, workspaceRoot, isInside,
+  normScope, withWriteLock, gitSnapshot, workspaceRoot, isInside, writePendingDispatch,
 } from "./lib.mjs";
 import { BRIEF_TEMPLATE, checkBrief, roleOfBrief, buildDispatchPrompt, readSharedContext, scopeOfBrief, needsOfBrief } from "./brief.mjs";
+
+// 不改命令、不做权限决定：自动模式只回 updatedInput 时，这次 Bash 可能被拒绝。
+// 只落一条记录，relay 建任务时按 cwd 认领。
+function handleBash(input) {
+  const command = input?.tool_input?.command;
+  if (typeof command !== "string") return;
+  if (!command.includes("relay.mjs") || !command.includes(" run ")) return;
+  const sessionId = String(input.session_id ?? "").trim();
+  if (!sessionId) return;
+  writePendingDispatch({
+    sessionId,
+    cwd: typeof input.cwd === "string" ? input.cwd : "",
+  });
+}
 
 function deny(reason) {
   process.stdout.write(
@@ -18,6 +33,7 @@ function deny(reason) {
 
 function main() {
   const input = JSON.parse(fs.readFileSync(0, "utf8") || "{}");
+  if (input.tool_name === "Bash") return handleBash(input);
   const agent = String(input.tool_input?.subagent_type || "");
   if (!agent.startsWith("codex:")) return;
 

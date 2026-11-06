@@ -1,5 +1,5 @@
 // ai-relay 模型打分路由：按擅长度、额度紧迫度、历史可靠度、执行速度、当前负载综合打分并排序
-import { capsOf, isEnabled, isInside, poolStatus } from "./lib.mjs";
+import { capsOf, isEnabled, isInside, poolStatus, resolveModel } from "./lib.mjs";
 
 const WINDOW_TOTAL_HOURS = {
   "5h": 5,
@@ -232,9 +232,10 @@ export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now
 
   for (let i = 0; i < route.length; i++) {
     const entry = route[i];
-    const [provName, pool, model, fitRaw] = entry.split(":");
+    const [provName, pool, routeModel, fitRaw] = entry.split(":");
     if (only && provName !== only) continue;
 
+    const model = resolveModel(cfg, provName, pool, routeModel);
     const prov = cfg.providers?.[provName];
     const quotaProvider = prov?.quota?.provider || provName;
     const st = poolStatus(cfg, rows, quotaProvider, pool, now);
@@ -244,6 +245,7 @@ export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now
         provider: provName,
         pool,
         model,
+        routeModel,
         via: prov?.via,
         status: st,
         why: "已停用",
@@ -258,6 +260,7 @@ export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now
         provider: provName,
         pool,
         model,
+        routeModel,
         via: prov?.via,
         status: st,
         why: capsWhy,
@@ -270,6 +273,7 @@ export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now
         provider: provName,
         pool,
         model,
+        routeModel,
         via: prov?.via,
         status: st,
         why: "额度耗尽或过低",
@@ -283,6 +287,7 @@ export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now
         provider: provName,
         pool,
         model,
+        routeModel,
         via: prov?.via,
         status: st,
         why: `沙箱只能写 ${workspace}，目标目录不在其中`,
@@ -306,6 +311,7 @@ export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now
       provider: provName,
       pool,
       model,
+      routeModel,
       via: prov?.via,
       status: st,
       score,

@@ -1,13 +1,15 @@
 // ai-relay 自带的额度获取：不依赖 AIQuota5h，各家用各自官方工具或本地记录
 //   Claude：由状态插件把当前会话的 rateLimits 传进来（插件接口 $.session.usage）
-//   Codex ：读 ~/.codex/sessions 里最近一次会话记录中的 rate_limits（不联网）
+//   Codex ：优先问本机 codex app-server 的 account/rateLimits/read（和官方同一份额度）；
+//           问不到时，再读 ~/.codex/sessions 里时间最新的一条 rate_limits
 //   agy   ：运行 `agy -p /usage`（斜杠命令，不消耗模型额度，约 3 秒）
 //   Grok  ：官方 CLI 没有查额度的命令，直接查 grok.com 计费接口（用 CLI 登录令牌）；失败时沿用 AIQuota5h
 // 结果写入 ~/.claude/ai-relay/quota-cache.json，钩子只读缓存，不在每条消息时现查
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const CODEX_TAIL_BYTES = 256 * 1024;
 const AGY_MIN_INTERVAL_MS = 5 * 60_000;
@@ -43,7 +45,62 @@ export function claudeRows(limits, now) {
     .map((l) => row("claude", "claude-subscription", keyOf[l.kind], Math.max(0, 100 - l.percentUsed) / 100, l.resetsAt ? Date.parse(l.resetsAt) : null, now));
 }
 
-// Codex：找最近修改的会话文件，取文件尾部最后一条 rate_limits
+// 一条 Codex 额度快照（会话日志是 snake_case，app-server 是 camelCase）转成额度行。
+// primary / secondary 谁是 5 小时、谁是每周，只看窗口长度，不看字段顺序。
+export function rowsFromCodexSnapshot(rl, at = Date.now()) {
+  if (!rl || typeof rl !== "object") return [];
+  const limitId = rl.limit_id ?? rl.limitId ?? null;
+  if (limitId && limitId !== "codex") return [];
+  const out = [];
+  for (const w of [rl.primary, rl.secondary]) {
+    if (!w || typeof w !== "object") continue;
+    const used = typeof w.used_percent === "number" ? w.used_percent : w.usedPercent;
+    if (typeof used !== "number" || !Number.isFinite(used)) continue;
+    const minutes = typeof w.window_minutes === "number" ? w.window_minutes : w.windowDurationMins;
+    const key = typeof minutes === "number" && minutes <= 300 ? "5h" : "weekly";
+    const resets = typeof w.resets_at === "number" ? w.resets_at : typeof w.resetsAt === "number" ? w.resetsAt : null;
+    out.push(row("codex", "codex", key, Math.max(0, 100 - used) / 100, resets ? resets * 1000 : null, at));
+  }
+  return out;
+}
+
+function readTail(filePath) {
+  const size = fs.statSync(filePath).size;
+  const fd = fs.openSync(filePath, "r");
+  try {
+    const len = Math.min(size, CODEX_TAIL_BYTES);
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, Math.max(0, size - len));
+    return buf.toString("utf8");
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// 一个会话文件尾部里，时间最新、且属于 codex 额度桶的那条快照
+function newestSnapshotInText(text) {
+  let best = null;
+  for (const line of text.split("\n")) {
+    if (!line.includes('"rate_limits"')) continue;
+    let d;
+    try {
+      d = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const rl = d?.payload?.rate_limits;
+    if (!rl) continue;
+    const at = Date.parse(d.timestamp);
+    if (!Number.isFinite(at)) continue;
+    const out = rowsFromCodexSnapshot(rl, at);
+    if (!out.length) continue;
+    if (!best || at >= best.at) best = { at, out };
+  }
+  return best;
+}
+
+// 会话日志：按额度记录自己的时间取最新一条，不按文件修改时间。
+// 文件被续写后修改时间会变新，但尾部最后一条 rate_limits 可能仍是上一个窗口的旧读数。
 export function codexRows(home = os.homedir()) {
   const root = path.join(home, ".codex", "sessions");
   const files = [];
@@ -62,33 +119,148 @@ export function codexRows(home = os.homedir()) {
   };
   walk(root, 0);
   files.sort((a, b) => b.m - a.m);
-  for (const { p } of files.slice(0, 5)) {
-    const size = fs.statSync(p).size;
-    const fd = fs.openSync(p, "r");
-    const len = Math.min(size, CODEX_TAIL_BYTES);
-    const buf = Buffer.alloc(len);
-    fs.readSync(fd, buf, 0, len, size - len);
-    fs.closeSync(fd);
-    const lines = buf.toString("utf8").split("\n").filter((l) => l.includes('"rate_limits"'));
-    for (const line of lines.reverse()) {
-      try {
-        const d = JSON.parse(line);
-        const rl = d.payload?.rate_limits;
-        if (!rl || (rl.limit_id && rl.limit_id !== "codex")) continue;
-        const at = Date.parse(d.timestamp) || Date.now();
-        const out = [];
-        for (const w of [rl.primary, rl.secondary]) {
-          if (!w || typeof w.used_percent !== "number") continue;
-          const key = w.window_minutes <= 300 ? "5h" : "weekly";
-          out.push(row("codex", "codex", key, Math.max(0, 100 - w.used_percent) / 100, w.resets_at ? w.resets_at * 1000 : null, at));
-        }
-        if (out.length) return out;
-      } catch {
-        // 半截的行跳过
-      }
+  let best = null;
+  for (const { p, m } of files) {
+    // 修改时间不会早于文件里的记录。已经找到更新的额度后，更旧的文件可以停。
+    if (best && m + 5_000 < best.at) break;
+    let snap = null;
+    try {
+      snap = newestSnapshotInText(readTail(p));
+    } catch {
+      continue;
+    }
+    if (snap && (!best || snap.at > best.at)) best = snap;
+  }
+  return best ? best.out : [];
+}
+
+function resolveCodexBin() {
+  const dirs = [
+    ...(process.env.PATH || "").split(":"),
+    path.join(os.homedir(), ".local", "bin"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+  ];
+  for (const dir of dirs) {
+    if (!dir) continue;
+    const p = path.join(dir, "codex");
+    try {
+      fs.accessSync(p, fs.constants.X_OK);
+      return p;
+    } catch {
+      // 继续找下一个目录
     }
   }
-  return [];
+  return null;
+}
+
+// 问本机 app-server。子进程只把窗口数字打出来，账号标识不带出这个函数。
+function codexLiveRows(now) {
+  const bin = resolveCodexBin();
+  if (!bin) return [];
+  const res = spawnSync(process.execPath, [fileURLToPath(import.meta.url), "--codex-live", bin], {
+    encoding: "utf8",
+    timeout: 18_000,
+    env: process.env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (res.error || res.status !== 0) return [];
+  const line = (res.stdout || "").trim().split("\n").pop();
+  let payload;
+  try {
+    payload = JSON.parse(line);
+  } catch {
+    return [];
+  }
+  if (!payload?.ok || !payload.snapshot) return [];
+  return rowsFromCodexSnapshot(payload.snapshot, now);
+}
+
+// 供 `node quota.mjs --codex-live <codex 可执行文件>` 使用，刷新额度时拉起，不给别人当命令
+async function readCodexLiveSnapshot(bin) {
+  const child = spawn(bin, ["app-server"], { stdio: ["pipe", "pipe", "ignore"], detached: true });
+  const stop = () => {
+    try {
+      process.kill(-child.pid, "SIGTERM");
+    } catch {
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        // 进程已经退出
+      }
+    }
+  };
+  let buf = "";
+  const messages = [];
+  child.stdout.on("data", (chunk) => {
+    buf += chunk.toString("utf8");
+    let idx;
+    while ((idx = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, idx).trim();
+      buf = buf.slice(idx + 1);
+      if (!line || line.toLowerCase().startsWith("content-length")) continue;
+      try {
+        messages.push(JSON.parse(line));
+      } catch {
+        // 这一行不是完整 JSON，丢掉。还没换行的半截仍留在 buf 里
+      }
+    }
+  });
+  const send = (obj) => child.stdin.write(JSON.stringify(obj) + "\n");
+  // 父进程超时只会杀掉这个脚本；app-server 在独立进程组里，要一起停掉
+  process.once("SIGTERM", () => {
+    stop();
+    process.exit(1);
+  });
+  const waitId = async (id, ms) => {
+    const start = Date.now();
+    while (Date.now() - start < ms) {
+      const i = messages.findIndex((m) => m.id === id);
+      if (i >= 0) return messages.splice(i, 1)[0];
+      if (child.exitCode !== null) throw new Error("codex app-server 已退出");
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    }
+    throw new Error("codex app-server 查询额度超时");
+  };
+  try {
+    send({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { clientInfo: { name: "ai-relay", version: "0.0.0" }, capabilities: {} },
+    });
+    const init = await waitId(1, 8_000);
+    if (init.error) throw new Error("codex app-server 初始化失败");
+    send({ jsonrpc: "2.0", method: "initialized" });
+    send({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "account/rateLimits/read",
+      params: { excludeResetCreditDetails: true },
+    });
+    const resp = await waitId(2, 8_000);
+    if (resp.error || !resp.result) throw new Error("codex app-server 没有返回额度");
+    const result = resp.result;
+    const by = result.rateLimitsByLimitId || {};
+    let rl = by.codex || null;
+    if (!rl && result.rateLimits && (!result.rateLimits.limitId || result.rateLimits.limitId === "codex")) rl = result.rateLimits;
+    if (!rl?.primary && !rl?.secondary) throw new Error("codex app-server 没有返回额度");
+    const win = (w) => (w ? { usedPercent: w.usedPercent, windowDurationMins: w.windowDurationMins ?? null, resetsAt: w.resetsAt ?? null } : null);
+    return { limitId: "codex", primary: win(rl.primary), secondary: win(rl.secondary) };
+  } finally {
+    stop();
+  }
+}
+
+if (path.basename(process.argv[1] || "") === "quota.mjs" && process.argv[2] === "--codex-live") {
+  readCodexLiveSnapshot(process.argv[3])
+    .then((snapshot) => {
+      process.stdout.write(JSON.stringify({ ok: true, snapshot }));
+      process.exit(0);
+    })
+    .catch(() => {
+      process.exit(1);
+    });
 }
 
 // agy：`agy -p /usage` 输出每行「分组\t窗口说明\t剩余%\t重置时间」
@@ -144,10 +316,11 @@ export function refreshCache({ stateDir, claudeLimits, agyBin, force = false, no
     });
   }
   set("codex", () => {
-    const rows = codexRows();
-    if (!rows.length) throw new Error("本机没有找到 Codex 的会话记录（用过一次 Codex 后才有）");
-    // 记录里是最后一次使用 Codex 时的额度；没再用就没再消耗，按刚读到处理，不标过期
-    return rows.map((r) => ({ ...r, updated_at: now }));
+    // 实时接口和官方界面同一份额度。接口不可用时才退回本机会话日志，日志按记录时间取最新一条
+    const rows = codexLiveRows(now);
+    const fallback = rows.length ? rows : codexRows();
+    if (!fallback.length) throw new Error("本机没有找到 Codex 的会话记录（用过一次 Codex 后才有）");
+    return fallback.map((r) => ({ ...r, updated_at: now }));
   });
   if (agyBin) {
     const last = cache.sources.agy?.fetchedAt || 0;

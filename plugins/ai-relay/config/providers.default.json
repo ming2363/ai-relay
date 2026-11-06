@@ -5,7 +5,8 @@
   "lowRemaining": 0.3,
   "staleMinutes": 15,
   "claudeConserveBelow": 0.2,
-  "jobTimeoutMinutes": 30,
+  "idleTimeoutMin": 20,
+  "maxRuntimeMin": 240,
   "selfEditMaxLines": 40,
   "workerFullAccess": true,
   "scoreWeights": {
@@ -34,6 +35,13 @@
         "pools": [
           "codex"
         ]
+      },
+      "modelList": {
+        "cmd": [
+          "debug",
+          "models"
+        ],
+        "format": "codex-json"
       },
       "pools": {
         "codex": [
@@ -73,6 +81,36 @@
         "fullAccess": [
           "--dangerously-skip-permissions"
         ]
+      },
+      "modelList": {
+        "cmd": [
+          "models"
+        ],
+        "format": "agy-table"
+      },
+      "poolRules": [
+        [
+          "argon",
+          "gemini-argon"
+        ],
+        [
+          "flash",
+          "gemini"
+        ],
+        [
+          "^(claude|gpt)",
+          "claude-gpt"
+        ]
+      ],
+      "poolLabels": {
+        "gemini-argon": "Gemini Argon",
+        "claude-gpt": "Claude / GPT",
+        "gemini": "Gemini Flash"
+      },
+      "defaultModels": {
+        "gemini-argon": "gemini-4-argon-high",
+        "claude-gpt": "claude-opus-5-5-high",
+        "gemini": "gemini-3.8-flash-high"
       },
       "pools": {
         "gemini-argon": [
@@ -129,6 +167,12 @@
           "--always-approve"
         ]
       },
+      "modelList": {
+        "cmd": [
+          "models"
+        ],
+        "format": "grok-list"
+      },
       "pools": {
         "supergrok-weekly": [
           "default"
@@ -143,31 +187,32 @@
   "routes": {
     "implement": [
       "codex:codex:default",
-      "grok:supergrok-weekly:default",
+      "agy:gemini-argon:default:0.9",
+      "grok:supergrok-weekly:default:0.85",
       "agy:claude-gpt:claude-sonnet-5-5-high",
-      "agy:gemini:gemini-3.8-flash-high"
+      "agy:gemini:default"
     ],
     "debug": [
       "codex:codex:default",
       "grok:supergrok-weekly:default",
-      "agy:gemini-argon:gemini-4-argon-high",
-      "agy:claude-gpt:claude-opus-5-5-high",
-      "agy:gemini:gemini-3.8-flash-high"
+      "agy:gemini-argon:default",
+      "agy:claude-gpt:default",
+      "agy:gemini:default"
     ],
     "review": [
       "grok:supergrok-weekly:default",
-      "agy:gemini-argon:gemini-4-argon-high",
-      "agy:gemini:gemini-3.8-flash-high",
+      "agy:gemini-argon:default",
+      "agy:gemini:default",
       "codex:codex:default"
     ],
     "read": [
-      "agy:gemini:gemini-3.8-flash-high",
+      "agy:gemini:default",
       "agy:gemini-argon:gemini-4-argon-medium",
       "grok:supergrok-weekly:default"
     ],
     "deep": [
-      "agy:gemini-argon:gemini-4-argon-high",
-      "agy:claude-gpt:claude-opus-5-5-high",
+      "agy:gemini-argon:default",
+      "agy:claude-gpt:default",
       "codex:codex:default"
     ],
     "quick": [
@@ -175,8 +220,8 @@
       "grok:supergrok-weekly:default"
     ],
     "claude-backup": [
-      "agy:claude-gpt:claude-opus-5-5-high",
-      "agy:gemini-argon:gemini-4-argon-high",
+      "agy:claude-gpt:default",
+      "agy:gemini-argon:default",
       "codex:codex:default"
     ]
   }

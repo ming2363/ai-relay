@@ -148,7 +148,7 @@ Default route order, which is the fit order. The live pick still applies the ful
 
 | Role | Default order |
 |---|---|
-| `implement` | Codex → Grok → agy Claude Sonnet → Gemini 3.8 Flash |
+| `implement` | Codex → Gemini 4 Argon → Grok → agy Claude Sonnet → Gemini 3.8 Flash |
 | `debug` | Codex → Grok → Gemini 4 Argon → agy Claude Opus → Gemini 3.8 Flash |
 | `review` | Grok → Gemini 4 Argon → Gemini 3.8 Flash → Codex |
 | `read` | Gemini 3.8 Flash → Gemini 4 Argon → Grok |

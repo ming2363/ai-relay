@@ -148,7 +148,7 @@ Codex 插件的启停要新会话才完全生效。当前会话里，钩子会�
 
 | 角色 | 默认顺序 |
 |---|---|
-| `implement` | Codex → Grok → agy 上的 Claude Sonnet → Gemini 3.8 Flash |
+| `implement` | Codex → Gemini 4 Argon → Grok → agy 上的 Claude Sonnet → Gemini 3.8 Flash |
 | `debug` | Codex → Grok → Gemini 4 Argon → agy 上的 Claude Opus → Gemini 3.8 Flash |
 | `review` | Grok → Gemini 4 Argon → Gemini 3.8 Flash → Codex |
 | `read` | Gemini 3.8 Flash → Gemini 4 Argon → Grok |

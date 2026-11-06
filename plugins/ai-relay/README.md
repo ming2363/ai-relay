@@ -81,7 +81,7 @@
 
 | 角色 | 路由表顺序（决定擅长度） |
 |---|---|
-| implement 实现 | Codex → Grok → agy·Claude Sonnet → Gemini Flash |
+| implement 实现 | Codex → Gemini Argon → Grok → agy·Claude Sonnet → Gemini Flash |
 | debug 排查 | Codex → Grok → Gemini Argon → agy·Claude Opus → Gemini Flash |
 | review 审查 | Grok → Gemini Argon → Gemini Flash → Codex |
 | read 大量阅读 | Gemini Flash → Argon → Grok |
@@ -90,6 +90,12 @@
 | claude-backup 替 Claude | agy·Claude Opus → Argon → Codex |
 
 实际选谁要看打分。Claude 自身 5 小时额度低于 20% 时，验收中的小修补也改为外派。
+
+### 默认模型
+
+- 路由条目 `provider:pool:model[:fit]` 中 `model` 为 `default` 时，取该额度池的默认模型；写了具体模型 id 的条目不受影响（如 `implement` 的 `claude-sonnet-5-5-high`、`read` 的 `gemini-4-argon-medium`、`quick` 的 `gemini-3.8-flash-medium`）。
+- 默认模型存在 `~/.claude/ai-relay/providers.json` 的 `providers.<名称>.defaultModels.<额度池>`。单池厂商（Codex、Grok）未设时不传模型参数、跟随 CLI 默认；多池厂商（agy）每个额度池必须指定默认模型。
+- 命令与面板：可在面板「厂商」页切换，或用 `relay models [--refresh]` 从官方 CLI 拉取最新模型清单（缓存 24 小时）、`relay provider model <厂商> <额度池> <模型id|default>` 设置默认模型。
 
 ## 增删会员 / 启用停用
 
@@ -113,6 +119,7 @@ Gemini 会员不需要新增：Google 已停止 Gemini CLI 的个人版（实测
 - agy / Grok 在无人值守模式下能不能执行终端命令，取决于该厂商的「最高权限」开关（默认开）。关掉时命令会被拒绝，它们只读写文件，测试由主管来跑。Codex 不受这个开关影响，在官方插件固定的沙箱里执行命令。
 - Grok 在 `-p` 模式下的默认权限会直接改文件，因此只读任务固定加 `--permission-mode plan`（已内置）。
 - Grok 较慢，单次 10–70 秒。
+- 任务超时按活动判断：每 60 秒检查终端输出、会话日志与工作区改动，连续 20 分钟无活动判定卡死；总时长 4 小时兜底。可用 `--idle-timeout` 与 `--max-runtime` 调整。
 - 额度缓存由状态插件每分钟刷新（agy、Grok 每 5 分钟查一次）；也可手动运行 `relay quota`。Grok 的官方 CLI 没有查额度的命令，relay 用 Grok CLI 的登录令牌直接查 grok.com 的计费接口（令牌只在本机内存里使用，过期时不会自己刷新）；查不到时，装了 AIQuota5h 就沿用它的数据。
 - 外派记录：面板「对话」页按对话轮次列出每轮的主模型、Claude 子代理、Codex 和 relay 外派，每轮回答下方也会写一行"本轮模型"；只看外派列表可用 `relay jobs`。
 

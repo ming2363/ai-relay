@@ -637,3 +637,35 @@ test("23. 不传 needs 时不按能力跳过", () => {
   assert.equal(res.choice?.provider, "codex");
   assert.equal(res.skipped.length, 0);
 });
+
+test("24. route 写 default 且有 defaultModels 时，候选 model 是实际模型，可靠度按实际模型查", () => {
+  const cfg = {
+    minRemaining: 0.15,
+    lowRemaining: 0.3,
+    providers: {
+      agy: {
+        via: "relay",
+        quota: { provider: "antigravity" },
+        defaultModels: {
+          "gemini-argon": "gemini-4-argon-high",
+        },
+      },
+    },
+    routes: {
+      implement: ["agy:gemini-argon:default:0.9"],
+    },
+  };
+  const now = 1700000000000;
+  const rows = [
+    { provider: "antigravity", pool_id: "gemini-argon", window_key: "5h", remaining_fraction: 0.8, reset_at: now + 4 * 3600000, allowance: "available", updated_at: now },
+  ];
+  const history = [
+    { provider: "agy", model: "gemini-4-argon-high", status: "failed", verdict: "fail", role: "implement" },
+  ];
+
+  const res = scoreRoute(cfg, rows, "implement", { now, history });
+  assert.equal(res.choice?.model, "gemini-4-argon-high");
+  assert.equal(res.choice?.routeModel, "default");
+  // 按实际模型 gemini-4-argon-high 查到 1 条同角色 fail，reliability 从 0.94 降为 0.76
+  assert.equal(res.choice?.parts.reliability, 0.76);
+});

@@ -47,6 +47,26 @@ export type Snapshot = {
   thresholds: { min: number; low: number }
 }
 
+/** 单个模型或外派任务的 Token 消耗 */
+export type TokenUsage = {
+  /** 输入 token 数（含新建缓存） */
+  input: number
+  /** 输出 token 数 */
+  output: number
+  /** 缓存命中读取的 token 数 */
+  cacheRead: number
+  /** 总 token 数 */
+  total?: number
+}
+
+/** 轮次详情里的一行 Token 消耗 */
+export type RoundTokenRow = {
+  /** 模型显示名，或最后一行「合计」 */
+  label: string
+  /** 取不到数据时为 null（界面显示「无数据」） */
+  usage: TokenUsage | null
+}
+
 /** 一条外派记录 */
 export type JobView = {
   id: string
@@ -74,6 +94,8 @@ export type JobView = {
   helpRequest?: string
   /** 任务执行所在目录 */
   cwd?: string
+  /** 任务结束时 CLI 报告的 token 消耗；取不到时不填 */
+  usage?: TokenUsage | null
 }
 
 /** 一轮对话里主模型启动的子代理（Agent 工具），含经 Codex 插件外派的 Codex */
@@ -111,7 +133,7 @@ export type Round = {
   selfLines: number
   /** 会话 id */
   sessionId: string
-  /** 所属项目：目录名与绝对路径 */
+  /** 所属项目：会话启动目录的末级名和绝对路径 */
   project: { name: string; path: string }
   /** 界面环境：desktop | terminal | vscode | mobile | headless */
   env: string
@@ -149,6 +171,63 @@ export type Vendor = {
     /** 不能开关时的原因 */
     note: string
   }
+  /** 可设置默认模型的额度池；主模型和没有清单的厂商为空 */
+  modelPools: ModelPool[]
+}
+
+/** 路由里写死了具体模型的角色 */
+export type ModelFixedRole = {
+  role: string
+  model: string
+}
+
+/** 一个额度池的默认模型 */
+export type ModelPool = {
+  /** 额度池标识，如 supergrok-weekly、gemini-argon */
+  pool: string
+  /** 行标题，如 Gemini Argon */
+  label: string
+  /** 当前默认模型 id；跟随 CLI 默认时为 null */
+  current: string | null
+  /** 能否选「跟随 CLI 默认」；多池厂商为 false */
+  allowCliDefault: boolean
+  /** 路由里该池写 default 的角色 */
+  followRoles: string[]
+  /** 路由里该池写了具体模型的角色 */
+  fixedRoles: ModelFixedRole[]
+}
+
+/** 清单里的一个模型 */
+export type CatalogModel = {
+  id: string
+  label: string
+  /** 所属额度池；归不进任何池为 null，不能被选 */
+  pool: string | null
+}
+
+/** relay models --json 里的单个厂商 */
+export type ProviderCatalog = {
+  ok: boolean
+  error: string | null
+  fetchedAt: string
+  /** CLI 自己的默认模型，取不到为 null */
+  cliDefault: string | null
+  models: CatalogModel[]
+}
+
+/** 模型清单 */
+export type ModelsCatalog = {
+  updatedAt: string
+  providers: Record<string, ProviderCatalog>
+}
+
+/** 面板上的模型清单：整次失败时保留上次的 catalog */
+export type ModelsView = {
+  catalog: ModelsCatalog | null
+  /** idle 未读，loading 进入页面，refreshing 手动刷新，ready 已读到，error 整次失败 */
+  status: 'idle' | 'loading' | 'refreshing' | 'ready' | 'error'
+  /** 整次调用失败的原因；某一家失败看 catalog 里的 error */
+  error: string | null
 }
 
 /** 新增厂商可选的模板 */
@@ -219,6 +298,12 @@ declare module 'claude-code' {
       /** 进行中的操作，如 "test:kimi"、"add"，用于按钮显示"…" */
       busy: string | null
       notice: Notice | null
+      /** 官方 CLI 的模型清单 */
+      modelCatalog: Shaped<ModelsView>
+      /** 正在保存默认模型的「厂商:额度池」，保存中不再提交 */
+      savingModels: string[]
+      /** 输入框上方提示条的时长节拍。只有提示条读取，加一就只重绘提示条 */
+      bandTick: number
     }
   }
 }

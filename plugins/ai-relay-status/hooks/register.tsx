@@ -1,14 +1,21 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface as Engine, FsEntry, Register, RenderChildren, SelectOption } from 'claude-code'
 
-import type { AddForm, JobView, PoolView, RelayMode, Round, RoundAgent, Snapshot, Vendor, VendorData, WindowView } from '../types'
+import type { AddForm, JobView, ModelPool, ModelsCatalog, ModelsView, PoolView, ProviderCatalog, RelayMode, Round, RoundAgent, RoundTokenRow, Snapshot, TokenUsage, Vendor, VendorData, WindowView } from '../types'
 
 // 家目录在会话启动时用 $.env.get('HOME') 读取，不写死，别人安装也能用
 let HOME = ''
 const roundsDir = () => `${HOME}/.claude/ai-relay/rounds`
+const jobsDir = () => `${HOME}/.claude/ai-relay/jobs`
+const projectsDir = () => `${HOME}/.claude/projects`
+const codexSessionsDir = () => `${HOME}/.codex/sessions`
 const installedPluginsFile = () => `${HOME}/.claude/plugins/installed_plugins.json`
 const NODE_CANDIDATES = ['/opt/homebrew/bin/node', '/usr/local/bin/node', 'node']
 const REFRESH_MS = 60_000
+// 提示条上的已运行时长：5 秒跳一次，不每秒重绘
+const BAND_TICK_MS = 5_000
+const BAND_SHOW = 3
+const BRIEF_CHARS = 12
 const PANE = 'relay-quota'
 const PANE_TITLE = 'ai-relay'
 
@@ -16,8 +23,8 @@ const PANE_TITLE = 'ai-relay'
 const snapshot = atom({ plugin: 'ai-relay-status', key: 'snapshot' } as const, null, { shape: 'snapshot-6' })
 const switching = atom({ plugin: 'ai-relay-status', key: 'switching' } as const, null)
 const tab = atom({ plugin: 'ai-relay-status', key: 'tab' } as const, 'quota')
-// 厂商增加最高权限字段，换 shape 丢掉没有该字段的旧缓存
-const vendors = atom({ plugin: 'ai-relay-status', key: 'vendors' } as const, null, { shape: 'vendors-2' })
+// 厂商增加默认模型字段，换 shape 丢掉没有该字段的旧缓存
+const vendors = atom({ plugin: 'ai-relay-status', key: 'vendors' } as const, null, { shape: 'vendors-3' })
 const jobs = atom({ plugin: 'ai-relay-status', key: 'jobs' } as const, null, { shape: 'jobs-2' })
 // 本会话的对话轮次，只保留最近 MAX_ROUNDS 轮
 const rounds = atom({ plugin: 'ai-relay-status', key: 'rounds' } as const, [] as Round[], { shape: 'rounds-3' })
@@ -34,12 +41,30 @@ const form = atom({ plugin: 'ai-relay-status', key: 'form' } as const, null)
 const confirmRemove = atom({ plugin: 'ai-relay-status', key: 'confirmRemove' } as const, null)
 const busy = atom({ plugin: 'ai-relay-status', key: 'busy' } as const, null)
 const notice = atom({ plugin: 'ai-relay-status', key: 'notice' } as const, null)
+const MODEL_CATALOG_INIT: ModelsView = { catalog: null, status: 'idle', error: null }
+const modelCatalog = atom({ plugin: 'ai-relay-status', key: 'modelCatalog' } as const, MODEL_CATALOG_INIT, { shape: 'model-catalog-1' })
+/** 正在保存的「厂商:额度池」。Select 没有禁用，保存中卸下下拉框，避免重复提交 */
+const savingModels = atom({ plugin: 'ai-relay-status', key: 'savingModels' } as const, [] as string[])
+// 提示条的时长节拍。只让提示条订阅，避免每 5 秒把整个面板重绘一遍
+const bandTick = atom({ plugin: 'ai-relay-status', key: 'bandTick' } as const, 0)
+// 同步锁：状态写回去之前拦住同一行的下一次选择
+const savingLock = new Set<string>()
+const NO_MODEL = '__none__'
 
 // 会话启动时记下的环境信息，跨钩子共享
 let currentSessionId = ''
 let currentCwd = ''
 let currentProject = { name: '', path: '' }
 let initialSurface: string | null = null
+// 桌面版左侧栏项目名：sessionId → originCwd 的末级目录名。只在打开对话页时读，60 秒内不重读
+let desktopProjectNames = new Map<string, string>()
+// 同一个桌面会话的 sessionId → 代表 id。cliSessionId 和 priorCliSessionIds 算同一组
+let desktopSessionGroups = new Map<string, string>()
+let desktopProjectsReadAt = 0
+// 提示条后台刷新外派台账时，上一次还没回来就不再叠一次
+let bandPollBusy = false
+// 上次成功发起 relay jobs 的时刻。提示条用它做 60 秒兜底，不依赖当时是否已经看见进行中的任务
+let bandPollAt = 0
 
 const MODES: RelayMode[] = ['off', 'manual', 'auto']
 const MODE_TEXT: Record<RelayMode, string> = { off: '纯 Claude', manual: '手动', auto: '自动' }
@@ -90,14 +115,18 @@ const ROUND_STATUS: Record<string, { icon: string; text: string; tone: Tone }> =
 // 子代理结束原因 → 外派状态
 const AGENT_END: Record<string, string> = { answer: 'done', aborted: 'cancelled', error: 'failed', refusal: 'failed' }
 const CODEX_AGENT = 'codex:codex-rescue'
-// 验收结论
+// 验收结论。只认主管用 relay verdict 记下的结论，没有 verdict 不算通过
 const VERDICT: Record<string, { icon: string; text: string; tone: Tone }> = {
-  pass: { icon: '✓', text: '验收通过', tone: 'good' },
-  partial: { icon: '▲', text: '部分通过', tone: 'warning' },
-  fail: { icon: '✕', text: '验收不通过', tone: 'critical' },
+  pass: { icon: '✓', text: '主管已验收', tone: 'good' },
+  partial: { icon: '◐', text: '主管判部分通过', tone: 'warning' },
+  fail: { icon: '✗', text: '主管判不通过', tone: 'critical' },
 }
 const ROLE_TEXT: Record<string, string> = {
   implement: '实现', debug: '排查', review: '审查', read: '阅读', deep: '深度推理', quick: '快速问答', 'claude-backup': 'Claude 替补',
+}
+// 厂商页角色名优先用 relay 给的 roles；没有时用这张表
+const MODEL_ROLE_TEXT: Record<string, string> = {
+  implement: '实现', debug: '排查', review: '审查', read: '阅读', deep: '深度推理', quick: '快问', 'claude-backup': '顶替 Claude',
 }
 /** relay status --json 输出中单个额度池的结构（只取用到的字段） */
 type RelayPool = {
@@ -223,21 +252,75 @@ function agentText(a: RoundAgent) {
   return { title: mainModelText(a.model), sub: 'Claude Pro' }
 }
 
-// relay 外派记录按时间归入轮次：开始时间落在这一轮之内的算这一轮的。
-// Codex 由子代理记录覆盖（它走 Agent 工具），这里不重复算
-function jobsOfRound(r: Round, list: JobView[]) {
-  const end = r.finishedAt ?? Number.POSITIVE_INFINITY
-  return list.filter(j => {
-    const t = Date.parse(j.startedAt)
-    return j.provider !== 'codex' && t >= r.startedAt && t <= end
-  })
+// 外派记录上的会话 id。旧记录没有这个字段，按空串处理
+function jobSessionId(j: JobView) {
+  const id = (j as { sessionId?: unknown }).sessionId
+  return typeof id === 'string' ? id.trim() : ''
+}
+
+function normPath(p: string) {
+  let s = p.trim().replace(/[/\\]+$/, '')
+  if (s.startsWith('/private/')) s = s.slice('/private'.length)
+  return s
+}
+
+function jobCwd(j: JobView) {
+  return typeof j.cwd === 'string' ? normPath(j.cwd) : ''
+}
+
+// 派单目录和轮次的项目路径相同才算同一项目。轮次没记下路径时，才退回末级目录名
+function sameProject(cwd: string, r: Round) {
+  const roundPath = normPath(r.project?.path ?? '')
+  if (cwd && roundPath && cwd === roundPath) return true
+  if (!roundPath) {
+    const name = (r.project?.name ?? '').trim()
+    return name !== '' && name === dirName(cwd)
+  }
+  return false
+}
+
+// 用户亲自发的一轮。系统标签和后台续跑并进它前面的用户轮次，不单独领任务
+function isUserRound(r: Round) {
+  return !isCarriedRound(r)
+}
+
+/**
+ * 一条外派只归一轮，且不再要求开始时间落在该轮 finishedAt 之前。
+ * 主管经常是先把任务派出去、这一轮就结束，任务的开始时间会晚于 finishedAt。
+ * 有 sessionId：归到该会话里、开始时间不晚于任务的最近一轮。
+ * 没有 sessionId：归到同一项目里、开始时间不晚于任务的最近一个用户轮次。
+ * 连目录都没有的旧记录，退回「最近一个用户轮次」，避免从提示条上消失。
+ * Codex 走 Agent 工具，不在这里归。
+ */
+function pickRoundForJob(j: JobView, rounds: readonly Round[]): Round | null {
+  if (j.provider === 'codex') return null
+  const t = Date.parse(j.startedAt)
+  if (!Number.isFinite(t)) return null
+  const sid = jobSessionId(j)
+  let candidates: Round[]
+  if (sid) {
+    candidates = rounds.filter(r => (r.sessionId || '') === sid && r.startedAt <= t)
+  } else {
+    const cwd = jobCwd(j)
+    const users = rounds.filter(r => isUserRound(r) && r.startedAt <= t)
+    candidates = cwd ? users.filter(r => sameProject(cwd, r)) : users
+  }
+  if (candidates.length === 0) return null
+  candidates.sort((a, b) => b.startedAt - a.startedAt || (a.id < b.id ? 1 : -1))
+  return candidates[0] ?? null
+}
+
+// 归入这一轮的 relay 外派。pool 是用来比较的全部轮次；不传时只拿这一轮自己比
+function jobsOfRound(r: Round, list: JobView[], pool?: readonly Round[]) {
+  const rounds = pool && pool.length > 0 ? pool : [r]
+  return list.filter(j => pickRoundForJob(j, rounds)?.id === r.id)
 }
 
 // 一轮里用到的其他模型（去重，按出现先后）
-function helperNames(r: Round, list: JobView[]) {
+function helperNames(r: Round, list: JobView[], pool?: readonly Round[]) {
   const names = [
     ...r.agents.map(a => (a.subagentType === CODEX_AGENT ? 'Codex' : `${mainModelText(a.model)} 子代理`)),
-    ...jobsOfRound(r, list).map(j => modelText(j.provider, j.model)),
+    ...jobsOfRound(r, list, pool).map(j => modelText(j.provider, j.model)),
   ]
   return [...new Set(names)]
 }
@@ -250,8 +333,8 @@ function roundSummary(r: Round, list: JobView[]) {
 }
 
 // 详情里的分工：有外派列出各验收状态数（大于 0 的项），无外派注明由主管完成
-function cardSummary(r: Round, list: JobView[]) {
-  const rj = jobsOfRound(r, list)
+function cardSummary(r: Round, list: JobView[], pool?: readonly Round[]) {
+  const rj = jobsOfRound(r, list, pool)
   const helpers = r.agents.length + rj.length
   if (helpers === 0) {
     return ''
@@ -292,12 +375,12 @@ function cardSummary(r: Round, list: JobView[]) {
   if (pass > 0) parts.push(`验收通过 ${pass}`)
   if (partial > 0) parts.push(`部分通过 ${partial}`)
   if (fail > 0) parts.push(`验收不通过 ${fail}`)
-  if (pending > 0) parts.push(`待验收 ${pending}`)
+  if (pending > 0) parts.push(`等主管验收 ${pending}`)
 
   return parts.join(' · ')
 }
 
-// 列表上员工名字后面的验收图标：✓ 通过、▲ 部分通过、✕ 不通过或失败、○ 待验收、● 进行中
+// 列表上员工名字后面的图标：✓ 主管已验收、▲ 部分通过、✕ 不通过或失败、○ 等主管验收、● 进行中
 function staffIcon(status: string, verdict: string | null, claudeAgent: boolean) {
   if (status === 'running') return '●'
   if (status === 'failed' || status === 'timeout' || verdict === 'fail') return '✕'
@@ -309,7 +392,7 @@ function staffIcon(status: string, verdict: string | null, claudeAgent: boolean)
 }
 
 // 列表第三行：主管，以及每个员工的模型名和验收图标
-function staffLine(r: Round, list: JobView[]) {
+function staffLine(r: Round, list: JobView[], pool?: readonly Round[]) {
   const bits: string[] = []
   for (const a of r.agents) {
     if (a.subagentType === CODEX_AGENT) {
@@ -321,10 +404,65 @@ function staffLine(r: Round, list: JobView[]) {
     }
   }
   // 摘要里用简称（去掉 High/Medium/Low 档位），避免和分隔符「 · 」混在一起
-  for (const j of jobsOfRound(r, list)) bits.push(`${modelText(j.provider, j.model).replace(/ · (High|Medium|Low)$/, '')} ${staffIcon(j.status, j.verdict, false)}`)
+  for (const j of jobsOfRound(r, list, pool)) bits.push(`${modelText(j.provider, j.model).replace(/ · (High|Medium|Low)$/, '')} ${staffIcon(j.status, j.verdict, false)}`)
   const main = `${mainModelText(r.mainModel)} 主管`
   // 只有主管一个模型时不写"未外派"，一看就知道
   return bits.length ? `${main} · ${bits.join(' · ')}` : main
+}
+
+// 还在跑的子任务数。子代理和 Codex 看 agent 状态；relay 外派看归入本轮的 job（不含 Codex 台账）
+function runningSubtaskCount(r: Round, list: JobView[], pool?: readonly Round[]) {
+  let n = 0
+  for (const a of r.agents ?? []) {
+    if (a.status === 'running') n++
+  }
+  for (const j of jobsOfRound(r, list, pool)) {
+    if (j.status === 'running') n++
+  }
+  return n
+}
+
+// 已经结束、主管还没记结论的外派。Claude 子代理没有 verdict 字段，不在这里计
+function missingVerdictCount(r: Round, list: JobView[], pool?: readonly Round[]) {
+  let n = 0
+  for (const j of jobsOfRound(r, list, pool)) {
+    if (j.status === 'running' || j.verdict) continue
+    n++
+  }
+  for (const a of r.agents ?? []) {
+    if (a.subagentType !== CODEX_AGENT || a.status === 'running') continue
+    const rec = list.find(item => item.id === a.toolUseId)
+    if (!rec || rec.status === 'running' || rec.verdict) continue
+    n++
+  }
+  return n
+}
+
+// 只改显示，不改存储里的 status。
+// 还有子任务在跑：本轮未结束是进行中，本轮已结束是等子任务。
+// 子任务都结束了、本轮或并入的系统轮次仍在进行：主管验收中。
+// 主管也结束了：用原来的状态。完成时若还有外派没记结论，pendingVerdicts 给界面加次要说明。
+function roundShownStatus(r: Round, list: JobView[], pool?: readonly Round[]) {
+  const running = runningSubtaskCount(r, list, pool)
+  const pendingVerdicts = missingVerdictCount(r, list, pool)
+  const runningView = ROUND_STATUS.running!
+  if (running > 0) {
+    if (r.status === 'running') return { icon: runningView.icon, text: runningView.text, tone: runningView.tone, running, pendingVerdicts }
+    return { icon: runningView.icon, text: '等子任务', tone: runningView.tone, running, pendingVerdicts }
+  }
+  const hadSubtasks = (r.agents?.length ?? 0) + jobsOfRound(r, list, pool).length > 0
+  if (r.status === 'running' && hadSubtasks) {
+    return { icon: runningView.icon, text: '主管验收中', tone: runningView.tone, running: 0, pendingVerdicts }
+  }
+  const base = ROUND_STATUS[r.status] ?? ROUND_STATUS.answer!
+  return { icon: base.icon, text: base.text, tone: base.tone, running: 0, pendingVerdicts }
+}
+
+// 等子任务时用时算到现在，不停在主模型回话那一刻；其他已结束的轮次仍停在结束时间
+function roundElapsed(r: Round, waiting: boolean, now: number) {
+  const end = waiting ? now : r.finishedAt
+  if (end == null) return null
+  return Math.max(0, end - r.startedAt)
 }
 
 // 外派「任务」行：角色 · 只读/可写 · 用时 · 改了 N 个文件
@@ -373,6 +511,427 @@ function formatReason(reason: string) {
     .map(part => part.trim())
     .filter(Boolean)
     .join('\n')
+}
+
+// ---------- Token 消耗计算与按需缓存 ----------
+
+// 已结束轮次的 Token 消耗缓存（key 为轮次 id）；进行中的轮次每次打开重新算
+const roundTokenCache = new Map<string, RoundTokenRow[]>()
+
+// 数字用 k / M 缩写，保留一位小数（末尾 .0 省略，如 12.3k、1.2k、80k）
+function fmtTokens(n: number) {
+  const v = Math.max(0, Math.round(n))
+  if (v < 1000) return String(v)
+  if (v < 999_950) return `${(v / 1000).toFixed(1).replace(/\.0$/, '')}k`
+  return `${(v / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`
+}
+
+function fmtUsage(u: TokenUsage | null, opts?: { live?: boolean; emptyText?: string }) {
+  if (!u) return opts?.emptyText || '无数据'
+  const text = `输入 ${fmtTokens(u.input)} · 输出 ${fmtTokens(u.output)} · 缓存读 ${fmtTokens(u.cacheRead)}`
+  return opts?.live ? `${text}（进行中）` : text
+}
+
+const toNum = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 0)
+const encodeProjectPath = (p: string) => p.replace(/[^a-zA-Z0-9-]/g, '-')
+
+function extractClaudeUsage(raw: unknown): TokenUsage | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const u = raw as Record<string, unknown>
+  const hasTokenField =
+    typeof u.input_tokens === 'number' ||
+    typeof u.output_tokens === 'number' ||
+    typeof u.cache_read_input_tokens === 'number' ||
+    typeof u.cache_creation_input_tokens === 'number'
+  if (!hasTokenField) return null
+  let input = toNum(u.input_tokens) + toNum(u.cache_creation_input_tokens)
+  let output = toNum(u.output_tokens)
+  let cacheRead = toNum(u.cache_read_input_tokens)
+  // 某些记录顶层全为 0，真实读数在 iterations[0] 里
+  if (input === 0 && output === 0 && cacheRead === 0 && Array.isArray(u.iterations) && u.iterations.length > 0) {
+    const it0 = u.iterations[0]
+    if (it0 && typeof it0 === 'object' && !Array.isArray(it0)) {
+      const it = it0 as Record<string, unknown>
+      input = toNum(it.input_tokens) + toNum(it.cache_creation_input_tokens)
+      output = toNum(it.output_tokens)
+      cacheRead = toNum(it.cache_read_input_tokens)
+    }
+  }
+  return { input, output, cacheRead, total: input + output + cacheRead }
+}
+
+// 从 Claude 会话或子代理的 jsonl 文本中累加 assistant 条目的 usage；按 message.id 去重
+function sumClaudeJsonlUsage(jsonlText: string, startMs?: number, endMs?: number): TokenUsage | null {
+  if (!jsonlText) return null
+  const byMsgId = new Map<string, TokenUsage>()
+  let seq = 0
+  for (const line of jsonlText.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    let entry: Record<string, unknown>
+    try {
+      const parsed: unknown = JSON.parse(trimmed)
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue
+      entry = parsed as Record<string, unknown>
+    } catch {
+      continue
+    }
+    if (entry.type !== 'assistant') continue
+    if (startMs !== undefined || endMs !== undefined) {
+      const ts = typeof entry.timestamp === 'string' ? Date.parse(entry.timestamp) : typeof entry.timestamp === 'number' ? entry.timestamp : Number.NaN
+      if (!Number.isFinite(ts)) continue
+      if (startMs !== undefined && ts < startMs) continue
+      if (endMs !== undefined && ts > endMs) continue
+    }
+    const msg = entry.message && typeof entry.message === 'object' ? (entry.message as Record<string, unknown>) : null
+    if (!msg) continue
+    const usage = extractClaudeUsage(msg.usage)
+    if (!usage) continue
+    const msgId = typeof msg.id === 'string' && msg.id ? msg.id : `__line_${++seq}`
+    byMsgId.set(msgId, usage)
+  }
+  if (byMsgId.size === 0) return null
+  let input = 0
+  let output = 0
+  let cacheRead = 0
+  for (const u of byMsgId.values()) {
+    input += u.input
+    output += u.output
+    cacheRead += u.cacheRead
+  }
+  return { input, output, cacheRead, total: input + output + cacheRead }
+}
+
+// 兜底：从主会话 jsonl 里的 Agent 工具返回结果（toolUseResult.usage）提取子代理消耗
+function findSubagentUsageFromMainJsonl(jsonlText: string, a: RoundAgent): TokenUsage | null {
+  if (!jsonlText) return null
+  const rawId = a.id.replace(/^agent-/, '')
+  for (const line of jsonlText.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    let entry: Record<string, unknown>
+    try {
+      const parsed: unknown = JSON.parse(trimmed)
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue
+      entry = parsed as Record<string, unknown>
+    } catch {
+      continue
+    }
+    const tur = entry.toolUseResult && typeof entry.toolUseResult === 'object' ? (entry.toolUseResult as Record<string, unknown>) : null
+    if (!tur) continue
+    const turAgentId = typeof tur.agentId === 'string' ? tur.agentId.replace(/^agent-/, '') : ''
+    let matched = Boolean(turAgentId && (turAgentId === rawId || turAgentId === a.id))
+    if (!matched && a.toolUseId && entry.message && typeof entry.message === 'object') {
+      const content = (entry.message as Record<string, unknown>).content
+      if (Array.isArray(content)) {
+        matched = content.some(c => c && typeof c === 'object' && (c as Record<string, unknown>).tool_use_id === a.toolUseId)
+      }
+    }
+    if (matched) {
+      const u = extractClaudeUsage(tur.usage)
+      if (u) return u
+    }
+  }
+  return null
+}
+
+// 定位会话主记录 ~/.claude/projects/<编码目录>/<sessionId>.jsonl
+async function findSessionJsonl($: Engine, r: Round): Promise<{ dir: string; file: string } | null> {
+  if (!HOME || !r.sessionId) return null
+  const base = projectsDir()
+  if (r.project?.path) {
+    const dir = `${base}/${encodeProjectPath(r.project.path)}`
+    const file = `${dir}/${r.sessionId}.jsonl`
+    try {
+      if (await $.fs.exists(file)) return { dir, file }
+    } catch {}
+  }
+  try {
+    const entries = await $.fs.list(base)
+    for (const entry of entries) {
+      const dir = `${base}/${entry.name}`
+      const file = `${dir}/${r.sessionId}.jsonl`
+      try {
+        if (await $.fs.exists(file)) return { dir, file }
+      } catch {}
+    }
+  } catch {}
+  return null
+}
+
+// 从 ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl 按时间和 cwd 匹配 Codex 的 token_count 事件
+async function findCodexUsage($: Engine, r: Round, a: RoundAgent, rec?: JobView): Promise<TokenUsage | null> {
+  if (rec?.usage && typeof rec.usage.input === 'number') {
+    return rec.usage
+  }
+  if (!HOME) return null
+  const startMs = a.startedAt || r.startedAt
+  const endMs = a.finishedAt ?? r.finishedAt ?? Number.POSITIVE_INFINITY
+  const targetCwd = rec?.cwd || r.project?.path || ''
+  const finiteEnd = Number.isFinite(endMs) ? endMs : Math.max(startMs, await $.clock.now().catch(() => startMs))
+  const dayDirs = new Set<string>()
+  const base = codexSessionsDir()
+  for (let t = startMs - 86_400_000; t <= finiteEnd + 86_400_000; t += 43_200_000) {
+    const d = new Date(t)
+    dayDirs.add(`${base}/${d.getUTCFullYear()}/${pad2(d.getUTCMonth() + 1)}/${pad2(d.getUTCDate())}`)
+    dayDirs.add(`${base}/${d.getFullYear()}/${pad2(d.getMonth() + 1)}/${pad2(d.getDate())}`)
+  }
+
+  let input = 0
+  let output = 0
+  let cacheRead = 0
+  let matchedEvents = 0
+
+  for (const dir of dayDirs) {
+    let entries: FsEntry[] = []
+    try {
+      entries = await $.fs.list(dir)
+    } catch {
+      continue
+    }
+    const rolloutFiles = entries.filter(e => e.kind === 'file' && e.name.startsWith('rollout-') && e.name.endsWith('.jsonl'))
+    for (const file of rolloutFiles) {
+      let text = ''
+      try {
+        text = await $.fs.read(`${dir}/${file.name}`)
+      } catch {
+        continue
+      }
+      if (!text) continue
+      const lines = text.split('\n')
+      let cwdOk = !targetCwd
+      for (const line of lines) {
+        const trimmed = line.trim()
+        if (!trimmed) continue
+        try {
+          const entry = JSON.parse(trimmed) as Record<string, unknown>
+          if (entry.type === 'session_meta' && entry.payload && typeof entry.payload === 'object') {
+            const metaCwd = (entry.payload as Record<string, unknown>).cwd
+            if (typeof metaCwd === 'string' && metaCwd && targetCwd) {
+              const normMeta = metaCwd.replace(/\/+$/, '')
+              const normTarget = targetCwd.replace(/\/+$/, '')
+              cwdOk = normMeta === normTarget || normMeta.startsWith(`${normTarget}/`) || normTarget.startsWith(`${normMeta}/`)
+            }
+            break
+          }
+        } catch {}
+      }
+      if (!cwdOk) continue
+
+      let prevTotalTokens: number | null = null
+      for (const line of lines) {
+        const trimmed = line.trim()
+        if (!trimmed) continue
+        let entry: Record<string, unknown>
+        try {
+          const parsed: unknown = JSON.parse(trimmed)
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue
+          entry = parsed as Record<string, unknown>
+        } catch {
+          continue
+        }
+        if (entry.type !== 'event_msg') continue
+        const payload = entry.payload && typeof entry.payload === 'object' ? (entry.payload as Record<string, unknown>) : null
+        if (!payload || payload.type !== 'token_count') continue
+        const ts = typeof entry.timestamp === 'string' ? Date.parse(entry.timestamp) : typeof entry.timestamp === 'number' ? entry.timestamp : Number.NaN
+        if (!Number.isFinite(ts)) continue
+        if (ts < startMs - 2000 || ts > endMs + 5000) continue
+        const info = payload.info && typeof payload.info === 'object' ? (entry.info ?? payload.info) as Record<string, unknown> : null
+        if (!info) continue
+        const totalObj = info.total_token_usage && typeof info.total_token_usage === 'object' ? (info.total_token_usage as Record<string, unknown>) : null
+        const lastObj = info.last_token_usage && typeof info.last_token_usage === 'object' ? (info.last_token_usage as Record<string, unknown>) : null
+        const curTotal = totalObj && typeof totalObj.total_tokens === 'number' ? totalObj.total_tokens : null
+        // Codex 单轮末尾可能连续写出两条 total_tokens 完全相同的 token_count 事件，跳过重复条
+        if (curTotal !== null && prevTotalTokens !== null && curTotal === prevTotalTokens) {
+          continue
+        }
+        if (curTotal !== null) prevTotalTokens = curTotal
+        const src = lastObj ?? totalObj
+        if (!src) continue
+        input += toNum(src.input_tokens)
+        output += toNum(src.output_tokens)
+        cacheRead += toNum(src.cached_input_tokens)
+        matchedEvents++
+      }
+    }
+  }
+
+  if (matchedEvents === 0) return null
+  return { input, output, cacheRead, total: input + output }
+}
+
+// 读取 relay 外派任务（agy / grok）的 usage 字段
+async function findJobUsage($: Engine, j: JobView): Promise<TokenUsage | null> {
+  if (j.usage && typeof j.usage.input === 'number' && typeof j.usage.output === 'number' && typeof j.usage.cacheRead === 'number') {
+    return {
+      input: toNum(j.usage.input),
+      output: toNum(j.usage.output),
+      cacheRead: toNum(j.usage.cacheRead),
+      total: toNum(j.usage.total ?? j.usage.input + j.usage.output + j.usage.cacheRead),
+    }
+  }
+  if (!HOME || !j.id) return null
+  try {
+    const file = `${jobsDir()}/${j.id}.json`
+    if (!(await $.fs.exists(file))) return null
+    const parsed = JSON.parse(await $.fs.read(file)) as Record<string, unknown>
+    const u = parsed?.usage && typeof parsed.usage === 'object' ? (parsed.usage as Record<string, unknown>) : null
+    if (!u || typeof u.input !== 'number') return null
+    const input = toNum(u.input)
+    const output = toNum(u.output)
+    const cacheRead = toNum(u.cacheRead)
+    return { input, output, cacheRead, total: toNum(u.total ?? input + output + cacheRead) }
+  } catch {
+    return null
+  }
+}
+
+async function computeRoundTokens($: Engine, r: Round, list: JobView[], pool?: readonly Round[]): Promise<RoundTokenRow[]> {
+  if (!HOME) {
+    try {
+      HOME = (await $.env.get('HOME')) || ''
+    } catch {}
+  }
+  const rows: RoundTokenRow[] = []
+  let sessionInfo: { dir: string; file: string } | null = null
+  let sessionText = ''
+  try {
+    sessionInfo = await findSessionJsonl($, r)
+    if (sessionInfo) {
+      sessionText = await $.fs.read(sessionInfo.file)
+    }
+  } catch {
+    sessionText = ''
+  }
+
+  // 1. 主管 Claude
+  let mainUsage: TokenUsage | null = null
+  try {
+    mainUsage = sumClaudeJsonlUsage(sessionText, r.startedAt, r.finishedAt ?? Number.POSITIVE_INFINITY)
+  } catch {
+    mainUsage = null
+  }
+  rows.push({ label: `${mainModelText(r.mainModel)}（主管）`, usage: mainUsage })
+
+  // 2. 各子代理（Claude 子代理与 Codex）
+  for (const a of r.agents) {
+    if (a.subagentType === CODEX_AGENT) {
+      const rec = list.find(j => j.id === a.toolUseId)
+      let codexUsage: TokenUsage | null = null
+      try {
+        codexUsage = await findCodexUsage($, r, a, rec)
+      } catch {
+        codexUsage = null
+      }
+      rows.push({ label: 'Codex', usage: codexUsage })
+    } else {
+      let subUsage: TokenUsage | null = null
+      try {
+        if (sessionInfo) {
+          const subDir = `${sessionInfo.dir}/${r.sessionId}/subagents`
+          const rawId = a.id.replace(/^agent-/, '')
+          const candidates = [`${subDir}/agent-${rawId}.jsonl`, `${subDir}/${a.id}.jsonl`]
+          for (const cand of candidates) {
+            if (await $.fs.exists(cand)) {
+              subUsage = sumClaudeJsonlUsage(await $.fs.read(cand))
+              if (subUsage) break
+            }
+          }
+          if (!subUsage) {
+            try {
+              const entries = await $.fs.list(subDir)
+              for (const entry of entries) {
+                if (!entry.name.endsWith('.meta.json')) continue
+                try {
+                  const meta = JSON.parse(await $.fs.read(`${subDir}/${entry.name}`)) as Record<string, unknown>
+                  if ((a.toolUseId && meta.toolUseId === a.toolUseId) || (a.id && meta.agentId === a.id)) {
+                    const jsonlFile = `${subDir}/${entry.name.replace(/\.meta\.json$/, '.jsonl')}`
+                    if (await $.fs.exists(jsonlFile)) {
+                      subUsage = sumClaudeJsonlUsage(await $.fs.read(jsonlFile))
+                      if (subUsage) break
+                    }
+                  }
+                } catch {}
+              }
+            } catch {}
+          }
+        }
+        if (!subUsage && sessionText) {
+          subUsage = findSubagentUsageFromMainJsonl(sessionText, a)
+        }
+      } catch {
+        subUsage = null
+      }
+      rows.push({ label: `${mainModelText(a.model)}（子代理）`, usage: subUsage })
+    }
+  }
+
+  // 3. relay 外派（agy / Grok 等）
+  for (const j of jobsOfRound(r, list, pool)) {
+    let jobUsage: TokenUsage | null = null
+    let isLive = false
+    try {
+      jobUsage = await findJobUsage($, j)
+    } catch {
+      jobUsage = null
+    }
+    if (!jobUsage) {
+      const live = (j as { liveUsage?: TokenUsage | null }).liveUsage
+      if (live && typeof live.input === 'number' && typeof live.output === 'number' && typeof live.cacheRead === 'number') {
+        jobUsage = {
+          input: toNum(live.input),
+          output: toNum(live.output),
+          cacheRead: toNum(live.cacheRead),
+          total: toNum(live.total ?? live.input + live.output + live.cacheRead),
+        }
+        isLive = true
+      }
+    }
+    const emptyText = j.status === 'running' ? '进行中，暂未匹配到日志' : '无数据'
+    rows.push({
+      label: modelText(j.provider, j.model),
+      usage: jobUsage,
+      live: isLive,
+      emptyText,
+    } as RoundTokenRow)
+  }
+
+  // 4. 本轮合计
+  const available = rows.map(row => row.usage).filter((u): u is TokenUsage => u !== null)
+  const totalUsage: TokenUsage | null =
+    available.length > 0
+      ? available.reduce(
+          (acc, u) => ({
+            input: acc.input + u.input,
+            output: acc.output + u.output,
+            cacheRead: acc.cacheRead + u.cacheRead,
+            total: (acc.total ?? 0) + (u.total ?? u.input + u.output + u.cacheRead),
+          }),
+          { input: 0, output: 0, cacheRead: 0, total: 0 },
+        )
+      : null
+  rows.push({ label: '合计', usage: totalUsage })
+  return rows
+}
+
+// 结束时间或并进来的子代理变了就换一把钥匙，折叠延长的窗口不会继续用旧结果
+function roundTokenCacheKey(r: Round) {
+  return `${r.id}:${r.status}:${r.finishedAt ?? 'open'}:${r.agents?.length ?? 0}`
+}
+
+async function getRoundTokens($: Engine, r: Round, list: JobView[], pool?: readonly Round[]): Promise<RoundTokenRow[]> {
+  const isRunning = r.status === 'running' || runningSubtaskCount(r, list, pool) > 0
+  const key = roundTokenCacheKey(r)
+  if (!isRunning && roundTokenCache.has(key)) {
+    return roundTokenCache.get(key)!
+  }
+  const rows = await computeRoundTokens($, r, list, pool)
+  if (!isRunning) {
+    roundTokenCache.set(key, rows)
+  } else {
+    roundTokenCache.delete(key)
+  }
+  return rows
 }
 
 // 本会话轮次写到共享目录，任何一个会话的对话页都能读到
@@ -496,6 +1055,152 @@ const errText = (err: unknown) => String(err instanceof Error ? err.message : er
 // relay 的报错带 "ai-relay 错误：" 前缀，面板里去掉
 const cleanErr = (stderr: string) => stderr.trim().replace(/^ai-relay 错误：/, '').slice(0, 160)
 
+function roleName(roles: { key: string; text: string }[], key: string) {
+  return roles.find(r => r.key === key)?.text || MODEL_ROLE_TEXT[key] || key
+}
+
+/** 额度池下面那行：用于哪些角色，以及写死了模型的角色 */
+function poolUsage(roles: { key: string; text: string }[], pool: ModelPool) {
+  const follow = pool.followRoles ?? []
+  const fixed = pool.fixedRoles ?? []
+  const used = follow.length ? `用于：${follow.map(k => roleName(roles, k)).join('、')}` : '暂无角色使用'
+  if (!fixed.length) return used
+  return `${used}；单独指定：${fixed.map(f => `${roleName(roles, f.role)} → ${f.model}`).join('、')}`
+}
+
+function catalogLabel(id: string, label?: string) {
+  if (!label || label === id) return id
+  return `${label} · ${id}`
+}
+
+function cliOption(entry: ProviderCatalog | undefined): SelectOption {
+  const cli = entry?.cliDefault
+  return { value: 'default', label: cli ? `跟随 CLI 默认（${cli}）` : '跟随 CLI 默认' }
+}
+
+/** 下拉选项：CLI 默认在最前，其余保持清单顺序；当前值被下架时仍留在末尾 */
+function poolOptions(pool: ModelPool, entry: ProviderCatalog | undefined): SelectOption[] {
+  const known = (entry?.models ?? []).filter(m => m.pool === pool.pool)
+  const options: SelectOption[] = []
+  const seen = new Set<string>()
+  const push = (opt: SelectOption) => {
+    if (seen.has(opt.value)) return
+    seen.add(opt.value)
+    options.push(opt)
+  }
+  if (known.length > 0 && pool.allowCliDefault) push(cliOption(entry))
+  for (const m of known) push({ value: m.id, label: catalogLabel(m.id, m.label) })
+  if (pool.current && !seen.has(pool.current)) {
+    const anywhere = (entry?.models ?? []).find(m => m.id === pool.current)
+    push({ value: pool.current, label: `${catalogLabel(pool.current, anywhere?.label)}（清单里已没有）` })
+  }
+  // 没有上次的清单时，只留当前值这一个选项
+  if (known.length === 0 && !pool.current && pool.allowCliDefault) push(cliOption(entry))
+  if (!options.length) push({ value: NO_MODEL, label: '暂无可用模型' })
+  return options
+}
+
+function poolValue(pool: ModelPool, options: SelectOption[]) {
+  if (pool.current && options.some(o => o.value === pool.current)) return pool.current
+  if (!pool.current && options.some(o => o.value === 'default')) return 'default'
+  return options[0]?.value ?? NO_MODEL
+}
+
+function poolCurrentLabel(pool: ModelPool, entry: ProviderCatalog | undefined) {
+  if (!pool.current) return pool.allowCliDefault ? (cliOption(entry).label ?? '跟随 CLI 默认') : '未设置'
+  const inPool = (entry?.models ?? []).find(m => m.id === pool.current && m.pool === pool.pool)
+  if (inPool) return catalogLabel(inPool.id, inPool.label)
+  const anywhere = (entry?.models ?? []).find(m => m.id === pool.current)
+  return `${catalogLabel(pool.current, anywhere?.label)}（清单里已没有）`
+}
+
+function fmtAgo(iso: string, now: number) {
+  const t = Date.parse(iso)
+  if (!iso || Number.isNaN(t)) return ''
+  const min = Math.max(0, Math.floor((now - t) / 60_000))
+  if (min < 1) return '更新于刚刚'
+  if (min < 60) return `更新于 ${min} 分钟前`
+  if (min < 24 * 60) return `更新于 ${Math.floor(min / 60)} 小时前`
+  return `更新于 ${Math.floor(min / (24 * 60))} 天前`
+}
+
+function normalizeModelPools(raw: unknown): ModelPool[] {
+  if (!Array.isArray(raw)) return []
+  const out: ModelPool[] = []
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue
+    const p = item as Record<string, unknown>
+    if (typeof p.pool !== 'string' || p.pool === '') continue
+    const fixedRoles: ModelPool['fixedRoles'] = []
+    if (Array.isArray(p.fixedRoles)) {
+      for (const f of p.fixedRoles) {
+        if (!f || typeof f !== 'object') continue
+        const fr = f as Record<string, unknown>
+        if (typeof fr.role !== 'string' || typeof fr.model !== 'string') continue
+        fixedRoles.push({ role: fr.role, model: fr.model })
+      }
+    }
+    out.push({
+      pool: p.pool,
+      label: typeof p.label === 'string' && p.label ? p.label : p.pool,
+      current: typeof p.current === 'string' && p.current ? p.current : null,
+      allowCliDefault: p.allowCliDefault === true,
+      followRoles: Array.isArray(p.followRoles) ? p.followRoles.filter((x): x is string => typeof x === 'string') : [],
+      fixedRoles,
+    })
+  }
+  return out
+}
+
+function parseModels(stdout: string): ModelsCatalog {
+  let data: unknown
+  try {
+    data = JSON.parse(stdout)
+  } catch (err) {
+    throw new Error(`解析失败：${errText(err)}`)
+  }
+  if (!data || typeof data !== 'object') throw new Error('解析失败：不是对象')
+  const root = data as Record<string, unknown>
+  const providers: Record<string, ProviderCatalog> = {}
+  if (root.providers && typeof root.providers === 'object') {
+    for (const [name, value] of Object.entries(root.providers as Record<string, unknown>)) {
+      if (!value || typeof value !== 'object') continue
+      const p = value as Record<string, unknown>
+      const models: ProviderCatalog['models'] = []
+      if (Array.isArray(p.models)) {
+        for (const item of p.models) {
+          if (!item || typeof item !== 'object') continue
+          const m = item as Record<string, unknown>
+          if (typeof m.id !== 'string' || m.id === '') continue
+          models.push({
+            id: m.id,
+            label: typeof m.label === 'string' && m.label ? m.label : m.id,
+            pool: typeof m.pool === 'string' && m.pool ? m.pool : null,
+          })
+        }
+      }
+      providers[name] = {
+        ok: p.ok !== false,
+        error: typeof p.error === 'string' ? p.error : null,
+        fetchedAt: typeof p.fetchedAt === 'string' ? p.fetchedAt : '',
+        cliDefault: typeof p.cliDefault === 'string' && p.cliDefault ? p.cliDefault : null,
+        models,
+      }
+    }
+  }
+  return { updatedAt: typeof root.updatedAt === 'string' ? root.updatedAt : '', providers }
+}
+
+function catalogProblem(view: ModelsView, name: string) {
+  // 整次调用失败优先：这是最新的错误；某一家 ok:false 只在清单本身读到了的时候显示
+  if (view.status === 'error' && view.error) {
+    return view.catalog ? `模型列表获取失败：${view.error}，显示的是上次的结果` : `模型列表获取失败：${view.error}`
+  }
+  const entry = view.catalog?.providers?.[name]
+  if (entry && entry.ok === false) return `模型列表获取失败：${entry.error || '未知原因'}，显示的是上次的结果`
+  return ''
+}
+
 async function refresh($: Engine) {
   let next: Snapshot
   let mainModel = ''
@@ -539,10 +1244,24 @@ async function refresh($: Engine) {
   await update($, snapshot, () => next)
 }
 
+async function stampJobPoll($: Engine) {
+  try {
+    bandPollAt = await $.clock.now()
+  } catch {
+    // 读不到时钟时保持原值，下一次兜底仍会再拉
+  }
+}
+
 async function refreshJobs($: Engine) {
+  await stampJobPoll($)
   try {
     const { exitCode, stdout } = await runRelay($, ['jobs', '--json', '--limit', '20'])
-    if (exitCode === 0) await update($, jobs, () => JSON.parse(stdout) as JobView[])
+    if (exitCode !== 0) return
+    const next = JSON.parse(stdout) as JobView[]
+    const prev = await read($, jobs)
+    // 内容没变就不写状态，避免提示条的定时刷新把订阅了 jobs 的页面一起重绘
+    if (JSON.stringify(prev) === JSON.stringify(next)) return
+    await update($, jobs, () => next)
   } catch {
     // 读不到记录时保留上次
   }
@@ -553,11 +1272,76 @@ async function refreshVendors($: Engine) {
     const { exitCode, stdout, stderr } = await runRelay($, ['providers', '--json'])
     if (exitCode !== 0) throw new Error(cleanErr(stderr) || `exit ${exitCode}`)
     const data = JSON.parse(stdout) as VendorData
-    // 旧版 relay 没有 fullAccess 字段：补默认值，避免厂商页渲染报错
-    data.providers = data.providers.map(p => ({ ...p, fullAccess: p.fullAccess ?? { supported: false, enabled: false, note: '需要更新 ai-relay 插件' } }))
+    // 旧版 relay 没有 fullAccess / modelPools：补默认值，避免厂商页渲染报错
+    data.providers = (data.providers ?? []).map(p => ({
+      ...p,
+      fullAccess: p.fullAccess ?? { supported: false, enabled: false, note: '需要更新 ai-relay 插件' },
+      modelPools: normalizeModelPools(p.modelPools),
+    }))
     await update($, vendors, () => data)
   } catch (err) {
     await update($, notice, () => ({ text: `读取厂商列表失败：${errText(err)}`, ok: false }))
+  }
+}
+
+// 进入厂商页或点刷新时取模型清单。失败只改这块的状态，不拖垮面板
+async function loadModels($: Engine, refresh = false) {
+  const cur = await read($, modelCatalog)
+  if (cur.status === 'loading' || cur.status === 'refreshing') return
+  try {
+    const status: ModelsView['status'] = refresh ? 'refreshing' : 'loading'
+    await update($, modelCatalog, (s): ModelsView => ({ ...s, status, error: null }))
+    const args = refresh ? ['models', '--refresh', '--json'] : ['models', '--json']
+    const { exitCode, stdout, stderr } = await runRelay($, args, refresh ? 120_000 : 60_000)
+    if (exitCode !== 0) throw new Error(cleanErr(stderr) || cleanErr(stdout) || `退出码 ${exitCode}`)
+    const catalog = parseModels(stdout)
+    await update($, modelCatalog, (): ModelsView => ({ catalog, status: 'ready', error: null }))
+  } catch (err) {
+    await update($, modelCatalog, (s): ModelsView => ({ catalog: s.catalog, status: 'error', error: errText(err) }))
+  }
+}
+
+async function applyPoolCurrent($: Engine, name: string, pool: string, current: string | null) {
+  await update($, vendors, data => {
+    if (!data) return data
+    return {
+      ...data,
+      providers: data.providers.map(p =>
+        p.name !== name ? p : { ...p, modelPools: (p.modelPools ?? []).map(mp => (mp.pool === pool ? { ...mp, current } : mp)) },
+      ),
+    }
+  })
+}
+
+// 选完立即保存。先改界面；失败改回并 toast。同一行保存中直接忽略后续选择
+async function setPoolModel($: Engine, name: string, pool: string, value: string) {
+  if (!value || value === NO_MODEL) return
+  const key = `${name}:${pool}`
+  if (savingLock.has(key)) return
+  savingLock.add(key)
+  let prev: string | null = null
+  let started = false
+  try {
+    const before = await read($, vendors)
+    const meta = before?.providers.find(p => p.name === name)?.modelPools?.find(mp => mp.pool === pool)
+    if (!meta) return
+    prev = meta.current
+    const currentValue = meta.current ?? (meta.allowCliDefault ? 'default' : '')
+    if (value === currentValue) return
+    started = true
+    await update($, savingModels, xs => (xs.includes(key) ? xs : [...xs, key]))
+    await applyPoolCurrent($, name, pool, value === 'default' ? null : value)
+    const { exitCode, stdout, stderr } = await runRelay($, ['provider', 'model', name, pool, value])
+    if (exitCode !== 0) throw new Error(cleanErr(stderr) || cleanErr(stdout) || `失败（退出码 ${exitCode}）`)
+    const line = stdout.trim().split('\n').map(s => s.trim()).find(Boolean) ?? ''
+    $.ui.toast(line || '已保存默认模型')
+    await refreshVendors($)
+  } catch (err) {
+    if (started) await applyPoolCurrent($, name, pool, prev)
+    $.ui.toast(errText(err) || '保存失败')
+  } finally {
+    savingLock.delete(key)
+    await update($, savingModels, xs => xs.filter(k => k !== key))
   }
 }
 
@@ -663,6 +1447,23 @@ async function submitForm($: Engine) {
   if (ok) await update($, form, () => null)
 }
 
+// 打开面板并切到对话页。已经开着就只切页，不把面板关掉
+async function openConversation($: Engine) {
+  try {
+    await update($, tab, () => 'jobs')
+    const panes = await $.ui.panes()
+    if (!panes.some(p => p.id === PANE)) {
+      await $.ui.open({ id: PANE, title: PANE_TITLE })
+      void refresh($)
+      void refreshVendors($)
+    }
+    void refreshJobs($)
+    void loadAllRounds($)
+  } catch {
+    // 打不开面板也不影响输入框
+  }
+}
+
 // 面板：已打开就关闭，没打开就打开（打开时顺手刷新）
 async function togglePane($: Engine) {
   const panes = await $.ui.panes()
@@ -697,8 +1498,271 @@ function meterText(remaining: number | null, cells: number) {
   return '█'.repeat(n) + '░'.repeat(cells - n)
 }
 
+// 系统自动发起的轮次：去掉首尾空白后，以 <小写字母和连字符组成的标签名> 开头。
+// 标签可以直接闭合，也可以先带属性再闭合，例如 <task-notification>、<agent-message from="…">。
+const SYSTEM_ROUND_TAG = /^<[a-z]+(?:-[a-z]+)*(?:\s[^>]*)?>/
+
+export function isSystemRoundText(text: string) {
+  return SYSTEM_ROUND_TAG.test(String(text ?? '').trim())
+}
+
+// 有一边还没结束时，合并后的这一轮也还没结束，Token 窗口保持敞开。
+// 两边都结束了，取较晚的那个，把后面系统轮次的耗时算进来。
+function laterFinishedAt(a: number | null, b: number | null) {
+  if (a == null || b == null) return null
+  return Math.max(a, b)
+}
+
+// 进行中优先；否则用后并入的那条的状态
+function mergedRoundStatus(current: string, incoming: string) {
+  if (current === 'running' || incoming === 'running') return 'running'
+  return incoming
+}
+
+// 桌面版更换底层 sessionId 后，同一条消息会在两个 id 下各记一次，开始时间通常只差几秒到一两分钟
+const DEDUPE_WINDOW_MS = 120_000
+
+// 不是用户亲自发的：系统标签，以及没有界面时由后台续上的轮次
+function isCarriedRound(round: Round) {
+  return isSystemRoundText(round.text) || round.env === 'headless'
+}
+
+function mergedRound(base: Round, incoming: Round, startedAt: number): Round {
+  return {
+    ...base,
+    startedAt,
+    finishedAt: laterFinishedAt(base.finishedAt, incoming.finishedAt),
+    status: mergedRoundStatus(base.status, incoming.status),
+    agents: [...(base.agents ?? []), ...(incoming.agents ?? [])],
+    selfLines: (base.selfLines ?? 0) + (incoming.selfLines ?? 0),
+  }
+}
+
+/**
+ * 显示用折叠，不改原对象，也不改存储。结果保留输入里存活轮次的顺序。
+ * 同一 sessionId 内，系统轮次和 headless 轮次并入它之前最近的用户轮次。
+ * 会话里还没有用户轮次时，这些轮次原样留下。
+ * sessionGroups 把同一个桌面会话的 sessionId 收成同一个代表 id。
+ * 正文相同、开始时间相差不超过 120 秒、且代表 id 相同（或 sessionId 相同）的，只留较早的那条。
+ */
+export function foldSystemRounds(list: Round[], sessionGroups?: ReadonlyMap<string, string>) {
+  const bySession = new Map<string, { round: Round; index: number }[]>()
+  list.forEach((round, index) => {
+    const key = round.sessionId ?? ''
+    const bucket = bySession.get(key)
+    const item = { round, index }
+    if (bucket) bucket.push(item)
+    else bySession.set(key, [item])
+  })
+
+  const replaced = new Map<number, Round>()
+  const dropped = new Set<number>()
+
+  for (const items of bySession.values()) {
+    // 同一时刻的，输入里靠后的视为更早（列表本身是新的在前）
+    const chrono = [...items].sort((a, b) => a.round.startedAt - b.round.startedAt || b.index - a.index)
+    let lastUser: { round: Round; index: number } | null = null
+    for (const item of chrono) {
+      if (!isCarriedRound(item.round)) {
+        lastUser = { round: replaced.get(item.index) ?? item.round, index: item.index }
+        continue
+      }
+      if (!lastUser) continue
+      const merged = mergedRound(lastUser.round, item.round, lastUser.round.startedAt)
+      replaced.set(lastUser.index, merged)
+      lastUser = { round: merged, index: lastUser.index }
+      dropped.add(item.index)
+    }
+  }
+
+  // 先按会话折完，再跨 sessionId 去掉桌面版换 id 时记下的重复消息
+  const byIdentity = new Map<string, { round: Round; index: number }[]>()
+  list.forEach((round, index) => {
+    if (dropped.has(index)) return
+    const current = replaced.get(index) ?? round
+    const group = sessionGroups?.get(current.sessionId) || current.sessionId || ''
+    // 同组的轮次放一起，下面再按时间窗口和正文相近程度判断是不是同一条消息
+    const key = group
+    const bucket = byIdentity.get(key)
+    const item = { round: current, index }
+    if (bucket) bucket.push(item)
+    else byIdentity.set(key, [item])
+  })
+
+  for (const items of byIdentity.values()) {
+    if (items.length < 2) continue
+    const chrono = [...items].sort((a, b) => a.round.startedAt - b.round.startedAt || b.index - a.index)
+    const first = chrono[0]
+    if (!first) continue
+    let anchor = first
+    for (const item of chrono.slice(1)) {
+      if (item.round.startedAt - anchor.round.startedAt > DEDUPE_WINDOW_MS || !sameMessage(anchor.round.text, item.round.text)) {
+        anchor = item
+        continue
+      }
+      const longer = item.round.text.length > anchor.round.text.length ? item.round.text : anchor.round.text
+      const merged = { ...mergedRound(anchor.round, item.round, anchor.round.startedAt), text: longer }
+      replaced.set(anchor.index, merged)
+      anchor = { round: merged, index: anchor.index }
+      dropped.add(item.index)
+    }
+  }
+
+  const out: Round[] = []
+  list.forEach((round, index) => {
+    if (dropped.has(index)) return
+    out.push(replaced.get(index) ?? round)
+  })
+  return out
+}
+
+// 把若干 sessionId 收成同一组。每组用其中一个 id 当代表，供折叠时判断是不是同一个桌面会话
+export function desktopSessionGroupMap(links: readonly (readonly string[])[]): Map<string, string> {
+  const parent = new Map<string, string>()
+  const find = (id: string): string => {
+    let root = id
+    while (true) {
+      const next = parent.get(root)
+      if (!next || next === root) return root
+      root = next
+    }
+  }
+  for (const ids of links) {
+    const uniq: string[] = []
+    for (const id of ids) {
+      if (typeof id !== 'string' || id === '' || uniq.includes(id)) continue
+      uniq.push(id)
+    }
+    const first = uniq[0]
+    if (!first || uniq.length < 2) continue
+    const root = find(first)
+    for (const id of uniq.slice(1)) {
+      const other = find(id)
+      if (other !== root) parent.set(other, root)
+    }
+  }
+  const out = new Map<string, string>()
+  for (const id of parent.keys()) out.set(id, find(id))
+  for (const root of out.values()) {
+    if (!out.has(root)) out.set(root, root)
+  }
+  return out
+}
+
+// 列表标题：系统轮次不把原始标签露出来
+export function roundListTitle(r: Round) {
+  if (r.text === '') return '（系统触发的继续）'
+  if (isSystemRoundText(r.text)) return '后台任务回报'
+  return r.text.replace(/\s+/g, ' ')
+}
+
+// 详情里的「你的消息」：被留下的系统轮次同样不展示原始标签；用户原文保持换行
+export function roundDetailText(r: Round) {
+  if (r.text === '') return '（系统触发的继续）'
+  if (isSystemRoundText(r.text)) return '后台任务回报'
+  return r.text
+}
+
+export { computeRoundTokens, fmtTokens, fmtUsage }
+
+type RunningSubtask = { id: string; name: string; brief: string; startedAt: number }
+
+// 提示条上的任务简述：空白收成一格，最多 12 个字
+function briefOf(text: string) {
+  const flat = text.replace(/\s+/g, ' ').trim()
+  const chars = Array.from(flat)
+  if (chars.length <= BRIEF_CHARS) return flat
+  return chars.slice(0, BRIEF_CHARS).join('')
+}
+
+function subtaskNameForJob(j: JobView) {
+  return modelText(j.provider, j.model).replace(/ · (High|Medium|Low)$/, '')
+}
+
+// 归属用的轮次池：全部会话里的轮次，再用本会话内存里的最新值盖掉同 id 的旧副本
+function assignmentPool(sessionRounds: Round[], all: Round[] | null | undefined): Round[] {
+  if (!all || all.length === 0) return sessionRounds
+  const byId = new Map<string, Round>()
+  for (const r of all) byId.set(r.id, r)
+  for (const r of sessionRounds) byId.set(r.id, r)
+  return [...byId.values()]
+}
+
+// 本会话还在跑的子代理、Codex 和 relay 外派。外派归属与对话页同一套
+function collectRunningSubtasks(sessionRounds: Round[], list: JobView[], sessionId: string, pool?: readonly Round[]): RunningSubtask[] {
+  const items: RunningSubtask[] = []
+  const seen = new Set<string>()
+  for (const r of sessionRounds) {
+    if (sessionId && r.sessionId && r.sessionId !== sessionId) continue
+    for (const a of r.agents ?? []) {
+      if (a.status !== 'running' || seen.has(`a:${a.id}`)) continue
+      seen.add(`a:${a.id}`)
+      let brief = a.description ?? ''
+      if (a.subagentType === CODEX_AGENT) {
+        const goal = taskGoal(list.find(j => j.id === a.toolUseId)?.task ?? '')
+        if (goal) brief = goal
+      }
+      items.push({ id: a.id, name: agentText(a).title, brief: briefOf(brief), startedAt: a.startedAt })
+    }
+    for (const j of jobsOfRound(r, list, pool)) {
+      if (j.status !== 'running' || seen.has(`j:${j.id}`)) continue
+      seen.add(`j:${j.id}`)
+      const started = Date.parse(j.startedAt)
+      items.push({
+        id: j.id,
+        name: subtaskNameForJob(j),
+        brief: briefOf(taskGoal(j.task) || ''),
+        startedAt: Number.isFinite(started) ? started : r.startedAt,
+      })
+    }
+  }
+  items.sort((a, b) => a.startedAt - b.startedAt || a.id.localeCompare(b.id))
+  return items
+}
+
+function runningBandDetail(items: RunningSubtask[], now: number) {
+  const shown = items.slice(0, BAND_SHOW)
+  const parts = shown.map(it => [it.name, it.brief, fmtTook(Math.max(0, now - it.startedAt))].filter(Boolean).join(' '))
+  const extra = items.length - shown.length
+  if (extra > 0) parts.push(`等 ${extra} 个`)
+  return parts.join(' · ')
+}
+
+// 上次拉到的 jobs 里有进行中的，或本会话还有进行中的轮次/子任务，就每 5 秒拉一次。
+// 否则也每 60 秒拉一次：任务若在轮次结束之后才出现，不能因为当时没看见就再也不查。
+async function tickRunningBand($: Engine) {
+  try {
+    const now = await $.clock.now()
+    const sessionRounds = await read($, rounds)
+    const list = (await read($, jobs)) ?? []
+    const pool = assignmentPool(sessionRounds, await read($, allRounds))
+    const items = collectRunningSubtasks(sessionRounds, list, currentSessionId, pool)
+    const roundOpen = sessionRounds.some(r => r.status === 'running' && (!currentSessionId || !r.sessionId || r.sessionId === currentSessionId))
+    const jobsRunning = list.some(j => j.status === 'running')
+    const fast = jobsRunning || items.length > 0 || roundOpen
+    const fallbackDue = bandPollAt === 0 || now - bandPollAt >= REFRESH_MS
+    if (!fast && !fallbackDue) return
+    if (items.length > 0) await update($, bandTick, n => n + 1)
+    if (bandPollBusy) return
+    bandPollBusy = true
+    try {
+      await refreshJobs($)
+      if (items.length === 0) {
+        const latest = (await read($, jobs)) ?? []
+        const found = collectRunningSubtasks(sessionRounds, latest, currentSessionId, assignmentPool(sessionRounds, await read($, allRounds)))
+        if (found.length > 0) await update($, bandTick, n => n + 1)
+      }
+    } finally {
+      bandPollBusy = false
+    }
+  } catch {
+    bandPollBusy = false
+  }
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
+    roundTokenCache.clear()
     await $.command.register({ name: 'relay-bar', description: '打开或关闭 ai-relay 面板（额度 / 任务 / 厂商）' })
     // 早期版本在底部状态栏放过文字，这里清掉，改由底栏按钮承担
     $.ui.status(undefined)
@@ -714,19 +1778,13 @@ export const register: Register = on => {
     } catch {
       currentCwd = e.cwd || ''
     }
-    try {
-      const repo = await $.session.repo()
-      const rootPath = repo?.root || currentCwd
-      currentProject = {
-        name: dirName(rootPath) || 'unknown',
-        path: currentCwd,
-      }
-    } catch {
-      currentProject = {
-        name: dirName(currentCwd) || 'unknown',
-        path: currentCwd,
-      }
-    }
+    // 项目名用会话启动目录，不用 git 根目录；桌面版左侧栏的名字在显示时再按会话 id 映射
+    desktopProjectNames = new Map()
+    desktopSessionGroups = new Map()
+    desktopProjectsReadAt = 0
+    bandPollBusy = false
+    bandPollAt = 0
+    currentProject = { name: dirName(currentCwd) || 'unknown', path: currentCwd }
     await migrateStoredRounds($)
     // 会话重新打开时内存是空的：先从自己那份文件读回历史，免得下一次保存用空列表把它覆盖
     if (currentSessionId && (await read($, rounds)).length === 0) {
@@ -738,10 +1796,16 @@ export const register: Register = on => {
       }
     }
     await refresh($)
+    // 先读一次外派台账，不等到 60 秒后提示条才知道有任务
+    await refreshJobs($)
     $.clock.every(REFRESH_MS, () => {
       void refresh($)
       void refreshJobs($)
       void loadAllRounds($)
+    })
+    // 时长 5 秒跳一次。回调里才读台账，ui.render 不碰文件
+    $.clock.every(BAND_TICK_MS, () => {
+      void tickRunningBand($)
     })
     return next(e)
   })
@@ -777,15 +1841,23 @@ export const register: Register = on => {
         currentSessionId = await $.session.id()
       } catch {}
     }
-    if (!currentProject.name) {
-      try {
-        const repo = await $.session.repo()
-        const cwd = currentCwd || (await $.session.cwd().catch(() => ''))
-        const rootPath = repo?.root || cwd
-        currentProject = { name: dirName(rootPath) || 'unknown', path: cwd }
-      } catch {
-        currentProject = { name: dirName(currentCwd) || 'unknown', path: currentCwd }
+    // 每轮重新取会话目录：桌面版会先在 ~/.claude/spares 临时目录预启动会话，用户选了项目后才切过去，
+    // 只用开局时记下的目录会把整段对话记成临时目录
+    try {
+      const nowCwd = await $.session.cwd()
+      if (nowCwd && nowCwd !== currentCwd) {
+        currentCwd = nowCwd
+        currentProject = { name: dirName(nowCwd) || 'unknown', path: nowCwd }
       }
+    } catch {}
+    if (!currentProject.name) {
+      let cwd = currentCwd
+      try {
+        cwd = currentCwd || (await $.session.cwd()) || ''
+      } catch {
+        cwd = currentCwd
+      }
+      currentProject = { name: dirName(cwd) || 'unknown', path: cwd }
     }
     const project = currentProject.name ? currentProject : { name: dirName(currentCwd) || 'unknown', path: currentCwd }
     const round: Round = {
@@ -877,6 +1949,41 @@ export const register: Register = on => {
     return done ? { ...result, text: roundSummary(done, list) } : result
   })
 
+  // 输入框正上方：本会话还有子任务在跑时显示一行，没有就让出这块，不占位
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    try {
+      // 问卷占着这块时让开，不盖住它
+      if (e.props.hasSurvey) return next(e)
+      // 订阅节拍。没有进行中的子任务时计数不动，这里不会跟着重绘
+      await read($, bandTick)
+      const now = await $.clock.now()
+      const sessionRounds = await read($, rounds)
+      const items = collectRunningSubtasks(sessionRounds, (await read($, jobs)) ?? [], currentSessionId, assignmentPool(sessionRounds, await read($, allRounds)))
+      if (items.length === 0) return next(e)
+      const els = $.ui.resolve(e)
+      const { Box, Text } = els
+      // 没有按钮的界面（类型表里没给 Button）只留文字
+      const Button = 'Button' in els ? els.Button : null
+      return (
+        <Box flexDirection="row" flexWrap="nowrap" alignItems="center" columnGap={1} minWidth={0}>
+          <Box flexDirection="row" flexWrap="nowrap" alignItems="center" flexGrow={1} flexShrink={1} minWidth={0}>
+            <Text size="caption" weight="medium" wrap="truncate-end">{`⏳ ${items.length}`}</Text>
+            <Box flexGrow={1} flexShrink={1} minWidth={0}>
+              <Text size="caption" dimColor wrap="truncate-end">{` 个子任务进行中 · ${runningBandDetail(items, now)}`}</Text>
+            </Box>
+          </Box>
+          {Button ? (
+            <Box flexShrink={0}>
+              <Button key="relay-running-view" label="查看" dimColor onPress={() => openConversation($)} />
+            </Box>
+          ) : null}
+        </Box>
+      )
+    } catch {
+      return next(e)
+    }
+  })
+
   // 输入框底栏右侧放一个小按钮，显示当前模式，点击打开面板
   on('ui.render', { component: 'SessionMode' }, async ($, e) => {
     const snap = await read($, snapshot)
@@ -925,7 +2032,10 @@ export const register: Register = on => {
                 await refreshJobs($)
                 await loadAllRounds($)
               }
-              if (key === 'vendors') await refreshVendors($)
+              if (key === 'vendors') {
+                await refreshVendors($)
+                void loadModels($, false)
+              }
             }}
           />
         ))}
@@ -1108,13 +2218,15 @@ export const register: Register = on => {
 
     // ---------- 对话页 ----------
     if (current === 'jobs') {
+      await loadDesktopProjects($)
       const list = (await read($, jobs)) ?? []
       let allRoundsVal = await read($, allRounds)
       if (allRoundsVal === null) {
         await loadAllRounds($)
         allRoundsVal = await read($, allRounds)
       }
-      const allRoundsList = allRoundsVal ?? []
+      // 系统轮次、后台续跑和换 sessionId 的重复记录只在显示时折叠，计数和「最近 40 轮」都按折叠后的算
+      const allRoundsList = foldSystemRounds(allRoundsVal ?? [], desktopSessionGroups)
       const filter = (await read($, roundFilter)) ?? { project: '' }
       const openBriefIds = new Set(await read($, openBriefs))
       // 选中的轮次或外派已经不在数据里时，回到列表
@@ -1132,7 +2244,7 @@ export const register: Register = on => {
 
       const projectCounts = new Map<string, number>()
       for (const r of allRoundsList) {
-        const name = r.project?.name || 'unknown'
+        const name = projectName(r.project, r.sessionId)
         projectCounts.set(name, (projectCounts.get(name) ?? 0) + 1)
       }
       const projectOptions: SelectOption[] = [
@@ -1142,7 +2254,9 @@ export const register: Register = on => {
           value: name,
         })),
       ]
-      const filteredRounds = allRoundsList.filter(r => !filter.project || (r.project?.name ?? '') === filter.project)
+      // 筛选值对不上任何项目（例如项目名规则改过后残留的旧名）时按「全部项目」处理，不显示空列表
+      const activeProject = projectCounts.has(filter.project) ? filter.project : ''
+      const filteredRounds = allRoundsList.filter(r => !activeProject || projectName(r.project, r.sessionId) === activeProject)
       const hasMore = filteredRounds.length > 40
       const displayedRounds = filteredRounds.slice(0, 40)
       const grouped: { title: string; rounds: Round[] }[] = []
@@ -1152,16 +2266,31 @@ export const register: Register = on => {
         if (last && last.title === title) last.rounds.push(r)
         else grouped.push({ title, rounds: [r] })
       }
-      // 不属于任何一轮的外派。Codex 由子代理覆盖，时间落在已有轮次之后的不重复列出
-      const inRounds = new Set(allRoundsList.flatMap(r => jobsOfRound(r, list).map(j => j.id)))
+      // 不属于任何一轮的外派。Codex 由子代理覆盖，已经归进某轮的不重复列出
+      const inRounds = new Set(allRoundsList.flatMap(r => jobsOfRound(r, list, allRoundsList).map(j => j.id)))
       const earliest = allRoundsList.length ? Math.min(...allRoundsList.map(r => r.startedAt)) : Number.POSITIVE_INFINITY
       const others = list.filter(j => !inRounds.has(j.id) && !(j.provider === 'codex' && Date.parse(j.startedAt) >= earliest))
 
       const statusOf = (s: string) => JOB_STATUS[s] ?? { icon: '·', text: s, tone: 'none' as Tone }
-      // 右侧状态：没结束看运行状态；结束了看验收结论，还没验收标待验收
+      // 右侧状态：没结束看运行状态；结束了只认主管记的结论
       const outcome = (status: string, verdict: string | null) => {
         if (status !== 'done') return statusOf(status)
-        return verdict ? VERDICT[verdict] ?? statusOf(status) : { icon: '○', text: '完成 · 待验收', tone: 'warning' as Tone }
+        return verdict ? VERDICT[verdict] ?? statusOf(status) : { icon: '○', text: '完成 · 等主管验收', tone: 'warning' as Tone }
+      }
+      // 轮次「完成」后面的未记结论用次要文字，不跟状态色走
+      const roundMark = (st: { icon: string; text: string; tone: Tone; pendingVerdicts: number }, label?: string) => {
+        const text = label ?? st.text
+        const note = text === '完成' && st.pendingVerdicts > 0 ? ` · ${st.pendingVerdicts} 个子任务未记验收结论` : ''
+        return (
+          <Box flexDirection="row" columnGap={1} alignItems="center" flexShrink={1} minWidth={0}>
+            {badge(st.icon, text, st.tone)}
+            {note !== '' && (
+              <Text size="caption" dimColor wrap="truncate-end">
+                {note}
+              </Text>
+            )}
+          </Box>
+        )
       }
       const projectOf = (cwd?: string) => (cwd ? dirName(cwd) || '未知' : '未知')
       const toggleBrief = (id: string) => update($, openBriefs, ids => (ids.includes(id) ? ids.filter(x => x !== id) : [...ids, id]))
@@ -1280,22 +2409,37 @@ export const register: Register = on => {
       if (activeId) {
         const r = allRoundsList.find(item => item.id === activeId)
         if (r) {
-          const st = ROUND_STATUS[r.status] ?? ROUND_STATUS.answer!
-          const took = r.finishedAt ? `用时 ${fmtTook(r.finishedAt - r.startedAt)}` : ''
-          const headText = [`◆ ${r.project?.name || 'unknown'}`, fmtTime(r.startedAt), took].filter(Boolean).join(' · ')
-          const message = r.text === '' ? '（系统触发的继续）' : r.text
-          const rj = jobsOfRound(r, list)
+          const st = roundShownStatus(r, list, allRoundsList)
+          const waiting = r.status !== 'running' && st.running > 0
+          const elapsed = roundElapsed(r, waiting, now)
+          const took = elapsed == null ? '' : `用时 ${fmtTook(elapsed)}`
+          const headLabel = waiting ? `等子任务（${st.running} 个进行中）` : st.text
+          const headText = [`◆ ${projectName(r.project, r.sessionId)}`, fmtTime(r.startedAt), took].filter(Boolean).join(' · ')
+          const message = roundDetailText(r)
+          const rj = jobsOfRound(r, list, allRoundsList)
+          const tokenRows = await getRoundTokens($, r, list, allRoundsList)
           return page(
             backButton,
             <Box flexDirection="row" alignItems="center" justifyContent="space-between" columnGap={1} minWidth={0}>
               <Box flexShrink={1} minWidth={0}>
                 <Text wrap="wrap">{headText}</Text>
               </Box>
-              {badge(st.icon, st.text, st.tone)}
+              {roundMark(st, headLabel)}
             </Box>,
             field('你的消息', message, { wrap: 'wrap' }),
             field('主管', `${mainModelText(r.mainModel)} · 统筹拆解、派发、核验、汇报`),
-            cardSummary(r, list) !== '' && field('分工', cardSummary(r, list)),
+            cardSummary(r, list, allRoundsList) !== '' && field('分工', cardSummary(r, list, allRoundsList)),
+            <Box flexDirection="column" rowGap={0}>
+              {section('Token 消耗')}
+              {tokenRows.map((row, idx) => {
+                const r = row as RoundTokenRow & { live?: boolean; emptyText?: string }
+                return (
+                  <Text key={`token-row-${idx}`} size="footnote" wrap="wrap" dimColor={row.usage === null}>
+                    {`${row.label}  ${fmtUsage(row.usage, { live: r.live, emptyText: r.emptyText })}`}
+                  </Text>
+                )
+              })}
+            </Box>,
             ...r.agents.map(agentCard),
             ...rj.map(jobCard),
           )
@@ -1303,30 +2447,32 @@ export const register: Register = on => {
       }
 
       const roundItem = (r: Round) => {
-        const st = ROUND_STATUS[r.status] ?? ROUND_STATUS.answer!
-        const took = r.finishedAt ? fmtTook(r.finishedAt - r.startedAt) : ''
+        const st = roundShownStatus(r, list, allRoundsList)
+        const waiting = r.status !== 'running' && st.running > 0
+        const elapsed = roundElapsed(r, waiting, now)
+        const took = elapsed == null ? '' : fmtTook(elapsed)
         const timeText = took ? `${fmtClockTime(r.startedAt)} · ${took}` : fmtClockTime(r.startedAt)
-        const title = r.text === '' ? '（系统触发的继续）' : r.text.replace(/\s+/g, ' ')
+        const title = roundListTitle(r)
         return (
           <Box key={`round-${r.id}`} flexDirection="column" minWidth={0}>
             <Box flexDirection="row" alignItems="center" justifyContent="space-between" columnGap={1} minWidth={0}>
               <Box flexDirection="row" columnGap={1} alignItems="center" flexShrink={1} minWidth={0}>
                 <Text size="caption" color="suggestion" wrap="truncate-end">
-                  ◆ {r.project?.name || 'unknown'}
+                  ◆ {projectName(r.project, r.sessionId)}
                 </Text>
                 <Text size="caption" dimColor tabular wrap="truncate-end">
                   {timeText}
                 </Text>
               </Box>
               <Box flexDirection="row" columnGap={1} alignItems="center" flexShrink={0}>
-                {badge(st.icon, st.text, st.tone)}
+                {roundMark(st)}
                 <Button key={`open-${r.id}`} label="详情 ›" dimColor onPress={() => update($, selectedRound, () => r.id)} />
               </Box>
             </Box>
             <Text weight="semibold" wrap="truncate-end">
               {title}
             </Text>
-            <Text size="caption">{staffLine(r, list)}</Text>
+            <Text size="caption">{staffLine(r, list, allRoundsList)}</Text>
           </Box>
         )
       }
@@ -1361,7 +2507,7 @@ export const register: Register = on => {
           <Select
             key="filter-project"
             label="项目"
-            value={filter.project}
+            value={activeProject}
             options={projectOptions}
             onSelect={(v: string) => update($, roundFilter, () => ({ project: v }))}
           />
@@ -1404,12 +2550,79 @@ export const register: Register = on => {
     }
 
     // ---------- 厂商页 ----------
+    // 模型清单在后台取，不挡住厂商卡片
+    const modelsView = await read($, modelCatalog)
+    const savingNow = await read($, savingModels)
+    if (modelsView.status === 'idle') void loadModels($, false)
     const data = await read($, vendors)
     if (data === null) return page(noticeBar, <Text dimColor>正在读取厂商…</Text>)
     const f = await read($, form)
     const pendingRemove = await read($, confirmRemove)
     const roleText = (keys: string[]) => keys.map(k => data.roles.find(r => r.key === k)?.text ?? k).join(' · ') || '不参与自动派活'
     const busyLabel = (key: string, text: string) => (busyKey === key ? `${text}…` : text)
+
+    // 默认模型：标题一行（刷新、更新时间），每个额度池一行下拉和一句说明
+    const modelsAgo = fmtAgo(modelsView.catalog?.updatedAt ?? '', now)
+    const modelSection = (v: Vendor) => {
+      const pools = v.modelPools ?? []
+      const entry = modelsView.catalog?.providers?.[v.name]
+      const problem = catalogProblem(modelsView, v.name)
+      const waiting = !modelsView.catalog && (modelsView.status === 'idle' || modelsView.status === 'loading')
+      return (
+        <Box key={`model-block-${v.name}`} flexDirection="column" rowGap={0}>
+          <Text size="caption" dimColor>
+            默认模型
+          </Text>
+          {pools.map(pool => {
+            // 单池厂商的区块标题已经是「默认模型」，下拉不再重复标题
+            const rowTitle = pools.length === 1 ? undefined : pool.label
+            const options = poolOptions(pool, entry)
+            const rowSaving = savingNow.includes(`${v.name}:${pool.pool}`)
+            return (
+              <Box key={`model-row-${v.name}-${pool.pool}`} flexDirection="column">
+                {waiting ? (
+                  <Box flexDirection="row" columnGap={1} alignItems="center" minWidth={0}>
+                    {pools.length > 1 && (
+                      <Text size="caption" dimColor>
+                        {pool.label}
+                      </Text>
+                    )}
+                    <Text size="caption" dimColor>
+                      正在获取模型列表…
+                    </Text>
+                  </Box>
+                ) : Select && !rowSaving ? (
+                  <Select
+                    key={`model-${v.name}-${pool.pool}`}
+                    label={rowTitle}
+                    options={options}
+                    value={poolValue(pool, options)}
+                    onSelect={(picked: string) => void setPoolModel($, v.name, pool.pool, picked)}
+                  />
+                ) : (
+                  <Box flexDirection="column">
+                    {pools.length > 1 && (
+                      <Text size="caption" dimColor>
+                        {pool.label}
+                      </Text>
+                    )}
+                    <Text size="footnote">{`默认模型：${poolCurrentLabel(pool, entry)}`}</Text>
+                  </Box>
+                )}
+                <Text size="caption" dimColor wrap="wrap">
+                  {poolUsage(data.roles ?? [], pool)}
+                </Text>
+              </Box>
+            )
+          })}
+          {problem !== '' && (
+            <Text size="caption" dimColor wrap="wrap">
+              {problem}
+            </Text>
+          )}
+        </Box>
+      )
+    }
 
     const vendorCard = (v: Vendor) => {
       const status =
@@ -1439,6 +2652,7 @@ export const register: Register = on => {
         field('调用方式', viaText, showBin && !v.binFound ? { color: 'warning' } : undefined),
         field('擅长', goodAt),
         field('最高权限', accessText, v.fullAccess.supported ? undefined : { dimColor: true }),
+        (v.modelPools?.length ?? 0) > 0 && modelSection(v),
         v.note !== '' && field('备注', v.note, { color: 'warning' }),
         pendingRemove === v.name ? (
           <Box flexDirection="row" columnGap={1} alignItems="center" marginTop={1}>
@@ -1514,14 +2728,10 @@ export const register: Register = on => {
           {formInput('label', '显示名', '如 Kimi 会员')}
           {f.preset === 'custom' && formInput('bin', '命令', '如 kimi')}
           {formInput('models', '模型', '留空用默认；多个用逗号分隔')}
-          {f.preset === 'custom' && (
-            <>
-              {formInput('promptArgs', '提示参数', '必须含 {prompt}，如 -p {prompt}')}
-              {formInput('modelArgs', '模型参数', '如 --model {model}')}
-              {formInput('readArgs', '只读参数', '如 --approval-mode plan')}
-              {formInput('writeArgs', '可写参数', '如 --approval-mode auto-edit')}
-            </>
-          )}
+          {f.preset === 'custom' && formInput('promptArgs', '提示参数', '必须含 {prompt}，如 -p {prompt}')}
+          {f.preset === 'custom' && formInput('modelArgs', '模型参数', '如 --model {model}')}
+          {f.preset === 'custom' && formInput('readArgs', '只读参数', '如 --approval-mode plan')}
+          {f.preset === 'custom' && formInput('writeArgs', '可写参数', '如 --approval-mode auto-edit')}
         </Box>
         <Box flexDirection="column" rowGap={1}>
           <Text size="caption" dimColor>
@@ -1553,9 +2763,28 @@ export const register: Register = on => {
     const accessCount = data.providers.filter(p => p.fullAccess.enabled).length
     return page(
       noticeBar,
-      <Text size="caption" dimColor>
-        {data.providers.length} 家 · 启用 {enabledCount} 家 · 最高权限开启 {accessCount} 家
-      </Text>,
+      // 统计和模型清单刷新放在页首同一行：刷新会更新全部厂商，按钮只放一个
+      <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1} minWidth={0}>
+        <Text size="caption" dimColor>
+          {data.providers.length} 家 · 启用 {enabledCount} 家 · 最高权限开启 {accessCount} 家
+        </Text>
+        <Box flexDirection="row" columnGap={1} alignItems="center">
+          {modelsAgo !== '' && (
+            <Text size="caption" dimColor>
+              {`模型列表${modelsAgo}`}
+            </Text>
+          )}
+          <Button
+            key="models-refresh"
+            label={modelsView.status === 'refreshing' ? '刷新中…' : '刷新模型列表'}
+            dimColor
+            onPress={() => {
+              if (modelsView.status === 'loading' || modelsView.status === 'refreshing') return
+              void loadModels($, true)
+            }}
+          />
+        </Box>
+      </Box>,
       <Box flexDirection="column" rowGap={1}>
         {data.providers.map(vendorCard)}
       </Box>,
@@ -1571,4 +2800,131 @@ export const register: Register = on => {
         )),
     )
   })
+}
+
+// 项目显示名。桌面版按会话 id 用左侧栏的 originCwd 末级名；
+// 对不上的（终端里跑的）用记录里的启动目录，不用 git 根目录名。
+// ~/.claude/spares/ 下的临时目录统一显示成「未选文件夹」
+function projectName(p?: { name?: string; path?: string }, sessionId?: string) {
+  if (sessionId) {
+    const mapped = desktopProjectNames.get(sessionId)
+    if (mapped) return mapped
+  }
+  if (p?.path) {
+    const label = folderLabel(p.path)
+    if (label) return label
+  }
+  return p?.name || 'unknown'
+}
+
+function desktopSessionsDir() {
+  return `${HOME}/Library/Application Support/Claude/claude-code-sessions`
+}
+
+// 打开对话页时读一次。距上次不足 60 秒就用缓存；这次失败保留上次读到的映射
+async function loadDesktopProjects($: Engine) {
+  if (!HOME) return
+  let now = 0
+  try {
+    now = await $.clock.now()
+  } catch {
+    now = Date.now()
+  }
+  if (desktopProjectsReadAt !== 0 && now - desktopProjectsReadAt < REFRESH_MS) return
+  desktopProjectsReadAt = now
+  try {
+    const next = await readDesktopProjects($)
+    if (next) {
+      desktopProjectNames = next.names
+      desktopSessionGroups = next.groups
+    }
+  } catch {
+    // 整次读取失败，沿用上次的映射
+  }
+}
+
+// 扫桌面版会话目录 */*/local_*.json。目录本身读不到时返回 null，调用方保留旧映射
+async function readDesktopProjects($: Engine): Promise<{ names: Map<string, string>; groups: Map<string, string> } | null> {
+  const root = desktopSessionsDir()
+  let projects: FsEntry[]
+  try {
+    projects = await $.fs.list(root)
+  } catch {
+    return null
+  }
+  const map = new Map<string, string>()
+  const links: string[][] = []
+  for (const project of projects) {
+    if (project.kind !== 'dir') continue
+    const projectDir = `${root}/${project.name}`
+    let sessions: FsEntry[]
+    try {
+      sessions = await $.fs.list(projectDir)
+    } catch {
+      continue
+    }
+    for (const session of sessions) {
+      if (session.kind !== 'dir') continue
+      const sessionDir = `${projectDir}/${session.name}`
+      let files: FsEntry[]
+      try {
+        files = await $.fs.list(sessionDir)
+      } catch {
+        continue
+      }
+      for (const file of files) {
+        if (file.kind !== 'file' || !file.name.startsWith('local_') || !file.name.endsWith('.json')) continue
+        try {
+          addDesktopSession(map, links, await $.fs.read(`${sessionDir}/${file.name}`))
+        } catch {
+          // 单个文件失败就跳过
+        }
+      }
+    }
+  }
+  return { names: map, groups: desktopSessionGroupMap(links) }
+}
+
+// 只取 cliSessionId、priorCliSessionIds、originCwd。项目名进 names，同一桌面会话的 id 进 links
+function addDesktopSession(map: Map<string, string>, links: string[][], text: string) {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return
+  const rec = parsed as Record<string, unknown>
+  const originCwd = rec.originCwd
+  const cliSessionId = rec.cliSessionId
+  const priorCliSessionIds = rec.priorCliSessionIds
+  const ids: string[] = []
+  if (typeof cliSessionId === 'string' && cliSessionId !== '') ids.push(cliSessionId)
+  if (Array.isArray(priorCliSessionIds)) {
+    for (const id of priorCliSessionIds) {
+      if (typeof id === 'string' && id !== '' && !ids.includes(id)) ids.push(id)
+    }
+  }
+  if (ids.length >= 2) links.push(ids)
+  if (typeof originCwd !== 'string' || originCwd === '') return
+  const name = folderLabel(originCwd)
+  if (!name) return
+  for (const id of ids) map.set(id, name)
+}
+
+// spares 临时目录没有项目名；其他路径取末级目录名
+function folderLabel(path: string) {
+  if (/\/\.claude\/spares\//.test(path)) return '未选文件夹'
+  return dirName(path)
+}
+
+// 桌面版换 sessionId 时会把同一条消息再记一次，两份正文可能只是结尾不同（一份是另一份的前缀，或后半截被改过）。
+// 完全相同，或较短的一份至少 20 字且前 90% 都与另一份相同，视为同一条消息
+function sameMessage(a: string, b: string) {
+  if (a === b) return true
+  const shorter = Math.min(a.length, b.length)
+  if (shorter < 20) return false
+  let common = 0
+  while (common < shorter && a[common] === b[common]) common++
+  return common >= shorter * 0.9
 }

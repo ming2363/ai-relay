@@ -156,9 +156,15 @@ relay pick <角色>
 
 拿到选择后这样派：
 
-- **Codex**：用 Agent 工具，`subagent_type: "codex:codex-rescue"`，prompt 按派单模板写。`relay run auto` 的首选是 Codex 时会直接停下提示你走这条路，不会悄悄改派；确有理由不用 Codex（比如目标目录在项目外）才加 `--skip-codex`。
+- **Codex**：用 Agent 工具，`subagent_type: "codex:codex-rescue"`，prompt 按派单模板写（若 Codex 设了具体默认模型，prompt 开头加 `--model <id>`）。`relay run auto` 的首选是 Codex 时会直接停下提示你走这条路，不会悄悄改派；确有理由不用 Codex（比如目标目录在项目外）才加 `--skip-codex`。
 - **其他模型**：用 `relay run <厂商名> --role <角色> --model <模型>`，或者 `relay run auto --role <角色>` 让脚本自己选。
 - 想点名某个模型可以，脚本仍会记下它的打分，事后可以对照。
+
+### 默认模型
+
+- 路由条目 `provider:pool:model[:fit]` 中 `model` 为 `default` 时，取该额度池的默认模型；写了具体模型 id 的条目固定不变（如 `implement` 的 `claude-sonnet-5-5-high`、`read` 的 `gemini-4-argon-medium`、`quick` 的 `gemini-3.8-flash-medium`）。
+- 默认模型存在 `~/.claude/ai-relay/providers.json` 的 `providers.<名称>.defaultModels.<额度池>`。单池厂商（Codex、Grok）未设时跟随 CLI 默认；多池厂商（agy）每个池必须设具体默认模型。
+- 查看与切换：`relay models [--refresh]` 从各家官方 CLI 拉取最新模型清单（缓存 24 小时，`models-cache.json`）；`relay provider model <厂商> <额度池> <模型id|default>` 设置默认模型（单池厂商写 `default` 恢复跟随 CLI 默认）。
 
 ## 四、上下文：怎么让看不到对话的模型拿到足够信息
 
@@ -191,7 +197,8 @@ relay pick <角色>
 
    这个结论会影响以后给这个模型打的可靠度分，**每次外派都必须记**。Codex 的任务 id 会在它结束后由钩子告诉你。
 3. 不简单的改动，必须再派一家**不同厂商**做 review（用 `--diff` 带上改动）。审查意见同样要你抽查源码后才能采纳。被推翻的审查意见，给那条 review 任务记 `partial` 或 `fail`。
-4. 后台任务的常用命令：`relay wait <id>`（Bash 超时设 600000）、`relay result <id>`、`relay jobs`、`relay cancel <id>`。
+4. 后台任务常用命令：`relay wait <id>`（Bash 超时设 600000）、`relay result <id>`、`relay jobs`、`relay cancel <id>`。
+   任务超时按活动判断：连续 20 分钟无活动（终端输出、会话日志、工作区均未更新）或总时长超 4 小时自动结束；可用 `--idle-timeout` / `--max-runtime` 覆盖。
 
 ## 六、汇报
 
