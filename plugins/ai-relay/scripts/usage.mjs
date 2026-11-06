@@ -532,9 +532,9 @@ export function getGrokSessionActivityMtime(job, opts = {}) {
   return getDirMaxMtime(primary.sDir);
 }
 
-function getAgyDbMaxMtime(dbPath) {
+function getAgyDbMaxMtime(dbPath, includeShm = true) {
   let maxMtime = 0;
-  for (const suffix of ["", "-wal"]) {
+  for (const suffix of includeShm ? ["", "-wal", "-shm"] : ["", "-wal"]) {
     try {
       const st = fs.statSync(dbPath + suffix);
       if (st.mtimeMs > maxMtime) maxMtime = st.mtimeMs;
@@ -543,29 +543,37 @@ function getAgyDbMaxMtime(dbPath) {
   return maxMtime;
 }
 
-// 获取 Antigravity (agy) 会话日志文件的最新修改时间（.db 和 .db-wal 的最大 mtime）
+// 只读探测也可能触碰 SHM；DB/WAL 不变时复用匹配结果，避免监测器自己制造持续活动。
+const agyActivityMatches = new Map();
+
+// 获取 Antigravity (agy) 会话日志文件的最新修改时间（.db、.db-wal、.db-shm 的最大 mtime）
 export function getAgySessionActivityMtime(job, opts = {}) {
   const win = jobTimeWindow(job);
   if (!win) return 0;
   const convDir = resolveAgyDir(opts);
   if (!fs.existsSync(convDir)) return 0;
 
-  if (job?._matchedAgyDb && (!opts?.agyDir || job._matchedAgyDb.startsWith(opts.agyDir)) && fs.existsSync(job._matchedAgyDb)) {
+  if (job?._matchedAgyDb && path.dirname(job._matchedAgyDb) === convDir && fs.existsSync(job._matchedAgyDb)) {
     return getAgyDbMaxMtime(job._matchedAgyDb);
   }
 
   const usedSources = getUsedSourcesSet(job, opts);
   let files = [];
   try {
-    files = fs.readdirSync(convDir).filter((f) => f.endsWith(".db"));
+    files = [...new Set(fs.readdirSync(convDir)
+      .filter((f) => /\.db(?:-wal|-shm)?$/.test(f))
+      .map((f) => f.replace(/-(?:wal|shm)$/, "")))];
   } catch {
     return 0;
   }
 
   const candidates = [];
+  let fallbackMtime = 0;
   for (const f of files) {
     if (usedSources.has(f)) continue;
     const dbPath = path.join(convDir, f);
+    const activityMtime = getAgyDbMaxMtime(dbPath);
+    fallbackMtime = Math.max(fallbackMtime, activityMtime);
     let st;
     try {
       st = fs.statSync(dbPath);
@@ -573,36 +581,37 @@ export function getAgySessionActivityMtime(job, opts = {}) {
       continue;
     }
     const createdMs = st.birthtimeMs > 0 ? st.birthtimeMs : st.mtimeMs;
-    if (createdMs < win.minMs || createdMs > win.maxMs) continue;
-
-    let matched = false;
-    let db;
-    try {
-      db = new DatabaseSync(dbPath, { readOnly: true });
-      matched = agyDbMatchesCwd(db, job.cwd);
-    } catch {
-      matched = false;
-    } finally {
+    // agy 可能复用旧库，活动识别不能用创建时间排除仍在写 WAL 的会话。
+    const contentMtime = getAgyDbMaxMtime(dbPath, false);
+    if (contentMtime < win.minMs) continue;
+    const cached = agyActivityMatches.get(dbPath);
+    let matched = cached?.cwd === job.cwd && cached.mtime === contentMtime ? cached.matched : undefined;
+    if (matched === undefined) {
+      let db;
       try {
-        db?.close();
-      } catch {}
+        db = new DatabaseSync(dbPath, { readOnly: true });
+        matched = agyDbMatchesCwd(db, job.cwd);
+      } catch {
+        matched = false;
+      } finally {
+        try { db?.close(); } catch {}
+      }
+      agyActivityMatches.set(dbPath, { cwd: job.cwd, mtime: contentMtime, matched });
     }
-    if (matched) {
-      candidates.push({ source: f, dbPath, createdMs });
-    }
+    if (matched) candidates.push({ source: f, dbPath, createdMs, activityMtime });
   }
 
-  if (!candidates.length) return 0;
-  candidates.sort((a, b) => a.createdMs - b.createdMs || a.source.localeCompare(b.source));
-
+  // 初期元数据为空或仍指向旧 cwd 时不缓存猜测；有目录活动就保活，总时长上限仍生效。
+  if (!candidates.length) return fallbackMtime;
+  candidates.sort((a, b) => Math.abs(a.createdMs - win.startMs) - Math.abs(b.createdMs - win.startMs) || a.source.localeCompare(b.source));
   const primary = candidates[0];
   if (job && typeof job === "object") {
     try { job._matchedAgyDb = primary.dbPath; } catch {}
   }
-  return getAgyDbMaxMtime(primary.dbPath);
+  return primary.activityMtime;
 }
 
-// 统一获取员工会话日志文件的最新修改时间（Grok 会话目录内文件、agy 的 .db 和 .db-wal）
+// 统一获取员工会话日志文件的最新修改时间（Grok 会话目录内文件、agy 的 .db、WAL 和 SHM）
 export function getSessionActivityMtime(job, opts = {}) {
   if (!job || typeof job !== "object") return 0;
   if (job.provider === "grok") return getGrokSessionActivityMtime(job, opts);

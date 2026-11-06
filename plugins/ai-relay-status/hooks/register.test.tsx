@@ -104,8 +104,23 @@ function fakeRelay(on: TestOn) {
     // 非 null 时 models 子命令原样返回这段 stdout（用来测解析失败）
     modelsRaw: null as string | null,
     modelSaveFail: '',
+    pluginFail: '',
+    pluginCalls: [] as string[][],
   }
   on('process.run', (_, e) => {
+    if (e.argv[1] === 'plugin') {
+      state.pluginCalls.push([...e.argv])
+      if (state.pluginFail) return fail(state.pluginFail)
+      const action = e.argv[2]
+      const pluginId = e.argv[3]
+      if (pluginId && (action === 'enable' || action === 'disable')) {
+        const settingsPath = `${TEST_HOME}/.claude/settings.json`
+        const cur = JSON.parse(fileMap.get(settingsPath)?.text ?? '{}')
+        const enabledPlugins = { ...(cur.enabledPlugins ?? {}), [pluginId]: action === 'enable' }
+        fileMap.set(settingsPath, { text: JSON.stringify({ ...cur, enabledPlugins }), mtimeMs: 1793712984000 })
+        return ok('')
+      }
+    }
     const argv = [...e.argv].slice(2)
     state.calls.push(argv)
     const [cmd, sub, arg] = argv
@@ -195,7 +210,10 @@ function baseStubs(
       return { value: JSON.stringify({ plugins: { 'ai-relay@test-market': [{ installPath: '/opt/ai-relay' }] } }) }
     }
     const hit = fileMap.get(e.path)
-    if (hit) return { value: hit.text }
+    if (hit) {
+      if (new TextEncoder().encode(hit.text).length > 4 * 1024 * 1024) throw new Error('file exceeds 4 MiB')
+      return { value: hit.text }
+    }
     return { value: '{}' }
   })
   on('fs.write', (_, e) => {
@@ -306,6 +324,17 @@ function visibleNodes(node: unknown, out: DrawnNode[] = []) {
   if (el.type) out.push(el)
   for (const child of el.children ?? []) visibleNodes(child, out)
   return out
+}
+
+async function tokenCells(ui: { drawn: () => Promise<unknown> }, label: string) {
+  let cells: string[] = []
+  walkDrawn(await ui.drawn(), el => {
+    if (nodeKey(el).startsWith('token-row-')) {
+      const texts = visibleTexts(el)
+      if (texts[0] === label) cells = texts
+    }
+  })
+  return cells
 }
 
 async function shownIncludes(ui: { drawn: () => Promise<unknown> }, needle: string | RegExp) {
@@ -585,8 +614,10 @@ test('对话页：按轮次列出主模型、子代理、Codex 和 relay 外派�
   expect(await ui.find({ type: 'Text', text: '验收意见' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: '漏了空数据分支，主控已补' })).toBeDefined()
   expect(await shownIncludes(ui, '派单全文')).toBe(false)
-  // Codex 只出现一次（子代理那条），relay 里的 codex 记录不重复显示。Claude 子代理没有派单全文
-  expect(await ui.findAll({ type: 'Text', text: /^Codex$/ })).toHaveLength(1)
+  // Codex 卡片只出现一次，表格里也只有一行；relay 记录不重复显示。
+  const codexCards = visibleNodes(await ui.drawn()).filter(el => nodeKey(el) === 'agent-ag-codex:codex-rescue')
+  expect(codexCards).toHaveLength(1)
+  expect(await tokenCells(ui, 'Codex')).toHaveLength(2)
   expect(await ui.find({ type: 'Button', key: 'brief-ag-Explore' })).toBeUndefined()
   await ui.press({ key: 'back' })
 
@@ -1599,24 +1630,25 @@ test('对话页详情：Token 消耗按模型列出主管、子代理、Codex、
   // 打开第一轮详情：断言各模型行和合计行
   await ui.press({ key: 'open-t-tok-1' })
   expect(await ui.find({ type: 'Text', text: 'Token 消耗' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: 'Opus 5.5（主管）  输入 12.3k · 输出 1.2k · 缓存读 80k' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: 'Haiku 4.5（子代理）  输入 2k · 输出 500 · 缓存读 10k' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: 'Codex  输入 15k · 输出 1.1k · 缓存读 9.6k' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: 'Gemini 3.8 Flash · High  输入 9.1k · 输出 300 · 缓存读 0' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: 'Grok  无数据' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: '合计  输入 38.4k · 输出 3.1k · 缓存读 99.6k' })).toBeDefined()
+  expect(await tokenCells(ui, '模型')).toEqual(['模型', '输入', '输出', '缓存读'])
+  expect(await tokenCells(ui, 'Opus 5.5（主管）')).toEqual(['Opus 5.5（主管）', '12.3k', '1.2k', '80k'])
+  expect(await tokenCells(ui, 'Haiku 4.5（子代理）')).toEqual(['Haiku 4.5（子代理）', '2k', '500', '10k'])
+  expect(await tokenCells(ui, 'Codex')).toEqual(['Codex', '15k', '1.1k', '9.6k'])
+  expect(await tokenCells(ui, 'Gemini 3.8 Flash · High')).toEqual(['Gemini 3.8 Flash · High', '9.1k', '300', '0'])
+  expect(await tokenCells(ui, 'Grok')).toEqual(['Grok', '无数据'])
+  expect(await tokenCells(ui, '合计')).toEqual(['合计', '38.4k', '3.1k', '99.6k'])
 
   // 已完成的轮次结果缓存在内存里：改写底层 jsonl 后再打开同一轮，仍返回缓存值
   fileMap.set(`${TEST_HOME}/.claude/projects/-projects-fj/s-cur.jsonl`, { text: '', mtimeMs: t })
   await ui.press({ key: 'back' })
   await ui.press({ key: 'open-t-tok-1' })
-  expect(await ui.find({ type: 'Text', text: 'Opus 5.5（主管）  输入 12.3k · 输出 1.2k · 缓存读 80k' })).toBeDefined()
+  expect(await tokenCells(ui, 'Opus 5.5（主管）')).toEqual(['Opus 5.5（主管）', '12.3k', '1.2k', '80k'])
   await ui.press({ key: 'back' })
 
   // 打开第二轮详情：没有数据时主管和合计都显示「无数据」
   await ui.press({ key: 'open-t-tok-2' })
-  expect(await ui.find({ type: 'Text', text: 'Opus 5.5（主管）  无数据' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: '合计  无数据' })).toBeDefined()
+  expect(await tokenCells(ui, 'Opus 5.5（主管）')).toEqual(['Opus 5.5（主管）', '无数据（本轮时间内没有用量记录）'])
+  expect(await tokenCells(ui, '合计')).toEqual(['合计', '无数据'])
   await ui.unmount()
 })
 
@@ -1642,7 +1674,7 @@ test('对话页详情：进行中的轮次每次打开详情重新计算 Token �
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await ui.press({ key: 'tab-jobs' })
   await ui.press({ key: 'open-t-running' })
-  expect(await ui.find({ type: 'Text', text: 'Opus 5.5（主管）  输入 1k · 输出 200 · 缓存读 5k' })).toBeDefined()
+  expect(await tokenCells(ui, 'Opus 5.5（主管）')).toEqual(['Opus 5.5（主管）', '1k', '200', '5k'])
 
   // 进行中轮次新增了一条消息：返回列表再打开详情应重新计算
   fileMap.set(sessionFile, {
@@ -1662,8 +1694,8 @@ test('对话页详情：进行中的轮次每次打开详情重新计算 Token �
   })
   await ui.press({ key: 'back' })
   await ui.press({ key: 'open-t-running' })
-  expect(await ui.find({ type: 'Text', text: 'Opus 5.5（主管）  输入 3.5k · 输出 1k · 缓存读 20k' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: '合计  输入 3.5k · 输出 1k · 缓存读 20k' })).toBeDefined()
+  expect(await tokenCells(ui, 'Opus 5.5（主管）')).toEqual(['Opus 5.5（主管）', '3.5k', '1k', '20k'])
+  expect(await tokenCells(ui, '合计')).toEqual(['合计', '3.5k', '1k', '20k'])
   await ui.unmount()
 })
 
@@ -1746,16 +1778,16 @@ test('对话页详情：进行中的 relay 外派有 liveUsage 时加"（进行�
   await ui.press({ key: 'open-t-live' })
 
   // 1. 验证有 liveUsage 的外派行尾加"（进行中）"
-  expect(await ui.find({ type: 'Text', text: 'Gemini 3.8 Flash · High  输入 12k · 输出 800 · 缓存读 0（进行中）' })).toBeDefined()
+  expect(await tokenCells(ui, 'Gemini 3.8 Flash · High（进行中）')).toEqual(['Gemini 3.8 Flash · High（进行中）', '12k', '800', '0'])
 
   // 2. 验证进行中但暂无 liveUsage 的外派显示"进行中，暂未匹配到日志"
-  expect(await ui.find({ type: 'Text', text: 'Grok  进行中，暂未匹配到日志' })).toBeDefined()
+  expect(await tokenCells(ui, 'Grok')).toEqual(['Grok', '进行中，暂未匹配到日志'])
 
   // 3. 验证已结束且无 usage 的外派显示"无数据"
-  expect(await ui.find({ type: 'Text', text: 'grok-4.7  无数据' })).toBeDefined()
+  expect(await tokenCells(ui, 'grok-4.7')).toEqual(['grok-4.7', '无数据'])
 
   // 4. 验证合计行包含 liveUsage：主管(1k/200/2k) + agy live(12k/800/0) = 13k/1k/2k
-  expect(await ui.find({ type: 'Text', text: '合计  输入 13k · 输出 1k · 缓存读 2k' })).toBeDefined()
+  expect(await tokenCells(ui, '合计')).toEqual(['合计', '13k', '1k', '2k'])
 
   // 5. 验证进行中轮次每次刷新不走缓存：更新 liveUsage 后刷新，能看到最新数字
   relay.jobs = JSON.stringify([
@@ -1810,8 +1842,8 @@ test('对话页详情：进行中的 relay 外派有 liveUsage 时加"（进行�
   await ui.press({ key: 'back' })
   await ui.press({ key: 'jobs-refresh' })
   await ui.press({ key: 'open-t-live' })
-  expect(await ui.find({ type: 'Text', text: 'Gemini 3.8 Flash · High  输入 20k · 输出 1.5k · 缓存读 0（进行中）' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: '合计  输入 21k · 输出 1.7k · 缓存读 2k' })).toBeDefined()
+  expect(await tokenCells(ui, 'Gemini 3.8 Flash · High（进行中）')).toEqual(['Gemini 3.8 Flash · High（进行中）', '20k', '1.5k', '0'])
+  expect(await tokenCells(ui, '合计')).toEqual(['合计', '21k', '1.7k', '2k'])
 
   await ui.unmount()
 })
@@ -2024,7 +2056,7 @@ test('对话页：系统轮次并入同一会话的上一轮，不跨会话合�
   expect(await ui.find({ type: 'Text', text: '乙会话的子代理' })).toBeUndefined()
   expect(await shownIncludes(ui, '<task-notification>')).toBe(false)
   expect(await shownIncludes(ui, '<task-id>')).toBe(false)
-  expect(await ui.find({ type: 'Text', text: 'Opus 5.5（主管）  输入 1k · 输出 200 · 缓存读 0' })).toBeDefined()
+  expect(await tokenCells(ui, 'Opus 5.5（主管）')).toEqual(['Opus 5.5（主管）', '1k', '200', '0'])
   await ui.press({ key: 'back' })
 
   await ui.press({ key: 'open-b-sys' })
@@ -2927,4 +2959,281 @@ test('输入框上方：60 秒兜底拉取能发现轮次结束后才出现的�
   expect(line).toContain('⏳ 1 个子任务进行中')
   expect(line).toContain('一分钟内出现')
   await band.unmount()
+})
+
+test('settings 中 ai-relay@zm-local:false 时休眠：面板含"总开关"、不含"各模型剩余额度"，底栏 label 为 ai-relay · 已停用，钩子直接放行不写文件', async ($, on) => {
+  baseStubs(on)
+  const relay = fakeRelay(on)
+  // 底层渲染存根，供 AbovePrompt 在放行 (next(e)) 时使用
+  on('ui.render', () => ({ type: 'Text', children: [] }))
+  // 模拟 settings.json 中停用 ai-relay@zm-local
+  fileMap.set(`${TEST_HOME}/.claude/settings.json`, {
+    text: JSON.stringify({ enabledPlugins: { 'ai-relay@zm-local': false } }),
+    mtimeMs: 1793712984000,
+  })
+  on('tool.call', () => ({ result: 'ok' }))
+  on('agent.spawn', (_, e) => ({ model: 'claude-haiku-4-5-20251001', agentId: `ag-${e.subagentType}` }))
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('turn.complete', () => ({ text: '原生回答' }))
+
+  await $.session.start({ cwd: '/projects/fj', surface: 'desktop', isInteractive: true })
+
+  // 1. 底栏 label 检查
+  const footer = await $.ui.mount({ ...FOOTER, surface: 'desktop' })
+  expect((await footer.find({ type: 'Button', key: 'relay-quota' }))?.props.label).toBe('ai-relay · 已停用')
+  await footer.unmount()
+
+  // 2. 面板检查：含"总开关"，不含"各模型剩余额度"，不显示 tabs，只显示休眠提示
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: '总开关' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '各模型剩余额度' })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', key: 'tab-quota' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: '重新启用后，其他页面在重启 Claude Code 后恢复' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^已停用：不再外派、不注入提示、不记录对话；重启 Claude Code 后完全生效$/ })).toBeDefined()
+  // 停用状态下"停用"为 primary，"启用"为 secondary
+  expect((await ui.find({ type: 'Button', key: 'relay-switch-disable' }))?.props.variant).toBe('primary')
+  expect((await ui.find({ type: 'Button', key: 'relay-switch-enable' }))?.props.variant).toBe('secondary')
+  await ui.unmount()
+
+  // 3. 验证 session.start 没有启动定时器与调用 refresh
+  expect(relay.calls.filter(c => c[0] === 'status' || c[0] === 'jobs')).toHaveLength(0)
+
+  // 4. 钩子放行验证：turn.start 不新增轮次，tool.call 不写行数，agent.spawn 不记录，turn.complete 不改写
+  const startRes = await $.turn.start({ text: '用户测试消息', turnId: 't-dormant' })
+  expect(startRes).toEqual({ turnId: 't-dormant' })
+  // 检查没有保存轮次文件
+  expect(fileMap.has(`${ROUNDS_DIR}/s-cur.json`)).toBe(false)
+
+  const agentRes = await $.agent.spawn({
+    tool_use_id: 'tu-dormant',
+    prompt: '子任务',
+    description: '子任务描述',
+    subagentType: 'Explore',
+    provider: { plugin: 'engine', tier: 'core' },
+    parentModel: 'claude-opus-5-5',
+    background: false,
+    fork: false,
+  })
+  expect(agentRes).toEqual({ model: 'claude-haiku-4-5-20251001', agentId: 'ag-Explore' })
+
+  await $.tool.call({ tool: 'Write', file_path: '/projects/fj/test.ts', content: 'test code' })
+  expect(fileMap.has(`${ROUNDS_DIR}/s-cur.json`)).toBe(false)
+
+  const completeRes = await $.turn.complete({ turnId: 't-dormant', reason: 'answer', answer: '原生回答', durationMs: 1000, isAborted: false })
+  // 不追加汇总行
+  expect(completeRes).toEqual({ text: '原生回答' })
+  expect(fileMap.has(`${ROUNDS_DIR}/s-cur.json`)).toBe(false)
+
+  // 5. AbovePrompt 不渲染提示条
+  const band = await $.ui.mount({ ...ABOVE, surface: 'desktop' })
+  expect(await bandLine(band)).toBe('')
+  await band.unmount()
+})
+
+test('settings 中为 true 时额度页正常且含"总开关"', async ($, on) => {
+  baseStubs(on)
+  fakeRelay(on)
+  fileMap.set(`${TEST_HOME}/.claude/settings.json`, {
+    text: JSON.stringify({ enabledPlugins: { 'ai-relay@zm-local': true } }),
+    mtimeMs: 1793712984000,
+  })
+
+  await $.session.start({ cwd: '/projects/fj', surface: 'desktop', isInteractive: true })
+
+  // 底栏显示模式
+  const footer = await $.ui.mount({ ...FOOTER, surface: 'desktop' })
+  expect((await footer.find({ type: 'Button', key: 'relay-quota' }))?.props.label).toBe('ai-relay · 手动')
+  await footer.unmount()
+
+  // 面板显示额度页且顶端含总开关
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: '总开关' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '各模型剩余额度' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '主模型' })).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: 'tab-quota' })).toBeDefined()
+  // 启用状态下"启用"为 primary，"停用"为 secondary
+  expect((await ui.find({ type: 'Button', key: 'relay-switch-enable' }))?.props.variant).toBe('primary')
+  expect((await ui.find({ type: 'Button', key: 'relay-switch-disable' }))?.props.variant).toBe('secondary')
+  expect(await ui.find({ type: 'Text', text: /^ai-relay 正在工作：外派任务、注入提示、记录对话和用量$/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('点"停用"以 [*, "plugin", "disable", "ai-relay@zm-local"] 调用进程并切换为休眠', async ($, on) => {
+  baseStubs(on)
+  const relay = fakeRelay(on)
+  fileMap.set(`${TEST_HOME}/.claude/settings.json`, {
+    text: JSON.stringify({ enabledPlugins: { 'ai-relay@zm-local': true } }),
+    mtimeMs: 1793712984000,
+  })
+
+  await $.session.start({ cwd: '/projects/fj', surface: 'desktop', isInteractive: true })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: '各模型剩余额度' })).toBeDefined()
+
+  // 点击停用
+  await ui.press({ key: 'relay-switch-disable' })
+
+  // 验证进程调用：[*, 'plugin', 'disable', 'ai-relay@zm-local']
+  expect(relay.pluginCalls.length).toBeGreaterThan(0)
+  const lastCall = relay.pluginCalls[relay.pluginCalls.length - 1]!
+  expect(lastCall[1]).toBe('plugin')
+  expect(lastCall[2]).toBe('disable')
+  expect(lastCall[3]).toBe('ai-relay@zm-local')
+
+  // 验证 toast 提示
+  expect(toastLog).toContain('已停用，重启 Claude Code 后完全生效')
+
+  // 验证面板切换为休眠状态
+  expect(await ui.find({ type: 'Text', text: '重新启用后，其他页面在重启 Claude Code 后恢复' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '各模型剩余额度' })).toBeUndefined()
+  await ui.unmount()
+
+  // 验证底栏切换为已停用
+  const footer = await $.ui.mount({ ...FOOTER, surface: 'desktop' })
+  expect((await footer.find({ type: 'Button', key: 'relay-quota' }))?.props.label).toBe('ai-relay · 已停用')
+  await footer.unmount()
+})
+
+test('ai-relay-status@zm-local:false 不被当成 ai-relay 停用', async ($, on) => {
+  baseStubs(on)
+  fakeRelay(on)
+  fileMap.set(`${TEST_HOME}/.claude/settings.json`, {
+    text: JSON.stringify({ enabledPlugins: { 'ai-relay-status@zm-local': false } }),
+    mtimeMs: 1793712984000,
+  })
+
+  await $.session.start({ cwd: '/projects/fj', surface: 'desktop', isInteractive: true })
+
+  // 底栏正常显示模式，而不是已停用
+  const footer = await $.ui.mount({ ...FOOTER, surface: 'desktop' })
+  expect((await footer.find({ type: 'Button', key: 'relay-quota' }))?.props.label).toBe('ai-relay · 手动')
+  await footer.unmount()
+
+  // 面板显示完整的额度页
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: '总开关' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '各模型剩余额度' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('由停用切回启用：以 [*, "plugin", "enable", "ai-relay@zm-local"] 调用进程，立即 refresh 并恢复面板', async ($, on) => {
+  baseStubs(on)
+  const relay = fakeRelay(on)
+  fileMap.set(`${TEST_HOME}/.claude/settings.json`, {
+    text: JSON.stringify({ enabledPlugins: { 'ai-relay@zm-local': false } }),
+    mtimeMs: 1793712984000,
+  })
+
+  await $.session.start({ cwd: '/projects/fj', surface: 'desktop', isInteractive: true })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: '各模型剩余额度' })).toBeUndefined()
+
+  // 点击启用
+  await ui.press({ key: 'relay-switch-enable' })
+
+  // 验证调用了 plugin enable
+  expect(relay.pluginCalls.length).toBeGreaterThan(0)
+  const lastCall = relay.pluginCalls[relay.pluginCalls.length - 1]!
+  expect(lastCall[1]).toBe('plugin')
+  expect(lastCall[2]).toBe('enable')
+  expect(lastCall[3]).toBe('ai-relay@zm-local')
+
+  // 验证 toast
+  expect(toastLog).toContain('已启用，重启 Claude Code 后完全生效')
+
+  // 验证立即触发了 refresh 和 refreshJobs
+  expect(relay.calls.some(c => c[0] === 'status')).toBe(true)
+  expect(relay.calls.some(c => c[0] === 'jobs')).toBe(true)
+
+  // 验证面板恢复正常，显示各模型剩余额度
+  expect(await ui.find({ type: 'Text', text: '各模型剩余额度' })).toBeDefined()
+  await ui.unmount()
+
+  // 验证底栏恢复
+  const footer = await $.ui.mount({ ...FOOTER, surface: 'desktop' })
+  expect((await footer.find({ type: 'Button', key: 'relay-quota' }))?.props.label).toBe('ai-relay · 手动')
+  await footer.unmount()
+})
+
+test('总开关切换失败时显示错误并在按钮解除 busy', async ($, on) => {
+  baseStubs(on)
+  const relay = fakeRelay(on)
+  relay.pluginFail = '模拟的停用失败错误：权限不足或配置冲突'
+  fileMap.set(`${TEST_HOME}/.claude/settings.json`, {
+    text: JSON.stringify({ enabledPlugins: { 'ai-relay@zm-local': true } }),
+    mtimeMs: 1793712984000,
+  })
+
+  await $.session.start({ cwd: '/projects/fj', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'relay-switch-disable' })
+
+  // 验证错误文字显示
+  expect(await ui.find({ type: 'Text', text: /模拟的停用失败错误/ })).toBeDefined()
+  // 验证按钮解除 busy（文字不再有“…”）
+  expect((await ui.find({ type: 'Button', key: 'relay-switch-disable' }))?.props.label).toBe('停用')
+  await ui.unmount()
+})
+
+
+test('主管用量：桌面换 session id、从 spares 切项目、跨文件重复 message.id 只计一次', async ($, on) => {
+  const now = 1793945873085
+  baseStubs(on, new Set<string>(), () => now)
+  fakeRelay(on)
+  await $.session.start({ cwd: '/projects/fj', surface: 'desktop', isInteractive: true })
+  fileMap.set(`${TEST_HOME}/Library/Application Support/Claude/claude-code-sessions/org/account/local_demo.json`, {
+    text: JSON.stringify({ cliSessionId: 's-new', priorCliSessionIds: ['s-old'], originCwd: '/projects/fj' }), mtimeMs: now,
+  })
+  const line = (id: string, input: number) => JSON.stringify({ type: 'assistant', timestamp: now - 1000, message: { id, usage: { input_tokens: input, output_tokens: 20, cache_read_input_tokens: 30 } } })
+  fileMap.set(`${TEST_HOME}/.claude/projects/-home-tester--claude-spares-temp/s-old.jsonl`, { text: line('m1', 100), mtimeMs: now })
+  fileMap.set(`${TEST_HOME}/.claude/projects/-projects-fj/s-old.jsonl`, { text: [line('m1', 100), line('m2', 200)].join('\n'), mtimeMs: now })
+  fileMap.set(`${TEST_HOME}/.claude/projects/-projects-fj/s-new.jsonl`, { text: [line('m1', 100), line('m3', 300)].join('\n'), mtimeMs: now })
+  // 无关会话即使目录、时间都相同也不能混入。
+  fileMap.set(`${TEST_HOME}/.claude/projects/-projects-fj/unrelated.jsonl`, { text: line('wrong', 99999), mtimeMs: now })
+  const r: Round = { id: 'r-switch', sessionId: 's-old', project: { name: 'java', path: '/projects/fj/src/main/java' }, env: 'desktop', text: '换目录', mainModel: 'claude-opus-5-5', startedAt: now - 5000, finishedAt: now, status: 'answer', agents: [], selfLines: 0 }
+  putRoundFile('s-old', [r], now)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab-jobs' })
+  await ui.press({ key: 'open-r-switch' })
+  expect(await tokenCells(ui, 'Opus 5.5（主管）')).toEqual(['Opus 5.5（主管）', '600', '60', '90'])
+  await ui.unmount()
+})
+
+test('主管用量：超过 4 MiB 时流式提取，失败附原因且不缓存，终端表格列对齐、合计加粗', async ($, on) => {
+  const now = 1793945873085
+  baseStubs(on, new Set<string>(), () => now)
+  const r: Round = { id: 'r-large', sessionId: 's-cur', project: { name: 'fj', path: '/projects/fj' }, env: 'terminal', text: '大日志', mainModel: 'claude-opus-5-5', startedAt: now - 5000, finishedAt: now, status: 'answer', agents: [], selfLines: 0 }
+  putRoundFile('s-cur', [r], now)
+  const file = `${TEST_HOME}/.claude/projects/-projects-fj/s-cur.jsonl`
+  fileMap.set(file, { text: 'x'.repeat(4 * 1024 * 1024 + 1), mtimeMs: now })
+  let failed = true
+  let calls = 0
+  on('process.run', (_, e) => {
+    if (e.argv[1] !== '-e') return ok('[]')
+    calls++
+    expect(e.argv[3]).toBe(file)
+    expect(e.argv.slice(4)).toEqual([String(r.startedAt), String(r.finishedAt)])
+    if (failed) return fail('读取失败')
+    const line = JSON.stringify({ type: 'assistant', timestamp: now - 1000, message: { id: 'large-1', usage: { input_tokens: 42, cache_creation_input_tokens: 100, output_tokens: 23, cache_read_input_tokens: 55 } } })
+    return ok([line, line].join('\n'))
+  })
+  await $.session.start({ cwd: '/projects/fj', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'tab-jobs' })
+  await ui.press({ key: 'open-r-large' })
+  expect(await tokenCells(ui, 'Opus 5.5（主管）')).toEqual(['Opus 5.5（主管）', '无数据（会话日志读取失败）'])
+  failed = false
+  await ui.press({ key: 'back' })
+  await ui.press({ key: 'open-r-large' })
+  expect(calls).toBeGreaterThan(1)
+  expect(await tokenCells(ui, '模型')).toEqual(['模型', '输入', '输出', '缓存读'])
+  expect(await tokenCells(ui, 'Opus 5.5（主管）')).toEqual(['Opus 5.5（主管）', '142', '23', '55'])
+  expect(await tokenCells(ui, '合计')).toEqual(['合计', '142', '23', '55'])
+  const nodes = visibleNodes(await ui.drawn())
+  expect(nodes.filter(el => nodeKey(el).startsWith('token-cell-')).every(el => el.props?.width === 8 && el.props?.justifyContent === 'flex-end')).toBe(true)
+  const total = nodes.find(el => nodeKey(el) === 'token-row-2')
+  expect(visibleNodes(total).filter(el => el.type === 'Text').every(el => el.props?.weight === 'bold')).toBe(true)
+  await ui.unmount()
 })

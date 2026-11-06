@@ -47,6 +47,10 @@ const modelCatalog = atom({ plugin: 'ai-relay-status', key: 'modelCatalog' } as 
 const savingModels = atom({ plugin: 'ai-relay-status', key: 'savingModels' } as const, [] as string[])
 // 提示条的时长节拍。只让提示条订阅，避免每 5 秒把整个面板重绘一遍
 const bandTick = atom({ plugin: 'ai-relay-status', key: 'bandTick' } as const, 0)
+// 插件总开关：记录在 ~/.claude/settings.json 的 enabledPlugins 中
+const relayEnabled = atom({ plugin: 'ai-relay-status', key: 'relayEnabled' } as const, true)
+// 启停切换状态：切换中标记 busy，失败记录 error，成功记录 text
+const relayToggle = atom({ plugin: 'ai-relay-status', key: 'relayToggle' } as const, null as { busy: boolean; error?: string; text?: string } | null)
 // 同步锁：状态写回去之前拦住同一行的下一次选择
 const savingLock = new Set<string>()
 const NO_MODEL = '__none__'
@@ -635,28 +639,71 @@ function findSubagentUsageFromMainJsonl(jsonlText: string, a: RoundAgent): Token
   return null
 }
 
-// 定位会话主记录 ~/.claude/projects/<编码目录>/<sessionId>.jsonl
-async function findSessionJsonl($: Engine, r: Round): Promise<{ dir: string; file: string } | null> {
-  if (!HOME || !r.sessionId) return null
+// 桌面版会换 id、跨项目目录写日志，同组的所有主记录都要参与去重统计。
+async function findSessionJsonl($: Engine, r: Round): Promise<{ dir: string; file: string; id: string }[]> {
+  if (!HOME || !r.sessionId) return []
+  await loadDesktopProjects($)
+  const ids = new Set([r.sessionId])
+  const group = desktopSessionGroups.get(r.sessionId)
+  if (group) for (const [id, root] of desktopSessionGroups) if (root === group) ids.add(id)
   const base = projectsDir()
-  if (r.project?.path) {
-    const dir = `${base}/${encodeProjectPath(r.project.path)}`
-    const file = `${dir}/${r.sessionId}.jsonl`
+  const dirs = new Set<string>()
+  if (r.project?.path) dirs.add(`${base}/${encodeProjectPath(r.project.path)}`)
+  try {
+    for (const entry of await $.fs.list(base)) if (entry.kind === 'dir') dirs.add(`${base}/${entry.name}`)
+  } catch {}
+  const found: { dir: string; file: string; id: string }[] = []
+  for (const dir of dirs) for (const id of ids) {
+    const file = `${dir}/${id}.jsonl`
     try {
-      if (await $.fs.exists(file)) return { dir, file }
+      if (await $.fs.exists(file)) found.push({ dir, file, id })
     } catch {}
   }
-  try {
-    const entries = await $.fs.list(base)
-    for (const entry of entries) {
-      const dir = `${base}/${entry.name}`
-      const file = `${dir}/${r.sessionId}.jsonl`
-      try {
-        if (await $.fs.exists(file)) return { dir, file }
-      } catch {}
+  return found
+}
+
+// $.fs.read 限制 4 MiB；大日志在本机流式提取用量，避免把正文搬进插件。
+const CLAUDE_USAGE_READER = `
+const fs = require('node:fs');
+const readline = require('node:readline');
+(async () => {
+  const [file, start, end] = process.argv.slice(1);
+  const lines = readline.createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity });
+  for await (const line of lines) {
+    let e;
+    try { e = JSON.parse(line); } catch { continue; }
+    if (!e || typeof e !== 'object' || Array.isArray(e)) continue;
+    const t = typeof e.timestamp === 'number' ? e.timestamp : Date.parse(e.timestamp);
+    if (!e.toolUseResult?.usage) {
+      if (start !== '' && (!Number.isFinite(t) || t < Number(start))) continue;
+      if (end !== '' && (!Number.isFinite(t) || t > Number(end))) continue;
     }
-  } catch {}
-  return null
+    const m = e.message;
+    const u = e.toolUseResult;
+    if (e.type !== 'assistant' && !u?.usage) continue;
+    console.log(JSON.stringify({ type: e.type, timestamp: e.timestamp,
+      message: m && { id: m.id, usage: m.usage, content: Array.isArray(m.content) ? m.content.filter(c => c && typeof c === 'object' && c.tool_use_id).map(c => ({ tool_use_id: c.tool_use_id })) : undefined },
+      toolUseResult: u?.usage ? { agentId: u.agentId, usage: u.usage } : undefined }));
+  }
+})().catch(() => { process.exitCode = 1; });
+`
+
+async function readClaudeUsageJsonl($: Engine, file: string, startMs?: number, endMs?: number): Promise<string> {
+  try {
+    return await $.fs.read(file)
+  } catch {
+    for (const node of NODE_CANDIDATES) {
+      let result
+      try {
+        result = await $.process.run([node, '-e', CLAUDE_USAGE_READER, file, startMs === undefined ? '' : String(startMs), endMs === undefined ? '' : String(endMs)])
+      } catch {
+        continue
+      }
+      if (result.exitCode !== 0 || result.isStdoutTruncated) throw new Error('会话日志读取失败或用量过大')
+      return result.stdout
+    }
+    throw new Error('未找到可读取会话日志的 Node')
+  }
 }
 
 // 从 ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl 按时间和 cwd 匹配 Codex 的 token_count 事件
@@ -793,16 +840,17 @@ async function computeRoundTokens($: Engine, r: Round, list: JobView[], pool?: r
     } catch {}
   }
   const rows: RoundTokenRow[] = []
-  let sessionInfo: { dir: string; file: string } | null = null
-  let sessionText = ''
-  try {
-    sessionInfo = await findSessionJsonl($, r)
-    if (sessionInfo) {
-      sessionText = await $.fs.read(sessionInfo.file)
+  const sessionInfos = await findSessionJsonl($, r)
+  const texts: string[] = []
+  let readFailed = false
+  for (const info of sessionInfos) {
+    try {
+      texts.push(await readClaudeUsageJsonl($, info.file, r.startedAt, r.finishedAt))
+    } catch {
+      readFailed = true
     }
-  } catch {
-    sessionText = ''
   }
+  const sessionText = texts.join('\n')
 
   // 1. 主管 Claude
   let mainUsage: TokenUsage | null = null
@@ -811,7 +859,8 @@ async function computeRoundTokens($: Engine, r: Round, list: JobView[], pool?: r
   } catch {
     mainUsage = null
   }
-  rows.push({ label: `${mainModelText(r.mainModel)}（主管）`, usage: mainUsage })
+  const mainEmptyText = readFailed ? '无数据（会话日志读取失败）' : sessionInfos.length === 0 ? '无数据（未找到会话日志）' : '无数据（本轮时间内没有用量记录）'
+  rows.push({ label: `${mainModelText(r.mainModel)}（主管）`, usage: readFailed ? null : mainUsage, emptyText: mainEmptyText } as RoundTokenRow)
 
   // 2. 各子代理（Claude 子代理与 Codex）
   for (const a of r.agents) {
@@ -827,13 +876,13 @@ async function computeRoundTokens($: Engine, r: Round, list: JobView[], pool?: r
     } else {
       let subUsage: TokenUsage | null = null
       try {
-        if (sessionInfo) {
-          const subDir = `${sessionInfo.dir}/${r.sessionId}/subagents`
+        for (const sessionInfo of sessionInfos) {
+          const subDir = `${sessionInfo.dir}/${sessionInfo.id}/subagents`
           const rawId = a.id.replace(/^agent-/, '')
           const candidates = [`${subDir}/agent-${rawId}.jsonl`, `${subDir}/${a.id}.jsonl`]
           for (const cand of candidates) {
             if (await $.fs.exists(cand)) {
-              subUsage = sumClaudeJsonlUsage(await $.fs.read(cand))
+              subUsage = sumClaudeJsonlUsage(await readClaudeUsageJsonl($, cand))
               if (subUsage) break
             }
           }
@@ -847,7 +896,7 @@ async function computeRoundTokens($: Engine, r: Round, list: JobView[], pool?: r
                   if ((a.toolUseId && meta.toolUseId === a.toolUseId) || (a.id && meta.agentId === a.id)) {
                     const jsonlFile = `${subDir}/${entry.name.replace(/\.meta\.json$/, '.jsonl')}`
                     if (await $.fs.exists(jsonlFile)) {
-                      subUsage = sumClaudeJsonlUsage(await $.fs.read(jsonlFile))
+                      subUsage = sumClaudeJsonlUsage(await readClaudeUsageJsonl($, jsonlFile))
                       if (subUsage) break
                     }
                   }
@@ -855,6 +904,7 @@ async function computeRoundTokens($: Engine, r: Round, list: JobView[], pool?: r
               }
             } catch {}
           }
+          if (subUsage) break
         }
         if (!subUsage && sessionText) {
           subUsage = findSubagentUsageFromMainJsonl(sessionText, a)
@@ -916,7 +966,7 @@ async function computeRoundTokens($: Engine, r: Round, list: JobView[], pool?: r
 
 // 结束时间或并进来的子代理变了就换一把钥匙，折叠延长的窗口不会继续用旧结果
 function roundTokenCacheKey(r: Round) {
-  return `${r.id}:${r.status}:${r.finishedAt ?? 'open'}:${r.agents?.length ?? 0}`
+  return `${r.id}:${r.status}:${r.finishedAt ?? 'open'}:${r.agents?.length ?? 0}:${[...desktopSessionGroups].filter(([, group]) => group === desktopSessionGroups.get(r.sessionId)).map(([id]) => id).sort().join(',')}`
 }
 
 async function getRoundTokens($: Engine, r: Round, list: JobView[], pool?: readonly Round[]): Promise<RoundTokenRow[]> {
@@ -926,7 +976,7 @@ async function getRoundTokens($: Engine, r: Round, list: JobView[], pool?: reado
     return roundTokenCache.get(key)!
   }
   const rows = await computeRoundTokens($, r, list, pool)
-  if (!isRunning) {
+  if (!isRunning && rows[0]?.usage !== null) {
     roundTokenCache.set(key, rows)
   } else {
     roundTokenCache.delete(key)
@@ -1663,7 +1713,7 @@ export function roundDetailText(r: Round) {
   return r.text
 }
 
-export { computeRoundTokens, fmtTokens, fmtUsage }
+export { computeRoundTokens, fmtTokens, fmtUsage, readRelayEnabled, setRelayEnabled }
 
 type RunningSubtask = { id: string; name: string; brief: string; startedAt: number }
 
@@ -1760,16 +1810,135 @@ async function tickRunningBand($: Engine) {
   }
 }
 
+/** 从 ~/.claude/settings.json 读取 ai-relay 启用状态和插件标识 */
+async function readRelayEnabled($: Engine): Promise<{ enabled: boolean; pluginId: string }> {
+  let home = ''
+  try {
+    home = (await $.env.get('HOME')) || HOME
+  } catch {
+    home = HOME
+  }
+  if (home && !HOME) HOME = home
+  const settingsFile = `${home}/.claude/settings.json`
+  try {
+    const raw = await $.fs.read(settingsFile)
+    const json = JSON.parse(raw)
+    const enabledPlugins = json?.enabledPlugins
+    if (enabledPlugins && typeof enabledPlugins === 'object') {
+      const entry = Object.entries(enabledPlugins).find(([k]) => k.startsWith('ai-relay@') && !k.startsWith('ai-relay-status@'))
+      if (entry) {
+        const [pluginId, val] = entry
+        return {
+          enabled: val !== false,
+          pluginId,
+        }
+      }
+    }
+  } catch {
+    // 没找到、读失败、true 均按 true 处理
+  }
+  return { enabled: true, pluginId: 'ai-relay@zm-local' }
+}
+
+let timersStarted = false
+
+/** 启动定时器：防重复注册 */
+function startTimers($: Engine) {
+  if (timersStarted) return
+  timersStarted = true
+  $.clock.every(REFRESH_MS, () => {
+    void refresh($)
+    void refreshJobs($)
+    void loadAllRounds($)
+  })
+  // 时长 5 秒跳一次。回调里才读台账，ui.render 不碰文件
+  $.clock.every(BAND_TICK_MS, () => {
+    void tickRunningBand($)
+  })
+}
+
+/** 启停 ai-relay 插件：依次尝试 claude 命令路径，执行 plugin enable/disable */
+async function setRelayEnabled($: Engine, on: boolean) {
+  const curToggle = await read($, relayToggle)
+  if (curToggle?.busy) return
+  await update($, relayToggle, () => ({ busy: true }))
+  const wasEnabled = await read($, relayEnabled)
+
+  try {
+    const { pluginId } = await readRelayEnabled($)
+    let home = HOME
+    if (!home) {
+      try {
+        home = (await $.env.get('HOME')) || ''
+        if (home) HOME = home
+      } catch {}
+    }
+    const candidates = [
+      `${home}/.local/bin/claude`,
+      '/opt/homebrew/bin/claude',
+      '/usr/local/bin/claude',
+      'claude',
+    ]
+    const action = on ? 'enable' : 'disable'
+    let success = false
+    let lastStderr = ''
+    for (const bin of candidates) {
+      try {
+        const res = await $.process.run([bin, 'plugin', action, pluginId], { timeoutMs: 60_000 })
+        if (res.exitCode === 0) {
+          success = true
+          break
+        }
+        lastStderr = res.stderr || res.stdout || `退出码 ${res.exitCode}`
+      } catch (err) {
+        lastStderr = String(err instanceof Error ? err.message : err)
+      }
+    }
+
+    if (!success) {
+      const errMsg = (lastStderr || '操作失败').slice(0, 160)
+      await update($, relayToggle, () => ({ busy: false, error: errMsg }))
+      $.ui.toast(errMsg)
+      return
+    }
+
+    // exitCode 0 后重新 readRelayEnabled 写回 atom（以文件为准）
+    const nextState = await readRelayEnabled($)
+    await update($, relayEnabled, () => nextState.enabled)
+    const msg = on ? '已启用，重启 Claude Code 后完全生效' : '已停用，重启 Claude Code 后完全生效'
+    await update($, relayToggle, () => ({ busy: false, text: msg }))
+    $.ui.toast(msg)
+
+    // 由停用切回启用时，本会话立即 refresh、refreshJobs、startTimers
+    if (!wasEnabled && nextState.enabled) {
+      await refresh($)
+      await refreshJobs($)
+      startTimers($)
+    }
+  } catch (err) {
+    const errMsg = String(err instanceof Error ? err.message : err).slice(0, 160)
+    await update($, relayToggle, () => ({ busy: false, error: errMsg }))
+    $.ui.toast(errMsg)
+  }
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     roundTokenCache.clear()
+    timersStarted = false
     await $.command.register({ name: 'relay-bar', description: '打开或关闭 ai-relay 面板（额度 / 任务 / 厂商）' })
-    // 早期版本在底部状态栏放过文字，这里清掉，改由底栏按钮承担
-    $.ui.status(undefined)
-    initialSurface = e.surface
     try {
       HOME = (await $.env.get('HOME')) || HOME
     } catch {}
+    const { enabled } = await readRelayEnabled($)
+    await update($, relayEnabled, () => enabled)
+    if (!enabled) {
+      $.ui.status(undefined)
+      return next(e)
+    }
+    // 早期版本在底部状态栏放过文字，这里清掉，改由底栏按钮承担
+    $.ui.status(undefined)
+    initialSurface = e.surface
     try {
       currentSessionId = await $.session.id()
     } catch {}
@@ -1798,15 +1967,7 @@ export const register: Register = on => {
     await refresh($)
     // 先读一次外派台账，不等到 60 秒后提示条才知道有任务
     await refreshJobs($)
-    $.clock.every(REFRESH_MS, () => {
-      void refresh($)
-      void refreshJobs($)
-      void loadAllRounds($)
-    })
-    // 时长 5 秒跳一次。回调里才读台账，ui.render 不碰文件
-    $.clock.every(BAND_TICK_MS, () => {
-      void tickRunningBand($)
-    })
+    startTimers($)
     return next(e)
   })
 
@@ -1817,6 +1978,7 @@ export const register: Register = on => {
 
   // 主模型每轮开始：记下你的消息和当时的主模型
   on('turn.start', async ($, e, next) => {
+    if (!(await read($, relayEnabled))) return next(e)
     const result = await next(e)
     if (e.agentId !== undefined) return result
     let mainModel = ''
@@ -1880,6 +2042,7 @@ export const register: Register = on => {
 
   // 主模型启动子代理（含 Codex）：记到当前这一轮
   on('agent.spawn', async ($, e, next) => {
+    if (!(await read($, relayEnabled))) return next(e)
     const result = await next(e)
     if (result.deny !== undefined) return result
     const agent: RoundAgent = {
@@ -1902,6 +2065,7 @@ export const register: Register = on => {
 
   // 主模型亲手写入的行数：子代理里的编辑不算
   on('tool.call', { tool: ['Edit', 'Write', 'NotebookEdit'] }, async ($, e, next) => {
+    if (!(await read($, relayEnabled))) return next(e)
     const result = await next(e)
     if (e.agentId !== undefined) return result
     // 写在临时 / 草稿目录里的（派单、笔记）不是代码改动，不计入
@@ -1921,6 +2085,25 @@ export const register: Register = on => {
 
   // 一轮结束：子代理的标记完成；主模型的收尾这一轮，在回答下方写一行本轮用到的模型，并刷新额度
   on('turn.complete', async ($, e, next) => {
+    if (!(await read($, relayEnabled))) {
+      const passed = await next(e)
+      // 轮次进行中途停用：把已开始记录的这一轮 / 子代理收尾，免得永远停在"进行中"；不追加汇总行
+      const list = await read($, rounds)
+      const stale =
+        e.agentId !== undefined
+          ? list.some(r => r.agents.some(a => a.id === e.agentId && a.status === 'running'))
+          : list.some(r => r.status === 'running')
+      if (stale) {
+        const now = await $.clock.now()
+        await update($, rounds, all =>
+          e.agentId !== undefined
+            ? all.map(r => ({ ...r, agents: r.agents.map(a => (a.id === e.agentId ? { ...a, status: AGENT_END[e.reason] ?? 'done', finishedAt: now } : a)) }))
+            : all.map(r => (r.status === 'running' ? { ...r, status: e.reason, finishedAt: now } : r)),
+        )
+        await saveRounds($)
+      }
+      return passed
+    }
     const result = await next(e)
     const now = await $.clock.now()
     if (e.agentId !== undefined) {
@@ -1952,6 +2135,7 @@ export const register: Register = on => {
   // 输入框正上方：本会话还有子任务在跑时显示一行，没有就让出这块，不占位
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     try {
+      if (!(await read($, relayEnabled))) return next(e)
       // 问卷占着这块时让开，不盖住它
       if (e.props.hasSurvey) return next(e)
       // 订阅节拍。没有进行中的子任务时计数不动，这里不会跟着重绘
@@ -1986,10 +2170,11 @@ export const register: Register = on => {
 
   // 输入框底栏右侧放一个小按钮，显示当前模式，点击打开面板
   on('ui.render', { component: 'SessionMode' }, async ($, e) => {
-    const snap = await read($, snapshot)
+    const isRelayEnabled = await read($, relayEnabled)
+    const snap = isRelayEnabled ? await read($, snapshot) : null
     const { Box, Button, Text } = $.ui.resolve(e)
-    // 只显示名称和模式，不加图标；各家额度在面板里看
-    const label = snap ? `ai-relay · ${MODE_TEXT[snap.mode]}` : 'ai-relay'
+    // 只显示名称和模式，不加图标；休眠时显示已停用，各家额度在面板里看
+    const label = !isRelayEnabled ? 'ai-relay · 已停用' : snap ? `ai-relay · ${MODE_TEXT[snap.mode]}` : 'ai-relay'
     return (
       <Box flexDirection="row" columnGap={1} alignItems="center">
         {e.props.modes.length > 0 && <Text dimColor>{e.props.modes.join(' & ')}</Text>}
@@ -1999,6 +2184,8 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const isRelayEnabled = await read($, relayEnabled)
+    const toggle = await read($, relayToggle)
     const els = $.ui.resolve(e)
     const { Box, Button, Text } = els
     // 有 Svg 的界面（桌面、编辑器、手机）画额度条，终端用字符
@@ -2006,6 +2193,69 @@ export const register: Register = on => {
     // 手机端没有输入框和下拉框，新增厂商只能在桌面端或终端里做
     const Input = e.surface !== 'mobile' && 'Input' in els ? els.Input : null
     const Select = e.surface !== 'mobile' && 'Select' in els ? els.Select : null
+
+    const section = (title: string, hint?: string) => (
+      <Box flexDirection="row" columnGap={1} alignItems="center">
+        <Text size="caption" weight="semibold" dimColor>
+          {title}
+        </Text>
+        {hint && (
+          <Text size="caption" dimColor>
+            {hint}
+          </Text>
+        )}
+      </Box>
+    )
+
+    const enableLabel = toggle?.busy && !isRelayEnabled ? '启用…' : '启用'
+    const disableLabel = toggle?.busy && isRelayEnabled ? '停用…' : '停用'
+    const switchSection = (
+      <Box flexDirection="column" rowGap={1}>
+        {section('总开关')}
+        <Box flexDirection="row" columnGap={1}>
+          <Button
+            key="relay-switch-enable"
+            label={enableLabel}
+            variant={isRelayEnabled ? 'primary' : 'secondary'}
+            onPress={() => (isRelayEnabled || toggle?.busy ? undefined : setRelayEnabled($, true))}
+          />
+          <Button
+            key="relay-switch-disable"
+            label={disableLabel}
+            variant={!isRelayEnabled ? 'primary' : 'secondary'}
+            onPress={() => (!isRelayEnabled || toggle?.busy ? undefined : setRelayEnabled($, false))}
+          />
+        </Box>
+        <Text size="caption" dimColor>
+          {isRelayEnabled
+            ? 'ai-relay 正在工作：外派任务、注入提示、记录对话和用量'
+            : '已停用：不再外派、不注入提示、不记录对话；重启 Claude Code 后完全生效'}
+        </Text>
+        {toggle?.error && (
+          <Text size="caption" color="error">
+            {toggle.error}
+          </Text>
+        )}
+        {toggle?.text && (
+          <Text size="caption" color="success">
+            {toggle.text}
+          </Text>
+        )}
+      </Box>
+    )
+
+    // 休眠时不管 tab，面板只渲染"总开关"节 + 一行"重新启用后，其他页面在重启 Claude Code 后恢复"，不显示 tabs、不读 snapshot
+    if (!isRelayEnabled) {
+      return (
+        <Box flexDirection="column" rowGap={1} paddingX={1}>
+          {switchSection}
+          <Text size="caption" dimColor>
+            重新启用后，其他页面在重启 Claude Code 后恢复
+          </Text>
+        </Box>
+      )
+    }
+
     const current = await read($, tab)
     const snap = await read($, snapshot)
     const busyKey = await read($, busy)
@@ -2039,18 +2289,6 @@ export const register: Register = on => {
             }}
           />
         ))}
-      </Box>
-    )
-    const section = (title: string, hint?: string) => (
-      <Box flexDirection="row" columnGap={1} alignItems="center">
-        <Text size="caption" weight="semibold" dimColor>
-          {title}
-        </Text>
-        {hint && (
-          <Text size="caption" dimColor>
-            {hint}
-          </Text>
-        )}
       </Box>
     )
     // 一行「标签：内容」。标签列固定宽，内容默认可换行
@@ -2098,7 +2336,7 @@ export const register: Register = on => {
 
     // ---------- 额度页 ----------
     if (current === 'quota') {
-      if (snap === null) return page(<Text dimColor>正在读取额度…</Text>)
+      if (snap === null) return page(switchSection, <Text dimColor>正在读取额度…</Text>)
       const busyMode = await read($, switching)
 
       const meterRow = (w: WindowView, poolKey: string) => {
@@ -2171,6 +2409,7 @@ export const register: Register = on => {
       }
 
       return page(
+        switchSection,
         <Box flexDirection="column" rowGap={1}>
           {section('主模型')}
           <Text size="heading" weight="semibold">
@@ -2429,16 +2668,32 @@ export const register: Register = on => {
             field('你的消息', message, { wrap: 'wrap' }),
             field('主管', `${mainModelText(r.mainModel)} · 统筹拆解、派发、核验、汇报`),
             cardSummary(r, list, allRoundsList) !== '' && field('分工', cardSummary(r, list, allRoundsList)),
-            <Box flexDirection="column" rowGap={0}>
+            <Box flexDirection="column" rowGap={1}>
               {section('Token 消耗')}
-              {tokenRows.map((row, idx) => {
-                const r = row as RoundTokenRow & { live?: boolean; emptyText?: string }
-                return (
-                  <Text key={`token-row-${idx}`} size="footnote" wrap="wrap" dimColor={row.usage === null}>
-                    {`${row.label}  ${fmtUsage(row.usage, { live: r.live, emptyText: r.emptyText })}`}
-                  </Text>
-                )
-              })}
+              <Box flexDirection="column" rowGap={0} minWidth={0}>
+                {[{ label: '模型', usage: null }, ...tokenRows].map((row, idx) => {
+                  const extra = row as RoundTokenRow & { live?: boolean; emptyText?: string }
+                  const weight = idx === 0 || row.label === '合计' ? 'bold' : undefined
+                  return (
+                    <Box key={`token-row-${idx}`} flexDirection="row" columnGap={1} minWidth={0}>
+                      <Box flexGrow={1} flexShrink={1} minWidth={0}>
+                        <Text size="footnote" weight={weight} wrap="wrap">{`${row.label}${extra.live ? '（进行中）' : ''}`}</Text>
+                      </Box>
+                      {idx === 0 || row.usage ? (
+                        (idx === 0 ? ['输入', '输出', '缓存读'] : [row.usage!.input, row.usage!.output, row.usage!.cacheRead].map(fmtTokens)).map((value, col) => (
+                          <Box key={`token-cell-${idx}-${col}`} width={8} flexShrink={0} justifyContent="flex-end" flexDirection="row">
+                            <Text size="footnote" weight={weight} tabular>{value}</Text>
+                          </Box>
+                        ))
+                      ) : (
+                        <Box width={26} flexShrink={0}>
+                          <Text size="footnote" dimColor wrap="wrap">{extra.emptyText || '无数据'}</Text>
+                        </Box>
+                      )}
+                    </Box>
+                  )
+                })}
+              </Box>
             </Box>,
             ...r.agents.map(agentCard),
             ...rj.map(jobCard),

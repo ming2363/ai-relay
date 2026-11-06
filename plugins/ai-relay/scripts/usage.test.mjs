@@ -13,6 +13,7 @@ import {
   agyUsageFor,
   backfill,
   attachLiveUsage,
+  getAgySessionActivityMtime,
 } from "./usage.mjs";
 
 // 手工编码 protobuf varint 与 length-delimited 字段的测试辅助函数
@@ -618,5 +619,65 @@ test("8. running 任务的 liveUsage 被算出且不写回 job json，且不持�
     });
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+
+test("agy 活动识别：旧库、空元数据和仅 WAL 更新均保活，不缓存猜测", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-activity-"));
+  try {
+    const file = path.join(dir, "old.db");
+    const db = new DatabaseSync(file);
+    db.exec("CREATE TABLE trajectory_metadata_blob (data BLOB)");
+    db.close();
+    const now = Date.now() + 600_000;
+    const job = { provider: "agy", cwd: "/workspace/current", startedAt: new Date(now).toISOString() };
+    const opts = { agyDir: dir, usedSources: new Set() };
+    assert.ok(fs.statSync(file).birthtimeMs < now - 5000);
+    fs.writeFileSync(file + "-wal", "");
+    fs.utimesSync(file + "-wal", now / 1000, now / 1000);
+    assert.ok(Math.abs(getAgySessionActivityMtime(job, opts) - now) < 1);
+    assert.equal(job._matchedAgyDb, undefined);
+    // 元数据可能残留旧 cwd；仍不能把近期 WAL 活动当作空闲。
+    const writer = new DatabaseSync(file);
+    writer.prepare("INSERT INTO trajectory_metadata_blob (data) VALUES (?)").run(Buffer.from("file:///workspace/previous"));
+    writer.close();
+    fs.writeFileSync(file + "-wal", "");
+    fs.utimesSync(file + "-wal", (now + 1000) / 1000, (now + 1000) / 1000);
+    assert.ok(Math.abs(getAgySessionActivityMtime(job, opts) - now - 1000) < 1);
+    assert.equal(job._matchedAgyDb, undefined);
+    fs.writeFileSync(file + "-shm", "共享内存活动");
+    fs.utimesSync(file + "-shm", (now + 2000) / 1000, (now + 2000) / 1000);
+    assert.ok(Math.abs(getAgySessionActivityMtime(job, opts) - now - 2000) < 1);
+    // 没有新的外部写入时，重复探测不能自行推进活动时间。
+    assert.ok(Math.abs(getAgySessionActivityMtime(job, opts) - now - 2000) < 1);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("agy 活动识别：匹配后不借用并发会话的活动，已占用来源不参与兜底", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-concurrent-"));
+  try {
+    const now = Date.now();
+    const file = path.join(dir, "own.db");
+    const other = path.join(dir, "other.db");
+    for (const [p, cwd] of [[file, "/workspace/own"], [other, "/workspace/other"]]) {
+      const db = new DatabaseSync(p);
+      db.exec("CREATE TABLE trajectory_metadata_blob (data BLOB)");
+      db.prepare("INSERT INTO trajectory_metadata_blob (data) VALUES (?)").run(Buffer.from(`file://${cwd}`));
+      db.close();
+    }
+    fs.utimesSync(file, now / 1000, now / 1000);
+    fs.utimesSync(other, (now + 1000) / 1000, (now + 1000) / 1000);
+    const job = { provider: "agy", cwd: "/workspace/own", startedAt: new Date(now).toISOString() };
+    const opts = { agyDir: dir, usedSources: new Set() };
+    assert.ok(Math.abs(getAgySessionActivityMtime(job, opts) - now) < 1);
+    assert.equal(job._matchedAgyDb, file);
+    fs.utimesSync(other, (now + 2000) / 1000, (now + 2000) / 1000);
+    assert.ok(Math.abs(getAgySessionActivityMtime(job, opts) - now) < 1);
+    assert.equal(getAgySessionActivityMtime({ ...job, cwd: "/unknown", _matchedAgyDb: undefined }, { ...opts, usedSources: new Set(["own.db", "other.db"]) }), 0);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });

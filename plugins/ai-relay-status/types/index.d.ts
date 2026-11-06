@@ -304,6 +304,10 @@ declare module 'claude-code' {
       savingModels: string[]
       /** 输入框上方提示条的时长节拍。只有提示条读取，加一就只重绘提示条 */
       bandTick: number
+      /** ai-relay 插件总开关是否开启 */
+      relayEnabled: boolean
+      /** 总开关切换状态 */
+      relayToggle: { busy: boolean; error?: string; text?: string } | null
     }
   }
 }

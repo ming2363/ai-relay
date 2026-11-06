@@ -4,7 +4,6 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { executeJob, formatTimeoutReason } from "./relay.mjs";
 import { getWorkspaceActivityMtime } from "./lib.mjs";
@@ -22,12 +21,10 @@ function setupTestEnv(prefix = "ai-relay-timeout-") {
   fs.mkdirSync(agyDir, { recursive: true });
   fs.mkdirSync(grokDir, { recursive: true });
 
-  // 初始化 git 仓库用于工作区快照
-  try {
-    execFileSync("git", ["init", cwdDir], { stdio: "ignore" });
-    execFileSync("git", ["-C", cwdDir, "config", "user.name", "TestUser"], { stdio: "ignore" });
-    execFileSync("git", ["-C", cwdDir, "config", "user.email", "test@example.com"], { stdio: "ignore" });
-  } catch {}
+  // 最小空仓库夹具，仅供 git status 读取，不执行 Git 写入命令。
+  fs.mkdirSync(path.join(cwdDir, ".git", "objects"), { recursive: true });
+  fs.mkdirSync(path.join(cwdDir, ".git", "refs"), { recursive: true });
+  fs.writeFileSync(path.join(cwdDir, ".git", "HEAD"), "ref: refs/heads/test\n");
 
   const cleanup = () => {
     try {
@@ -38,15 +35,14 @@ function setupTestEnv(prefix = "ai-relay-timeout-") {
   return { tmpDir, jobsDir, cwdDir, agyDir, grokDir, cleanup };
 }
 
-test("1. 持续写日志不被杀：子进程定期更新会话日志，超过无活动超时时长仍正常跑完", async () => {
+test("1. 初期没有 cwd 元数据、仅 WAL 持续更新，超过无活动超时时长仍正常跑完", async () => {
   const env = setupTestEnv("ai-relay-test1-");
   try {
-    // 创建一个匹配该 cwd 的 fake agy 会话库
+    // 模拟 agy 初期尚未写入 cwd 元数据的会话库
     const dbPath = path.join(env.agyDir, "conv-active.db");
     const walPath = path.join(env.agyDir, "conv-active.db-wal");
     const db = new DatabaseSync(dbPath);
     db.exec("CREATE TABLE trajectory_metadata_blob (data BLOB);");
-    db.prepare("INSERT INTO trajectory_metadata_blob (data) VALUES (?)").run(Buffer.from(`file://${env.cwdDir}`));
     db.close();
     fs.writeFileSync(walPath, "initial wal\n");
 
