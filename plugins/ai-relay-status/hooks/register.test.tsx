@@ -632,6 +632,45 @@ test('对话页：按轮次列出主模型、子代理、Codex 和 relay 外派�
   await ui.unmount()
 })
 
+test('对话页：本轮行数取 relay 统计（含 Bash 写入），详情显示主管自己做的原因', async ($, on) => {
+  let t = Date.parse('2026-11-04T07:00:00.000Z')
+  baseStubs(on, new Set<string>(), () => t)
+  fakeRelay(on)
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('turn.complete', () => ({ text: '答完了' }))
+  on('tool.call', () => ({ result: 'ok' }))
+  await $.session.start({ cwd: '/projects/fj', surface: 'desktop', isInteractive: true })
+  const edits = `${TEST_HOME}/.claude/ai-relay/prompts/s-cur.edits.json`
+
+  await $.turn.start({ text: '按这个改', turnId: 'ts1' })
+  await $.tool.call({ tool: 'Write', file_path: '/x.ts', content: Array(10).fill('x').join('\n') })
+  fileMap.set(edits, { text: JSON.stringify({ lines: 230, warned: true, reads: 0, readWarned: false, decision: 'self', selfReason: '需要本会话前面讨论的结论' }), mtimeMs: t })
+  t += 60_000
+  await $.turn.complete({ turnId: 'ts1', reason: 'answer', answer: '', durationMs: 1000, isAborted: false })
+
+  // 外派了的一轮：decision 为 dispatch，不显示原因
+  await $.turn.start({ text: '再派一个', turnId: 'ts2' })
+  fileMap.set(edits, { text: JSON.stringify({ lines: 0, warned: false, reads: 0, readWarned: false, decision: 'dispatch' }), mtimeMs: t })
+  t += 60_000
+  await $.turn.complete({ turnId: 'ts2', reason: 'answer', answer: '', durationMs: 1000, isAborted: false })
+
+  const saved = JSON.parse(fileMap.get(`${ROUNDS_DIR}/s-cur.json`)!.text) as Round[]
+  const r1 = saved.find(r => r.id === 'ts1')!
+  expect(r1.selfLines).toBe(230)
+  expect(r1.selfReason).toBe('需要本会话前面讨论的结论')
+  expect(saved.find(r => r.id === 'ts2')!.selfReason).toBeUndefined()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab-jobs' })
+  await ui.press({ key: 'open-ts1' })
+  expect(await ui.find({ type: 'Text', text: '自己做的原因' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '需要本会话前面讨论的结论' })).toBeDefined()
+  await ui.press({ key: 'back' })
+  await ui.press({ key: 'open-ts2' })
+  expect(await ui.find({ type: 'Text', text: '自己做的原因' })).toBeUndefined()
+  await ui.unmount()
+})
+
 test('对话页：跨会话展示所有项目、按项目筛选、写入跨会话存储', async ($, on) => {
   const otherRound: Round = {
     id: 't-other',
@@ -649,7 +688,7 @@ test('对话页：跨会话展示所有项目、按项目筛选、写入跨会�
 
   baseStubs(on, new Set<string>(), () => 1793712984000)
   putRoundFile('s-other', [otherRound], 1793712984000)
-  // 桌面版没选文件夹的会话跑在 spares 临时目录，显示成「未选文件夹」
+  // 桌面版没选文件夹的会话跑在 spares 临时目录，显示成「本电脑」
   putRoundFile('s-spare', [{ ...otherRound, id: 't-spare', sessionId: 's-spare', text: '没选文件夹的提问',
     project: { name: 'spare-AJP8NA', path: '/Users/me/.claude/spares/spare-AJP8NA' } }], 1793712984000)
   fakeRelay(on)
@@ -675,10 +714,17 @@ test('对话页：跨会话展示所有项目、按项目筛选、写入跨会�
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await ui.press({ key: 'tab-jobs' })
 
+  // 默认选中当前窗口所在项目，只列本项目的对话；「全部项目」仍可选
+  expect((await ui.find({ type: 'Select', key: 'filter-project' }))?.props.value).toBe('fj')
+  expect(await ui.find({ type: 'Text', text: '本会话修改前端样式' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '修复报表导出服务 bug' })).toBeUndefined()
+  await ui.select({ key: 'filter-project', value: '' })
+  expect((await ui.find({ type: 'Select', key: 'filter-project' }))?.props.value).toBe('')
+
   // 每个项目都显示项目名；本会话不再单独标，环境标签和环境筛选不再出现
   expect(await ui.find({ type: 'Text', text: '◆ fj' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: '◆ api-server' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: '◆ 未选文件夹' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '◆ 本电脑' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /spare-AJP8NA/ })).toBeUndefined()
   expect(await ui.find({ type: 'Text', text: '▣ 桌面端' })).toBeUndefined()
   expect(await ui.find({ type: 'Text', text: '▣ 终端' })).toBeUndefined()
@@ -919,6 +965,7 @@ test('对话页：有两个项目时显示项目标签，未归入外派的项�
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await ui.press({ key: 'tab-jobs' })
+  await ui.select({ key: 'filter-project', value: '' })
   expect(await ui.find({ type: 'Text', text: '◆ fj' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: '◆ api-server' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: '● 本会话' })).toBeUndefined()
@@ -1203,6 +1250,7 @@ test('对话页：共享目录里其他会话的项目和本会话一起显示',
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await ui.press({ key: 'tab-jobs' })
+  await ui.select({ key: 'filter-project', value: '' })
   expect(await ui.find({ type: 'Text', text: '◆ zc' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: '◆ fj' })).toBeDefined()
   await ui.unmount()
@@ -1860,6 +1908,12 @@ test('对话页：项目名按桌面版会话映射，筛选下拉按映射名�
     title: '无关字段，不应参与项目名',
   })
   fileMap.set(meta, { text: desktopMeta('/Users/me/Documents/workspace/ZS/zc'), mtimeMs: now })
+  // 桌面版没选文件夹的会话跑在 scratch-workspaces 临时目录，左侧栏归在「本电脑」
+  const scratchCwd = `${TEST_HOME}/Library/Application Support/Claude/scratch-workspaces/env-1/sess-b/scratch-2026-11-08-10b765`
+  fileMap.set(`${TEST_HOME}/Library/Application Support/Claude/claude-code-sessions/group-a/sess-b/local_2.json`, {
+    text: JSON.stringify({ cliSessionId: 'sid-scratch', originCwd: scratchCwd }),
+    mtimeMs: now,
+  })
   const round = (id: string, sessionId: string, name: string, path: string, text: string, startedAt: number): Round => ({
     id,
     sessionId,
@@ -1877,6 +1931,7 @@ test('对话页：项目名按桌面版会话映射，筛选下拉按映射名�
   putRoundFile('sid-prior', [round('t-prior', 'sid-prior', 'zc-knowledge-service', '/Users/me/Documents/workspace/ZS/zc/knowledge', '命中以前的会话 id', now - 2)], now)
   putRoundFile('sid-term', [round('t-term', 'sid-term', 'backend', '/Users/me/work/octop', '终端里的会话', now - 3)], now)
   putRoundFile('sid-spare', [round('t-spare', 'sid-spare', 'spare-AJP8NA', '/Users/me/.claude/spares/spare-AJP8NA', '没选文件夹的提问', now - 4)], now)
+  putRoundFile('sid-scratch', [round('t-scratch', 'sid-scratch', 'scratch-2026-11-08-10b765', scratchCwd, '临时会话的提问', now - 5)], now)
   fakeRelay(on)
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: '答完了' }))
@@ -1889,11 +1944,13 @@ test('对话页：项目名按桌面版会话映射，筛选下拉按映射名�
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await ui.press({ key: 'tab-jobs' })
+  await ui.select({ key: 'filter-project', value: '' })
 
-  // 命中 cliSessionId、priorCliSessionIds 都显示 originCwd 末级名；终端回退到启动目录；spares 显示未选文件夹
+  // 命中 cliSessionId、priorCliSessionIds 都显示 originCwd 末级名；终端回退到启动目录；spares 显示本电脑
   expect(await ui.findAll({ type: 'Text', text: '◆ zc' })).toHaveLength(2)
   expect(await ui.find({ type: 'Text', text: '◆ octop' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: '◆ 未选文件夹' })).toBeDefined()
+  expect(await ui.findAll({ type: 'Text', text: '◆ 本电脑' })).toHaveLength(2)
+  expect(await ui.find({ type: 'Text', text: /scratch-2026/ })).toBeUndefined()
   expect(await ui.find({ type: 'Text', text: '◆ terminal-app' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: '◆ backend' })).toBeUndefined()
   expect(await ui.find({ type: 'Text', text: '◆ zc-knowledge-service' })).toBeUndefined()
@@ -1904,7 +1961,7 @@ test('对话页：项目名按桌面版会话映射，筛选下拉按映射名�
     'terminal-app（1）',
     'zc（2）',
     'octop（1）',
-    '未选文件夹（1）',
+    '本电脑（2）',
   ])
 
   await ui.press({ key: 'open-t-cli' })
@@ -1934,7 +1991,7 @@ test('对话页：项目名按桌面版会话映射，筛选下拉按映射名�
     'terminal-app（1）',
     'renamed（2）',
     'octop（1）',
-    '未选文件夹（1）',
+    '本电脑（2）',
   ])
   await ui.unmount()
 })
@@ -2449,6 +2506,7 @@ test('输入框上方：只算当前会话，其他会话的子任务不算', as
   // 对话页会把其他会话读进 allRounds；提示条不能跟着算进去
   const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await pane.press({ key: 'tab-jobs' })
+  await pane.select({ key: 'filter-project', value: '' })
   expect(await pane.find({ type: 'Text', text: '另一个会话' })).toBeDefined()
   await pane.unmount()
 
@@ -2503,6 +2561,7 @@ test('输入框上方：带 sessionId 的他会话外派，时间重叠也不进
   // 对话页同一套归属：他会话的任务挂到他的轮次，不进本会话
   const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await pane.press({ key: 'tab-jobs' })
+  await pane.select({ key: 'filter-project', value: '' })
   expect(await pane.find({ type: 'Text', text: 'Opus 5.5 主管 · Grok ● · Gemini 4 Argon ●' })).toBeDefined()
   // 没有 sessionId 的旧记录只归同一项目里最近的用户轮次，不再因为时间重叠进另一个项目
   expect(await pane.find({ type: 'Text', text: 'Sonnet 5.5 主管 · Gemini 3.8 Flash ●' })).toBeDefined()

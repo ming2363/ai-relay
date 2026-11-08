@@ -1048,6 +1048,17 @@ async function cmdProvider(opts) {
   }
 }
 
+// 钩子看到 stdout 里的 [relay-self] 行，才把原因写进当前会话。这里只负责打印。
+function cmdSelf(opts) {
+  const raw = opts.text != null ? String(opts.text) : opts._.slice(1).join(" ");
+  let reason = raw.replace(/[\r\n]+/g, " ").replace(/[ \t]+/g, " ").trim();
+  if (!reason) throw new Error("用法：relay self <原因>");
+  const chars = Array.from(reason);
+  if (chars.length > 200) reason = chars.slice(0, 200).join("");
+  console.log(`[relay-self] ${reason}`);
+  console.log("已记录，本轮可以继续自己改");
+}
+
 function help() {
   console.log(`用法：node relay.mjs <命令>
   status [--json]                 查看模式、各家额度、各类任务首选
@@ -1072,6 +1083,7 @@ function help() {
   brief [--context --cwd 目录]     派单模板；--context 预览会自动附上的项目上下文和共享背景
   context set|show|clear [--cwd 目录]   本次任务的共享背景（同目录 6 小时内的派单自动附上）
   verdict <id|last> pass|partial|fail [-- 说明]   记录验收结论，影响以后的可靠度打分
+  self <原因>                     记下这一轮为什么自己改项目代码（自动模式第一次改代码前必须先定分工）
   clean [--json]                  清理过期的历史数据并显示磁盘占用（平时每天自动清理一次）
   quota [--force] [--json]        刷新自带额度（Claude 由状态插件提供，Codex 读本地记录，agy 跑 /usage）
   usage --backfill [--redo] [--json]   从本机 CLI 会话日志回填历史外派任务（agy / Grok）的 token 用量
@@ -1111,6 +1123,7 @@ async function main() {
       case "wait": return await cmdWait(opts);
       case "result": return printJob(loadAnyJob(opts._[1] || "last"));
       case "cancel": return cmdCancel(opts);
+      case "self": return cmdSelf(opts);
       default: return help();
     }
   } catch (e) {

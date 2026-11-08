@@ -31,7 +31,8 @@ const rounds = atom({ plugin: 'ai-relay-status', key: 'rounds' } as const, [] as
 // 全部会话的对话轮次，最新的在前
 const allRounds = atom({ plugin: 'ai-relay-status', key: 'allRounds' } as const, null as Round[] | null, { shape: 'all-rounds-1' })
 // 对话筛选：只按项目。去掉环境后换 shape，丢掉旧的 { project, env }
-const roundFilter = atom({ plugin: 'ai-relay-status', key: 'roundFilter' } as const, { project: '' }, { shape: 'round-filter-2' })
+// project 为 null：还没手动选过，默认选中当前窗口所在项目；'' 是用户选的「全部项目」
+const roundFilter = atom({ plugin: 'ai-relay-status', key: 'roundFilter' } as const, { project: null } as { project: string | null }, { shape: 'round-filter-3' })
 // 对话页当前详情。换掉按轮次展开后，旧的 expandedRounds 不再读取
 const selectedRound = atom({ plugin: 'ai-relay-status', key: 'selectedRound' } as const, null)
 // 详情里展开了派单全文的外派 id
@@ -1585,6 +1586,7 @@ function mergedRound(base: Round, incoming: Round, startedAt: number): Round {
     status: mergedRoundStatus(base.status, incoming.status),
     agents: [...(base.agents ?? []), ...(incoming.agents ?? [])],
     selfLines: (base.selfLines ?? 0) + (incoming.selfLines ?? 0),
+    ...(base.selfReason || incoming.selfReason ? { selfReason: base.selfReason || incoming.selfReason } : {}),
   }
 }
 
@@ -2116,11 +2118,20 @@ export const register: Register = on => {
     }
     await refreshJobs($)
     const list = (await read($, jobs)) ?? []
+    const selfStat = await readSelfStat($, currentSessionId)
     let done: Round | undefined
     await update($, rounds, all => {
       const idx = all.findIndex(r => r.status === 'running')
       if (idx < 0) return all
       done = { ...all[idx]!, status: e.reason, finishedAt: now }
+      // 用户消息开始的这一轮：行数取 relay 钩子的统计（含 Bash 写入），并带上主管自己做的原因
+      if (selfStat && !isCarriedRound(done)) {
+        done = {
+          ...done,
+          selfLines: Math.max(done.selfLines ?? 0, selfStat.lines),
+          ...(selfStat.reason ? { selfReason: selfStat.reason } : {}),
+        }
+      }
       // 系统触发的继续（没有你的消息）且没用到其他模型的，不单独占一轮
       if (done.text === '' && helperNames(done, list).length === 0) return all.filter((_, i) => i !== idx)
       return all.map((r, i) => (i === idx ? done! : r))
@@ -2466,7 +2477,7 @@ export const register: Register = on => {
       }
       // 系统轮次、后台续跑和换 sessionId 的重复记录只在显示时折叠，计数和「最近 40 轮」都按折叠后的算
       const allRoundsList = foldSystemRounds(allRoundsVal ?? [], desktopSessionGroups)
-      const filter = (await read($, roundFilter)) ?? { project: '' }
+      const filter = (await read($, roundFilter)) ?? { project: null }
       const openBriefIds = new Set(await read($, openBriefs))
       // 选中的轮次或外派已经不在数据里时，回到列表
       let activeId = await read($, selectedRound)
@@ -2494,7 +2505,8 @@ export const register: Register = on => {
         })),
       ]
       // 筛选值对不上任何项目（例如项目名规则改过后残留的旧名）时按「全部项目」处理，不显示空列表
-      const activeProject = projectCounts.has(filter.project) ? filter.project : ''
+      const wantedProject = filter.project ?? (currentProject.path || currentSessionId ? projectName(currentProject, currentSessionId) : '')
+      const activeProject = projectCounts.has(wantedProject) ? wantedProject : ''
       const filteredRounds = allRoundsList.filter(r => !activeProject || projectName(r.project, r.sessionId) === activeProject)
       const hasMore = filteredRounds.length > 40
       const displayedRounds = filteredRounds.slice(0, 40)
@@ -2667,6 +2679,7 @@ export const register: Register = on => {
             </Box>,
             field('你的消息', message, { wrap: 'wrap' }),
             field('主管', `${mainModelText(r.mainModel)} · 统筹拆解、派发、核验、汇报`),
+            !!r.selfReason && field('自己做的原因', r.selfReason, { wrap: 'wrap' }),
             cardSummary(r, list, allRoundsList) !== '' && field('分工', cardSummary(r, list, allRoundsList)),
             <Box flexDirection="column" rowGap={1}>
               {section('Token 消耗')}
@@ -3059,7 +3072,7 @@ export const register: Register = on => {
 
 // 项目显示名。桌面版按会话 id 用左侧栏的 originCwd 末级名；
 // 对不上的（终端里跑的）用记录里的启动目录，不用 git 根目录名。
-// ~/.claude/spares/ 下的临时目录统一显示成「未选文件夹」
+// 没选文件夹的临时目录（spares、scratch-workspaces）统一显示成「本电脑」
 function projectName(p?: { name?: string; path?: string }, sessionId?: string) {
   if (sessionId) {
     const mapped = desktopProjectNames.get(sessionId)
@@ -3070,6 +3083,20 @@ function projectName(p?: { name?: string; path?: string }, sessionId?: string) {
     if (label) return label
   }
   return p?.name || 'unknown'
+}
+
+// relay 钩子每条用户消息重置的本轮统计：lines 含 Edit/Write 和 Bash 写入；decision 为 self 时 selfReason 是「relay self」记下的原因。
+// 文件不在或读不了返回 null，沿用面板自己的计数
+async function readSelfStat($: Engine, sessionId: string): Promise<{ lines: number; reason: string } | null> {
+  if (!HOME || !sessionId) return null
+  try {
+    const data = JSON.parse(await $.fs.read(`${HOME}/.claude/ai-relay/prompts/${sessionId}.edits.json`)) as Record<string, unknown>
+    const lines = typeof data.lines === 'number' && data.lines > 0 ? Math.round(data.lines) : 0
+    const reason = data.decision === 'self' && typeof data.selfReason === 'string' ? data.selfReason.trim() : ''
+    return { lines, reason }
+  } catch {
+    return null
+  }
 }
 
 function desktopSessionsDir() {
@@ -3167,9 +3194,11 @@ function addDesktopSession(map: Map<string, string>, links: string[][], text: st
   for (const id of ids) map.set(id, name)
 }
 
-// spares 临时目录没有项目名；其他路径取末级目录名
+// 没选文件夹的会话（spares 预热目录、桌面版 scratch-workspaces 临时目录）和左侧栏一样归到「本电脑」；
+// 其他路径取末级目录名
 function folderLabel(path: string) {
-  if (/\/\.claude\/spares\//.test(path)) return '未选文件夹'
+  if (/\/\.claude\/spares\//.test(path)) return '本电脑'
+  if (/\/Claude\/scratch-workspaces\//.test(path)) return '本电脑'
   return dirName(path)
 }
 

@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { cachedRows } from "./quota.mjs";
 
@@ -418,8 +418,18 @@ export function savePrompt(sessionId, prompt) {
   if (!sessionId) return;
   ensureStateDir();
   fs.writeFileSync(path.join(STATE_DIR, "prompts", `${sessionId}.txt`), String(prompt || "").slice(0, 4000));
-  // 每条新消息重新统计主模型亲手改动的行数和读文件次数
-  fs.writeFileSync(selfEditFile(sessionId), JSON.stringify({ lines: 0, warned: false, reads: 0, readWarned: false }));
+  // 每条新消息重新统计主模型亲手改动的行数、读文件次数，以及这一轮的分工决定。
+  // repos 用 null 表示还没扫过仓库；空数组表示扫过但没有，避免和「未扫描」混在一起。
+  fs.writeFileSync(selfEditFile(sessionId), JSON.stringify({
+    lines: 0,
+    warned: false,
+    reads: 0,
+    readWarned: false,
+    decision: null,
+    selfReason: "",
+    bashPending: false,
+    repos: null,
+  }));
   // 每天自动清理一次历史数据
   cleanupIfDue();
 }
@@ -898,21 +908,369 @@ function selfEditFile(sessionId) {
   return path.join(STATE_DIR, "prompts", `${sessionId}.edits.json`);
 }
 
+function bashSnapFile(sessionId) {
+  return path.join(STATE_DIR, "prompts", `${sessionId}.bashsnap.json`);
+}
+
+// 不算项目代码：临时目录、会话 memory、计划草稿。不拦截，也不计行数。
+const SCRATCH_PATH_RE = /^(\/private)?\/tmp\/|^\/var\/folders\//;
+
+export function isScratchPath(filePath) {
+  const raw = String(filePath || "");
+  if (!raw) return false;
+  if (SCRATCH_PATH_RE.test(raw)) return true;
+  let abs = raw;
+  if (raw.startsWith("~/")) abs = path.join(os.homedir(), raw.slice(2));
+  if (!path.isAbsolute(abs)) return false;
+  const norm = path.normalize(abs);
+  const home = os.homedir();
+  const plans = path.join(home, ".claude", "plans");
+  if (norm === plans || norm.startsWith(plans + path.sep)) return true;
+  const projects = path.join(home, ".claude", "projects") + path.sep;
+  if (!norm.startsWith(projects)) return false;
+  const parts = norm.slice(projects.length).split(path.sep);
+  return parts.length >= 2 && parts[1] === "memory";
+}
+
+// 缺字段补默认值。reposKnown 只留在内存里：false 表示文件里还没有仓库缓存。
 export function readSelfEdits(sessionId) {
+  const blank = () => ({
+    lines: 0,
+    warned: false,
+    reads: 0,
+    readWarned: false,
+    decision: null,
+    selfReason: "",
+    bashPending: false,
+    repos: [],
+    reposKnown: false,
+  });
   try {
     const data = JSON.parse(fs.readFileSync(selfEditFile(sessionId), "utf8"));
+    if (typeof data.lines !== "number") data.lines = 0;
+    if (typeof data.warned !== "boolean") data.warned = false;
     if (typeof data.reads !== "number") data.reads = 0;
     if (typeof data.readWarned !== "boolean") data.readWarned = false;
+    if (data.decision !== "self" && data.decision !== "dispatch") data.decision = null;
+    if (typeof data.selfReason !== "string") data.selfReason = "";
+    if (typeof data.bashPending !== "boolean") data.bashPending = false;
+    if (Array.isArray(data.repos)) {
+      data.repos = data.repos.filter((p) => typeof p === "string");
+      data.reposKnown = true;
+    } else {
+      data.repos = [];
+      data.reposKnown = false;
+    }
     return data;
   } catch {
-    return { lines: 0, warned: false, reads: 0, readWarned: false };
+    return blank();
   }
 }
 
 export function writeSelfEdits(sessionId, data) {
+  if (!sessionId || !data) return;
+  ensureStateDir();
+  const out = { ...data };
+  // 还没扫过仓库时写 null，避免下一次把「未扫描」当成「扫过且没有」
+  if (out.reposKnown === false) out.repos = null;
+  delete out.reposKnown;
+  fs.writeFileSync(selfEditFile(sessionId), JSON.stringify(out));
+}
+
+export function readBashSnap(sessionId) {
+  try {
+    const data = JSON.parse(fs.readFileSync(bashSnapFile(sessionId), "utf8"));
+    if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+export function writeBashSnap(sessionId, snap) {
   if (!sessionId) return;
   ensureStateDir();
-  fs.writeFileSync(selfEditFile(sessionId), JSON.stringify(data));
+  fs.writeFileSync(bashSnapFile(sessionId), JSON.stringify(snap && typeof snap === "object" ? snap : {}));
+}
+
+export function clearBashSnap(sessionId) {
+  if (!sessionId) return;
+  try {
+    fs.unlinkSync(bashSnapFile(sessionId));
+  } catch {}
+}
+
+// relay.mjs 后面紧跟的子命令是 run。原因文字里碰巧出现 “ run ” 不算。
+export function isRelayRunCommand(command) {
+  return /relay\.mjs["']?\s+run(?:\s|$)/.test(String(command || ""));
+}
+
+// 自动模式下，第一次改项目代码前还没定分工时的拒绝理由
+export function divisionReason() {
+  return `[ai-relay 自动模式] 这一轮第一次改项目代码前，先定分工：成块的实现派给员工（relay pick implement，再 relay run 或 Codex 子代理）；确认自己做更合适，就先运行 node "${RELAY_SCRIPT}" self "<一句话原因>"，再继续改。原因会显示在面板这一轮的详情里。`;
+}
+
+// Bash 已经改了项目代码、但这一轮还没定分工
+export function bashWroteReminder(delta) {
+  return `[ai-relay 自动模式] 刚才的 Bash 已改了项目代码 ${delta} 行，这一轮还没定分工。下一步改动前必须先定：成块的实现派给员工（relay pick implement，再 relay run 或 Codex 子代理）；确认自己做更合适，就先运行 node "${RELAY_SCRIPT}" self "<一句话原因>"，再继续改。原因会显示在面板这一轮的详情里。`;
+}
+
+// 超过上限时记 warned 并返回提醒；没超过返回空串
+export function selfEditLimitMessage(stat, limit) {
+  const max = limit || 40;
+  if (!stat || stat.warned || !(stat.lines > max)) return "";
+  stat.warned = true;
+  return `[ai-relay 自动模式] 这一轮你已亲手写了 ${stat.lines} 行。如果后面还有成块的实现，考虑交给更合适的员工模型（relay pick implement）；自己做更合适的，汇报时说明原因即可。`;
+}
+
+// ---------- Bash 写入的行数：改前改后各拍一次 git 快照，用差值计入亲手改动 ----------
+const SNAP_GIT_TIMEOUT_MS = 400;
+const FIND_REPO_MAX = 20;
+const FIND_DIR_MAX = 400;
+const UNTRACKED_MAX = 200;
+const UNTRACKED_BYTES = 1024 * 1024;
+const SKIP_DIR_NAMES = new Set(["node_modules", ".git", "target", "dist", "build"]);
+
+function gitText(args, timeoutMs = SNAP_GIT_TIMEOUT_MS) {
+  return execFileSync("git", args, {
+    encoding: "utf8",
+    timeout: timeoutMs,
+    stdio: ["ignore", "pipe", "ignore"],
+    maxBuffer: 4 * 1024 * 1024,
+    env: {
+      ...process.env,
+      GIT_TERMINAL_PROMPT: "0",
+      GIT_OPTIONAL_LOCKS: "0",
+      GIT_PAGER: "cat",
+    },
+  });
+}
+
+// 异步版：快照时各仓库的 git 调用并行跑，仓库多时（如十几个子仓库的工作区）不至于把每次 Bash 拖慢太多
+function gitTextAsync(args, timeoutMs = SNAP_GIT_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    execFile("git", args, {
+      encoding: "utf8",
+      timeout: timeoutMs,
+      maxBuffer: 4 * 1024 * 1024,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0", GIT_PAGER: "cat" },
+    }, (err, stdout) => (err ? reject(err) : resolve(stdout)));
+  });
+}
+
+function countTextLines(text) {
+  if (!text) return 0;
+  let n = 0;
+  for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) === 10) n++;
+  if (text.charCodeAt(text.length - 1) !== 10) n++;
+  return n;
+}
+
+// 未跟踪文件按行数计。超过 1MB 或含空字节（当二进制）的跳过，返回 null。
+function untrackedLineCount(full) {
+  let st;
+  try {
+    st = fs.statSync(full);
+  } catch {
+    return null;
+  }
+  if (!st.isFile() || st.size > UNTRACKED_BYTES) return null;
+  if (st.size === 0) return 0;
+  let fd;
+  try {
+    fd = fs.openSync(full, "r");
+    const probeLen = Math.min(st.size, 8192);
+    const probe = Buffer.alloc(probeLen);
+    fs.readSync(fd, probe, 0, probeLen, 0);
+    if (probe.includes(0)) return null;
+    if (st.size <= 8192) return countTextLines(probe.toString("utf8"));
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch {}
+    }
+  }
+  try {
+    const buf = fs.readFileSync(full);
+    if (buf.includes(0)) return null;
+    return countTextLines(buf.toString("utf8"));
+  } catch {
+    return null;
+  }
+}
+
+// cwd 自己所在的仓库；不在仓库里时，向下最多 3 层找含 .git 的目录，最多 20 个。
+export function findRepos(cwd) {
+  if (!cwd || typeof cwd !== "string") return [];
+  let dir = cwd;
+  try {
+    if (!fs.statSync(dir).isDirectory()) dir = path.dirname(dir);
+  } catch {
+    return [];
+  }
+  try {
+    const top = gitText(["-C", dir, "rev-parse", "--show-toplevel"], 250).trim();
+    if (top) return [top];
+  } catch {}
+  const found = [];
+  const queue = [{ dir, depth: 0 }];
+  let scanned = 0;
+  while (queue.length && found.length < FIND_REPO_MAX && scanned < FIND_DIR_MAX) {
+    const cur = queue.shift();
+    if (cur.depth >= 3) continue;
+    let entries;
+    try {
+      entries = fs.readdirSync(cur.dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    scanned++;
+    for (const ent of entries) {
+      if (found.length >= FIND_REPO_MAX) break;
+      if (!ent.isDirectory() || SKIP_DIR_NAMES.has(ent.name)) continue;
+      const full = path.join(cur.dir, ent.name);
+      let isRepo = false;
+      try {
+        isRepo = fs.existsSync(path.join(full, ".git"));
+      } catch {}
+      if (isRepo) {
+        found.push(full);
+        continue;
+      }
+      if (cur.depth + 1 < 3) queue.push({ dir: full, depth: cur.depth + 1 });
+    }
+  }
+  return found;
+}
+
+// 命令里 cd 进去的目录（绝对路径、~ 开头或相对 cwd），用来把这条命令要去的仓库提前纳入快照
+export function cdTargets(command, cwd) {
+  const out = [];
+  if (typeof command !== "string") return out;
+  const re = /(?:^|[\s;&|(])cd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|)]+))/g;
+  let m;
+  while ((m = re.exec(command))) {
+    let p = m[1] ?? m[2] ?? m[3] ?? "";
+    if (!p || p === "-" || p.includes("$")) continue;
+    if (p === "~" || p.startsWith("~/")) p = path.join(os.homedir(), p.slice(1));
+    else if (!path.isAbsolute(p)) {
+      if (!cwd) continue;
+      p = path.resolve(cwd, p);
+    }
+    out.push(p);
+  }
+  return out;
+}
+
+function insideAny(dir, roots) {
+  return roots.some((r) => dir === r || dir.startsWith(r + path.sep));
+}
+
+// 这次 Bash 要盯的仓库：本轮已知的 + 项目根目录下的 + 当前目录所在的 + 命令里 cd 进去的。
+// 多仓库工作区里一轮会在几个仓库之间来回切，不能只看本轮第一条命令所在的仓库。
+// 新发现的仓库并入 edits.json，本轮后面的命令直接复用。
+export function resolveRepos(sessionId, stat, cwd, command) {
+  const known = stat?.reposKnown && Array.isArray(stat.repos) ? stat.repos : [];
+  const repos = [...known];
+  const dirs = [process.env.CLAUDE_PROJECT_DIR, cwd, ...cdTargets(command, cwd)].filter((d) => typeof d === "string" && d);
+  for (const dir of dirs) {
+    if (insideAny(path.resolve(dir), repos)) continue;
+    for (const r of findRepos(dir)) if (!repos.includes(r)) repos.push(r);
+  }
+  if (stat && (!stat.reposKnown || repos.length !== known.length)) {
+    stat.repos = repos;
+    stat.reposKnown = true;
+    writeSelfEdits(sessionId, stat);
+  }
+  return repos;
+}
+
+// 文件签名：行数不变但内容改了（比如改一行还没提交的新增行）时靠它发现
+function fileSig(full) {
+  try {
+    const st = fs.statSync(full);
+    return `${st.size}:${st.mtimeMs}`;
+  } catch {
+    return "";
+  }
+}
+
+// base 是对比的提交：前快照用当时的 HEAD；后快照沿用前快照的 HEAD，
+// 这样命令里 git commit 让改动从工作区进了提交，行数不会被当成又改了一遍。
+async function snapshotRepo(root, base) {
+  const files = {};
+  const args = ["-C", root, "-c", "core.quotePath=false"];
+  const head = base || (await gitTextAsync([...args, "rev-parse", "--verify", "-q", "HEAD"]).catch(() => "")).trim();
+  const [numstat, listing] = await Promise.all([
+    (head ? gitTextAsync([...args, "diff", "--numstat", head]) : Promise.reject(new Error("no head")))
+      .catch(() => gitTextAsync([...args, "diff", "--numstat"]))
+      .catch(() => ""),
+    gitTextAsync([...args, "ls-files", "--others", "--exclude-standard"]).catch(() => ""),
+  ]);
+  for (const line of numstat.split("\n")) {
+    if (!line) continue;
+    const tab = line.indexOf("\t");
+    const tab2 = tab < 0 ? -1 : line.indexOf("\t", tab + 1);
+    if (tab <= 0 || tab2 < 0) continue;
+    const addedRaw = line.slice(0, tab);
+    const deletedRaw = line.slice(tab + 1, tab2);
+    const file = line.slice(tab2 + 1);
+    if (!file) continue;
+    const added = addedRaw === "-" ? 0 : Number(addedRaw) || 0;
+    const deleted = deletedRaw === "-" ? 0 : Number(deletedRaw) || 0;
+    const n = added + deleted;
+    const full = path.join(root, file);
+    if (n > 0) files[full] = { n, sig: fileSig(full) };
+  }
+  const untracked = listing.split("\n").filter(Boolean);
+  const capped = untracked.length > UNTRACKED_MAX ? untracked.slice(0, UNTRACKED_MAX) : untracked;
+  for (const rel of capped) {
+    const full = path.join(root, rel);
+    if (files[full] !== undefined) continue;
+    const n = untrackedLineCount(full);
+    if (n > 0) files[full] = { n, sig: fileSig(full) };
+  }
+  return { head, files };
+}
+
+// repos 是仓库根目录列表，不传时现发现；bases 是 { 仓库: 对比提交 }，后快照传前快照的 heads。
+// 返回 Promise<{ heads: { 仓库: 提交 }, files: { 绝对路径: { n: 行数, sig } } }>
+export async function lineSnapshot(cwd, repos, bases) {
+  const roots = (Array.isArray(repos) ? repos : findRepos(cwd)).filter(Boolean);
+  const parts = await Promise.all(
+    roots.map((root) => snapshotRepo(root, bases?.[root]).then((r) => [root, r]).catch(() => [root, null])),
+  );
+  const heads = {};
+  const files = {};
+  for (const [root, r] of parts) {
+    if (!r) continue;
+    heads[root] = r.head;
+    Object.assign(files, r.files);
+  }
+  return { heads, files };
+}
+
+// 兼容旧格式：快照可以直接是 { 路径: 行数 }
+function snapFiles(snap) {
+  if (!snap || typeof snap !== "object") return {};
+  return snap.files && typeof snap.files === "object" ? snap.files : snap;
+}
+
+// 两边都出现的文件取行数差的绝对值；行数没变但签名变了，算改了 1 行；只在一边出现的，另一边按 0。
+export function snapshotDelta(before, after) {
+  const b = snapFiles(before);
+  const a = snapFiles(after);
+  const norm = (v) => (v && typeof v === "object" ? { n: Number(v.n) || 0, sig: v.sig } : { n: Number(v) || 0 });
+  let sum = 0;
+  for (const key of new Set([...Object.keys(b), ...Object.keys(a)])) {
+    const x = norm(b[key]);
+    const y = norm(a[key]);
+    const d = Math.abs(y.n - x.n);
+    if (d > 0) sum += d;
+    else if (key in b && key in a && x.sig && y.sig && x.sig !== y.sig) sum += 1;
+  }
+  return sum;
 }
 
 // 一次编辑工具调用新写入的行数

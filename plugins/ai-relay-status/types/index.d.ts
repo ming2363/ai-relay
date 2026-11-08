@@ -129,8 +129,10 @@ export type Round = {
   /** running 进行中，answer 完成，aborted 中断，error / refusal 出错 */
   status: string
   agents: RoundAgent[]
-  /** 主模型这一轮亲手写入的行数（Edit / Write / NotebookEdit） */
+  /** 主模型这一轮亲手写入的行数（Edit / Write / NotebookEdit，以及 relay 钩子统计到的 Bash 写入） */
   selfLines: number
+  /** 自动模式下主管决定自己做时，用「relay self」记下的原因 */
+  selfReason?: string
   /** 会话 id */
   sessionId: string
   /** 所属项目：会话启动目录的末级名和绝对路径 */
@@ -286,7 +288,7 @@ declare module 'claude-code' {
       /** 全部会话的对话轮次，最新的在前 */
       allRounds: Shaped<Round[] | null>
       /** 对话筛选条件：只按项目，空串表示全部 */
-      roundFilter: Shaped<{ project: string }>
+      roundFilter: Shaped<{ project: string | null }>
       /** 对话页当前详情：轮次 id，或 job:<外派 id>；null 为列表 */
       selectedRound: string | null
       /** 详情里展开了派单全文的外派 id */

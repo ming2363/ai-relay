@@ -31,11 +31,15 @@ function main() {
   } else {
     lines.push("[ai-relay] 用户提到了其他模型/外派。外派方法见 Skill「ai-relay:orchestrate」，只做用户点名的那部分。");
   }
+  // 复核铁令（用户定的，任何模式、任何档位都带上）：用户把所有交付都视为主管出品
+  lines.push(
+    "[复核铁令] 不管派出多少个子任务（Codex、agy、Grok、Agent 子代理），每一个结果主管都要亲自复核后才能交付，不能只抽查、不能原样转述：可写的逐个看 diff、自己跑测试或构建；结论类的回到代码或数据里核对。用户把所有交付都视为主管出品、由主管认可。复核没做完不报完成，汇报写清每个子任务核了什么。",
+  );
   // 自动模式按 Claude 剩余额度追加一档；0 档不追加。原「省 Claude」提示并入 2 档
   if (mode === "auto") {
     const t = claudeThrottle(cfg, rows);
     // 质量底线：任何档位都不放松，节流只减少主管亲自执行的部分
-    const qualityFloor = "质量优先，节流不降标准：验收和关键结论的抽查必须亲自做；员工都不擅长、或需要本会话上下文才能判断的活，主管自己做。";
+    const qualityFloor = "质量优先，节流不降标准：节流只减少主管亲自执行的部分，子任务结果的复核一个都不能省；员工都不擅长、或需要本会话上下文才能判断的活，主管自己做。";
     if (t.level >= 1) lines.push(`[质量底线] ${qualityFloor}`);
     if (t.level === 1) {
       const who = t.richHelpers?.length ? `（其他家充足：${t.richHelpers.join("、")}）` : "";
