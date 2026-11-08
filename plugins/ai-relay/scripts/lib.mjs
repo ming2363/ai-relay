@@ -571,6 +571,8 @@ export function allJobRecords(limit = Infinity) {
           scope: j.scope ?? null,
           pid: j.pid ?? null,
           helpRequest: j.helpRequest || "",
+          ...(j.level ? { level: j.level } : {}),
+          ...(j.reworkOf ? { reworkOf: j.reworkOf, reworkRound: j.reworkRound || 1 } : {}),
           // 发起这次外派的 Claude 会话；旧任务没有，jobs --json 就不带这个字段
           ...(typeof j.sessionId === "string" && j.sessionId.trim() ? { sessionId: j.sessionId.trim() } : {}),
           ...(j.usage ? { usage: j.usage } : {}),
@@ -761,8 +763,11 @@ export function parseGitStatusPath(line) {
 
 export function gitSnapshot(cwd) {
   try {
-    const raw = execFileSync("git", ["-C", cwd, "-c", "core.quotePath=false", "status", "--porcelain"], {
+    // --untracked-files=all：新建目录里的文件逐个列出，否则只显示成「?? 目录/」，判断写入范围时会误报越界
+    const raw = execFileSync("git", ["-C", cwd, "-c", "core.quotePath=false", "status", "--porcelain", "--untracked-files=all"], {
       encoding: "utf8",
+      // 未跟踪文件逐个列出后输出会变大，默认 1MB 不够时整张快照会丢，越界检查也跟着失效
+      maxBuffer: 64 * 1024 * 1024,
       stdio: ["ignore", "pipe", "ignore"],
     });
     const lines = raw.split("\n").filter(Boolean);
@@ -1007,12 +1012,12 @@ export function isRelayRunCommand(command) {
 
 // 自动模式下，第一次改项目代码前还没定分工时的拒绝理由
 export function divisionReason() {
-  return `[ai-relay 自动模式] 这一轮第一次改项目代码前，先定分工：成块的实现派给员工（relay pick implement，再 relay run 或 Codex 子代理）；确认自己做更合适，就先运行 node "${RELAY_SCRIPT}" self "<一句话原因>"，再继续改。原因会显示在面板这一轮的详情里。`;
+  return `[ai-relay 自动模式] 这一轮第一次改项目代码前，先定分工：成块的实现派给员工（relay pick implement --level <难度>，再 relay run 或 Codex 子代理）；确认自己做更合适，就先运行 node "${RELAY_SCRIPT}" self "<一句话原因>"，再继续改。原因会显示在面板这一轮的详情里。`;
 }
 
 // Bash 已经改了项目代码、但这一轮还没定分工
 export function bashWroteReminder(delta) {
-  return `[ai-relay 自动模式] 刚才的 Bash 已改了项目代码 ${delta} 行，这一轮还没定分工。下一步改动前必须先定：成块的实现派给员工（relay pick implement，再 relay run 或 Codex 子代理）；确认自己做更合适，就先运行 node "${RELAY_SCRIPT}" self "<一句话原因>"，再继续改。原因会显示在面板这一轮的详情里。`;
+  return `[ai-relay 自动模式] 刚才的 Bash 已改了项目代码 ${delta} 行，这一轮还没定分工。下一步改动前必须先定：成块的实现派给员工（relay pick implement --level <难度>，再 relay run 或 Codex 子代理）；确认自己做更合适，就先运行 node "${RELAY_SCRIPT}" self "<一句话原因>"，再继续改。原因会显示在面板这一轮的详情里。`;
 }
 
 // 超过上限时记 warned 并返回提醒；没超过返回空串
@@ -1020,7 +1025,7 @@ export function selfEditLimitMessage(stat, limit) {
   const max = limit || 40;
   if (!stat || stat.warned || !(stat.lines > max)) return "";
   stat.warned = true;
-  return `[ai-relay 自动模式] 这一轮你已亲手写了 ${stat.lines} 行。如果后面还有成块的实现，考虑交给更合适的员工模型（relay pick implement）；自己做更合适的，汇报时说明原因即可。`;
+  return `[ai-relay 自动模式] 这一轮你已亲手写了 ${stat.lines} 行。如果后面还有成块的实现，考虑交给更合适的员工模型（relay pick implement --level <难度>）；自己做更合适的，汇报时说明原因即可。`;
 }
 
 // ---------- Bash 写入的行数：改前改后各拍一次 git 快照，用差值计入亲手改动 ----------

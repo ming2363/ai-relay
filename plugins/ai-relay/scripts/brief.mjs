@@ -8,6 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
+import { parseLevel } from "./score.mjs";
 
 // 项目规则文件：小于上限的直接附原文（里面通常是"禁止 git commit"这类硬约束），大的只给路径
 const RULE_FILES = ["AGENTS.md", "CLAUDE.md", "GEMINI.md", "PROJECT_MEMORY.md"];
@@ -19,6 +20,7 @@ const DIFF_MAX = 20 * 1024;
 export const CONTEXT_TTL_MS = 6 * 3600_000;
 
 export const BRIEF_TEMPLATE = `角色：<implement|debug|review|read|deep|quick|claude-backup>
+难度：<简单|中等|困难>（必填。简单：照样子改、补注释、整理资料这类不用推理的活，优先派便宜、额度多的轻档模型；中等：常规实现和排查；困难：跨模块设计、疑难排查，只派强档模型）
 
 ## 目标
 <一句话说清要交付什么>
@@ -70,6 +72,17 @@ export function roleOfBrief(text) {
   for (const line of String(text || "").split(/\r?\n/)) {
     const m = line.match(/^[ \t]*角色\s*[:：]\s*([a-z][a-z-]*)/i);
     if (m) return m[1].toLowerCase();
+  }
+  return null;
+}
+
+// 派单里的「难度：简单|中等|困难」，返回 easy / medium / hard；没写或认不出返回 null
+export function levelOfBrief(text) {
+  // 认不出的（比如没填的模板占位符）跳过，继续找后面的；也接受「## 难度：中等」这种标题写法
+  for (const line of String(text || "").split(/\r?\n/)) {
+    const m = line.match(/^[ \t]*(?:#{1,6}[ \t]*)?难度\s*[:：]\s*([^\s（(，,。]+)/);
+    const level = m ? parseLevel(m[1]) : null;
+    if (level) return level;
   }
   return null;
 }

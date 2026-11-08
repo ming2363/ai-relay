@@ -134,7 +134,9 @@ While throttling or conserving, a turn in which the lead reads files more than 8
 
 ### Routing
 
-`relay pick <role>` prints the first choice, the backups, and the models it skipped, each with a reason.
+Every brief must state a difficulty, `难度：简单|中等|困难` (easy / medium / hard), or the run is refused. Models sit in three tiers (`modelTiers`): light (Gemini 3.8 Flash), mid (Grok, Argon medium/low, Sonnet) and strong (Codex, Argon high, Opus). Easy work may go to any tier and favours cheap models with spare quota. Medium work needs mid or strong. Hard work goes to strong models only; when none has quota, Claude does it or passes `--downgrade "<reason>"`.
+
+`relay pick <role> --level <difficulty>` prints the first choice, the backups, and the models it skipped, each with a reason.
 
 | Term | Weight | How it is calculated |
 |---|---|---|
@@ -245,7 +247,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/relay.mjs" status
 | Switch mode | `/ai-relay:relay off` · `manual` · `auto` |
 | Open or close the panel | `/relay-bar`, or the footer button |
 | Mode, quota, and the current first choice per role | `/ai-relay:relay` or `relay status` |
-| Pick a model and see why | `relay pick <role>` |
+| Pick a model and see why | `relay pick <role> --level easy\|medium\|hard` |
 | Run a worker | `relay run <provider\|auto> --role <role>` |
 | Hand agy or Grok a task from chat | `/ai-relay:ask grok --role review …` |
 | List dispatches | `relay jobs` or `/ai-relay:relay jobs` |
@@ -258,7 +260,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/relay.mjs" status
 | Full access for one provider | `relay provider access <name> on\|off` |
 | Force multi-model orchestration | Put `ulw` in the message |
 
-Other script commands: `relay wait <id…>`, `relay result <id>`, `relay cancel <id>`, `relay provider enable|disable|test|remove <name>`, `relay provider add <name> --preset kimi|qwen|custom`.
+Other script commands: `relay wait <id…>` (returns as soon as one job finishes; `--all` waits for every job), `relay rework <id> -- <feedback>` (sends a failed job back to the same worker with the feedback), `relay result <id>`, `relay cancel <id>`, `relay provider enable|disable|test|remove <name>`, `relay provider add <name> --preset kimi|qwen|custom`.
 
 A `relay run` brief must contain the headings `目标` and `验收标准`. Add `--write` to allow edits. The default is read-only. `--background` runs a read-only job in the background. `--scope` and the brief's `## 写入范围` are the write scope.
 
@@ -348,7 +350,7 @@ Workers follow these rules:
 
 Codex is fixed to the official plugin sandbox and can write the current project only. `relay pick <role> --write --target <dir>` skips Codex when the directory is outside that sandbox, and the hook refuses a Codex brief whose write scope leaves the sandbox.
 
-Read-only tasks can run in parallel with `--background`. Wait for them with `relay wait <id1> <id2>`.
+Read-only tasks can run in parallel with `--background`. Wait for them with `relay wait <id1> <id2>`. It returns when the first one finishes, so Claude checks each result as it arrives and sends a failed one back with `relay rework`.
 
 ## 💾 Data and privacy
 

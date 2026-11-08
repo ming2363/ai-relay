@@ -471,9 +471,12 @@ function roundElapsed(r: Round, waiting: boolean, now: number) {
 }
 
 // 外派「任务」行：角色 · 只读/可写 · 用时 · 改了 N 个文件
-function taskMeta(role: string | null, write: boolean | null, took: string | null, changedFiles: number) {
+const LEVEL_TEXT: Record<string, string> = { easy: '简单', medium: '中等', hard: '困难' }
+
+function taskMeta(role: string | null, write: boolean | null, took: string | null, changedFiles: number, level?: string | null) {
   const parts = [
     role ? ROLE_TEXT[role] ?? role : null,
+    level ? LEVEL_TEXT[level] ?? level : null,
     write === null ? null : write ? '可写' : '只读',
     took ? `用时 ${took}` : null,
     changedFiles > 0 ? `改了 ${changedFiles} 个文件` : null,
@@ -484,7 +487,7 @@ function taskMeta(role: string | null, write: boolean | null, took: string | nul
 // 派单里给人看的那一句：优先「## 目标」下的第一段，否则去掉「角色：」行后的第一行
 function taskGoal(task: string) {
   const lines = task.replace(/\r\n/g, '\n').split('\n')
-  const head = /^[ \t]*##[ \t]*目标(?:[ \t]*[（(][^）)\n]*[）)])?[ \t]*[:：]?[ \t]*$/
+  const head = /^[ \t]*#{1,6}[ \t]*目标(?:[ \t]*[（(][^）)\n]*[）)])?[ \t]*[:：]?[ \t]*$/
   const idx = lines.findIndex(line => head.test(line))
   if (idx >= 0) {
     const para: string[] = []
@@ -499,7 +502,7 @@ function taskGoal(task: string) {
     if (para.length) return para.join('\n')
   }
   for (const line of lines) {
-    if (/^[ \t]*角色[ \t]*[:：]/.test(line)) continue
+    if (/^[ \t]*(?:角色|难度)[ \t]*[:：]/.test(line)) continue
     const text = line.trim()
     if (text) return text
   }
@@ -2557,6 +2560,13 @@ export const register: Register = on => {
         const title = modelText(j.provider, j.model)
         const member = PROVIDER_TEXT[j.provider] ?? j.provider
         const st = outcome(j.status, j.verdict)
+        // 返工链：这条是谁的返工、这条被退回后返工得怎样
+        const parent = j.reworkOf ? list.find(x => x.id === j.reworkOf) : undefined
+        const reworkFrom = j.reworkOf
+          ? `第 ${j.reworkRound ?? 1} 次返工 · 原任务 ${parent ? `${modelText(parent.provider, parent.model)} ${fmtClockTime(Date.parse(parent.startedAt))}` : j.reworkOf}`
+          : ''
+        const children = list.filter(x => x.reworkOf === j.id)
+        const sentBack = children.length ? `已退回原员工返工：${children.map(x => outcome(x.status, x.verdict).text).join('、')}` : ''
         return card(
           `job-${j.id}`,
           <Box flexDirection="row" alignItems="center" justifyContent="space-between" columnGap={1} minWidth={0}>
@@ -2572,10 +2582,12 @@ export const register: Register = on => {
             </Box>
             {badge(st.icon, st.text, st.tone)}
           </Box>,
-          field('任务', taskMeta(j.role, j.write, took, j.changedFiles)),
+          field('任务', taskMeta(j.role, j.write, took, j.changedFiles, j.level)),
           goal !== '' && field('目标', goal, { wrap: 'wrap' }),
           why !== '' && field('为什么选它', why),
           note !== '' && field('验收意见', note),
+          reworkFrom !== '' && field('返工', reworkFrom),
+          sentBack !== '' && field('返工', sentBack),
           help !== '' && field('需要协助', help, { color: 'warning' }),
           open && field('派单全文', j.task, { wrap: 'wrap' }),
           <Button key={`brief-${j.id}`} label={open ? '收起派单全文' : '查看派单全文'} dimColor onPress={() => toggleBrief(j.id)} />,
@@ -2615,7 +2627,7 @@ export const register: Register = on => {
           return card(
             `agent-${a.id}`,
             head(st),
-            field('任务', taskMeta(rec?.role ?? null, rec ? rec.write : null, took, rec?.changedFiles ?? 0)),
+            field('任务', taskMeta(rec?.role ?? null, rec ? rec.write : null, took, rec?.changedFiles ?? 0, rec?.level)),
             goal !== '' && field('目标', goal, { wrap: 'wrap' }),
             why !== '' && field('为什么选它', why),
             note !== '' && field('验收意见', note),

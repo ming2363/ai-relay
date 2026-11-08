@@ -3296,3 +3296,30 @@ test('主管用量：超过 4 MiB 时流式提取，失败附原因且不缓存�
   expect(visibleNodes(total).filter(el => el.type === 'Text').every(el => el.props?.weight === 'bold')).toBe(true)
   await ui.unmount()
 })
+
+test('对话页：一级标题的目标也能取到，返工任务和原任务互相标出返工链', async ($, on) => {
+  let t = Date.parse('2026-11-04T12:00:00.000Z')
+  baseStubs(on, new Set<string>(), () => t)
+  const relay = fakeRelay(on)
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('turn.complete', () => ({ text: '答完了' }))
+  const task = ['# 目标', '为题库出 8 道终端题。', '', '# 验收标准', '自检全部通过。'].join('\n')
+  const base = { provider: 'grok', model: 'default', role: 'implement', level: 'easy', write: true, task, changedFiles: 1, reason: '擅长 0.80 → 0.80' }
+  relay.jobs = JSON.stringify([
+    { ...base, id: 'j-orig', status: 'done', startedAt: '2026-11-04T12:00:10.000Z', finishedAt: '2026-11-04T12:00:40.000Z', verdict: 'partial', verdictNote: '退回返工：term-03 自检没过' },
+    { ...base, id: 'j-redo', status: 'running', startedAt: '2026-11-04T12:00:50.000Z', finishedAt: null, verdict: null, verdictNote: '', reworkOf: 'j-orig', reworkRound: 1 },
+  ])
+  await $.session.start({ cwd: '/projects/fj', surface: 'desktop', isInteractive: true })
+  await $.turn.start({ text: '出题', turnId: 't-redo' })
+  t = Date.parse('2026-11-04T12:01:00.000Z')
+  await $.turn.complete({ turnId: 't-redo', reason: 'answer', answer: '', durationMs: 1000, isAborted: false })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab-jobs' })
+  await ui.press({ key: 'open-t-redo' })
+  expect(await shownIncludes(ui, '为题库出 8 道终端题。')).toBe(true)
+  expect(await shownIncludes(ui, '已退回原员工返工：')).toBe(true)
+  expect(await shownIncludes(ui, '第 1 次返工 · 原任务 ')).toBe(true)
+  expect(await shownIncludes(ui, '实现 · 简单 · 可写')).toBe(true)
+  await ui.unmount()
+})

@@ -18,7 +18,80 @@ const DEFAULT_SCORE_WEIGHTS = {
   quota: 0.25,
   speed: 0.5,
   load: 0.5,
+  // 经济性：只有简单任务才计入（见 LEVEL_RULES），轻档模型得分高，强档低
+  cost: 0,
 };
+
+// ---------- 任务难度与模型档位 ----------
+// 模型分三档：light 轻（便宜、额度多，适合简单活）、mid 中、strong 强（留给难活）
+// 按「厂商:模型」匹配，* 是通配；多条都匹配时取最长的那条。配置里的 modelTiers 覆盖这里的同名条目，没列到的模型按中档算
+export const DEFAULT_MODEL_TIERS = {
+  "codex:*": "strong",
+  "grok:*": "mid",
+  "agy:gemini-3.8-flash*": "light",
+  "agy:gpt-oss*": "light",
+  "agy:gemini-4-argon-low": "mid",
+  "agy:gemini-4-argon-medium": "mid",
+  "agy:gemini-4-argon-high": "strong",
+  "agy:claude-sonnet*": "mid",
+  "agy:claude-opus*": "strong",
+};
+export const TIER_TEXT = { light: "轻档", mid: "中档", strong: "强档" };
+const TIER_RANK = { light: 0, mid: 1, strong: 2 };
+// 简单任务的经济性得分：越轻越省
+const TIER_COST = { light: 1, mid: 0.7, strong: 0.45 };
+
+export const LEVELS = ["easy", "medium", "hard"];
+export const LEVEL_TEXT = { easy: "简单", medium: "中等", hard: "困难" };
+// 每档难度：最低模型档位、打分权重（覆盖默认值）、同一模型有 low/medium/high 几档时用哪一档
+const LEVEL_RULES = {
+  easy: { minTier: "light", weights: { fit: 1, reliability: 2, quota: 2, speed: 0.5, load: 0.5, cost: 2 }, effort: "low", note: "优先额度充足、便宜的模型" },
+  medium: { minTier: "mid", weights: null, effort: "medium", note: "中档以上按综合分" },
+  hard: { minTier: "strong", weights: { fit: 3, reliability: 3, quota: 0.1, speed: 0.25, load: 0.25 }, effort: "high", note: "只派强档，看擅长和可靠" },
+};
+
+// 这个档位的模型能不能接这个难度的活；downgrade 为真时门槛降一档
+export function tierAllowed(level, tier, downgrade = false) {
+  const rule = LEVEL_RULES[level];
+  if (!rule) return true;
+  return TIER_RANK[tier] >= Math.max(0, TIER_RANK[rule.minTier] - (downgrade ? 1 : 0));
+}
+
+// 「简单 / 中等 / 困难」或 easy / medium / hard，认不出返回 null
+export function parseLevel(raw) {
+  const v = String(raw ?? "").trim().toLowerCase();
+  if (!v) return null;
+  if (["简单", "easy", "低"].includes(v)) return "easy";
+  if (["中等", "medium", "中", "一般"].includes(v)) return "medium";
+  if (["困难", "hard", "难", "高"].includes(v)) return "hard";
+  return null;
+}
+
+function globMatch(pattern, text) {
+  const re = new RegExp("^" + pattern.split("*").map((x) => x.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$");
+  return re.test(text);
+}
+
+export function modelTier(cfg, provider, model) {
+  const table = { ...DEFAULT_MODEL_TIERS, ...(cfg?.modelTiers || {}) };
+  const key = `${provider}:${model}`;
+  let best = null;
+  for (const [pattern, tier] of Object.entries(table)) {
+    if (!TIER_RANK.hasOwnProperty(tier) || !globMatch(pattern, key)) continue;
+    if (!best || pattern.length > best.pattern.length) best = { pattern, tier };
+  }
+  return best ? best.tier : "mid";
+}
+
+// 同一模型有 -low/-medium/-high 几档时，按难度换成对应的一档；该档不在额度池的模型列表里就不换
+export function levelVariant(cfg, provider, pool, model, level) {
+  const effort = LEVEL_RULES[level]?.effort;
+  const m = String(model || "").match(/^(.*)-(low|medium|high)$/);
+  if (!effort || !m || m[2] === effort) return model;
+  const want = `${m[1]}-${effort}`;
+  const list = cfg?.providers?.[provider]?.pools?.[pool] || [];
+  return list.includes(want) ? want : model;
+}
 
 function windowTotalHours(key) {
   return WINDOW_TOTAL_HOURS[key] || 24;
@@ -82,11 +155,14 @@ function calcQuota(status, now) {
 //   - verdict: pass(1), partial(0.5), fail(0); 无 verdict: done(1), failed/timeout(0), cancelled 不计入
 //   - sum = Σ 权重 × 成功分, count = Σ 权重
 //   - rate = (sum + 1.8) / (count + 2); reliability = 0.4 + 0.6 * rate
+// 同一模型的 -low/-medium/-high 算一个家族：按难度换档后，历史验收记录照样算数
+const modelFamily = (m) => String(m || "").replace(/-(low|medium|high)$/, "");
+
 function calcReliability(history, provider, model, role) {
   let sum = 0;
   let count = 0;
   for (const r of history || []) {
-    if (r.provider !== provider || r.model !== model || r.status === "running") continue;
+    if (r.provider !== provider || modelFamily(r.model) !== modelFamily(model) || r.status === "running") continue;
     const w = (r.role && r.role === role) ? 1 : 0.5;
     if (r.verdict === "pass") {
       sum += w * 1;
@@ -181,7 +257,8 @@ function calcWeightedScore(parts, weightsCfg) {
 // 若 running > 0，追加「；该厂商有 N 个任务在跑」
 // 若某窗口 remaining >= 0.5 且距重置不到该窗口总时长的 1/3，追加「；5h 额度 X 小时后重置，优先用掉」
 function formatReason(parts, score, status, now, running = 0) {
-  let text = `擅长 ${parts.fit.toFixed(2)} · 可靠 ${parts.reliability.toFixed(2)} · 额度 ${parts.quota.toFixed(2)} · 速度 ${parts.speed.toFixed(2)} · 负载 ${parts.load.toFixed(2)} → ${score.toFixed(2)}`;
+  const costText = parts.cost !== undefined ? ` · 经济 ${parts.cost.toFixed(2)}` : "";
+  let text = `擅长 ${parts.fit.toFixed(2)} · 可靠 ${parts.reliability.toFixed(2)} · 额度 ${parts.quota.toFixed(2)} · 速度 ${parts.speed.toFixed(2)} · 负载 ${parts.load.toFixed(2)}${costText} → ${score.toFixed(2)}`;
 
   if (running > 0) {
     text += `；该厂商有 ${running} 个任务在跑`;
@@ -220,7 +297,9 @@ function capsSkipWhy(caps, needs) {
   return labels.length ? `不具备：${labels.join("、")}` : "";
 }
 
-export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now(), write, target, workspace, needs } = {}) {
+// level：任务难度（easy / medium / hard），不传按旧规则只看角色路由；downgrade 为真时档位门槛降一档，权重仍按原难度；
+// exactModel：调用方点名了具体模型，不按难度换 low/medium/high
+export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now(), write, target, workspace, needs, level, downgrade, exactModel } = {}) {
   const route = cfg?.routes?.[role];
   if (!route) {
     const available = Object.keys(cfg?.routes || {}).join(", ");
@@ -229,13 +308,19 @@ export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now
 
   const cands = [];
   const skipped = [];
+  const rule = level ? LEVEL_RULES[level] : null;
+  if (level && !rule) throw new Error(`未知难度 ${level}，可选：简单 / 中等 / 困难`);
+  const minRank = rule ? Math.max(0, TIER_RANK[rule.minTier] - (downgrade ? 1 : 0)) : 0;
+  const weights = rule?.weights ? { ...cfg?.scoreWeights, ...rule.weights } : cfg?.scoreWeights;
 
   for (let i = 0; i < route.length; i++) {
     const entry = route[i];
     const [provName, pool, routeModel, fitRaw] = entry.split(":");
     if (only && provName !== only) continue;
 
-    const model = resolveModel(cfg, provName, pool, routeModel);
+    const resolved = resolveModel(cfg, provName, pool, routeModel);
+    const model = level && !exactModel ? levelVariant(cfg, provName, pool, resolved, level) : resolved;
+    const tier = modelTier(cfg, provName, model);
     const prov = cfg.providers?.[provName];
     const quotaProvider = prov?.quota?.provider || provName;
     const st = poolStatus(cfg, rows, quotaProvider, pool, now);
@@ -264,6 +349,23 @@ export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now
         via: prov?.via,
         status: st,
         why: capsWhy,
+      });
+      continue;
+    }
+
+    // 难度门槛在额度之前：档位不够的模型额度再多也不派
+    if (rule && TIER_RANK[tier] < minRank) {
+      const need = Object.keys(TIER_RANK).find((k) => TIER_RANK[k] === minRank);
+      skipped.push({
+        provider: provName,
+        pool,
+        model,
+        routeModel,
+        via: prov?.via,
+        status: st,
+        tier,
+        tierTooLow: true,
+        why: `${LEVEL_TEXT[level]}任务需要${TIER_TEXT[need]}${minRank < 2 ? "以上" : ""}，它是${TIER_TEXT[tier]}`,
       });
       continue;
     }
@@ -304,14 +406,17 @@ export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now
     const load = round(rawLoad, 3);
 
     const parts = { fit, reliability, quota, speed, load };
-    const score = calcWeightedScore(parts, cfg?.scoreWeights);
-    const reason = formatReason(parts, score, st, now, running);
+    if (rule?.weights?.cost) parts.cost = TIER_COST[tier];
+    const score = calcWeightedScore(parts, weights);
+    let reason = formatReason(parts, score, st, now, running);
+    if (rule) reason = `难度${LEVEL_TEXT[level]}${downgrade ? "（已降级）" : ""}：${rule.note}，它是${TIER_TEXT[tier]}；${reason}`;
 
     cands.push({
       provider: provName,
       pool,
       model,
       routeModel,
+      tier,
       via: prov?.via,
       status: st,
       score,
@@ -330,6 +435,7 @@ export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now
 
   return {
     role,
+    level: level || null,
     choice: ordered[0] || null,
     alternatives: ordered.slice(1),
     skipped,

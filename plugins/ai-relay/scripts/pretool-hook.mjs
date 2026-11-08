@@ -10,7 +10,7 @@ import {
   readSelfEdits, writeSelfEdits, isScratchPath, divisionReason, resolveRepos, lineSnapshot, writeBashSnap,
   isRelayRunCommand,
 } from "./lib.mjs";
-import { BRIEF_TEMPLATE, checkBrief, roleOfBrief, buildDispatchPrompt, readSharedContext, scopeOfBrief, needsOfBrief } from "./brief.mjs";
+import { BRIEF_TEMPLATE, checkBrief, roleOfBrief, levelOfBrief, buildDispatchPrompt, readSharedContext, scopeOfBrief, needsOfBrief } from "./brief.mjs";
 
 const EDIT_TOOLS = new Set(["Edit", "MultiEdit", "Write", "NotebookEdit"]);
 
@@ -106,6 +106,10 @@ function main() {
   if (!role || !cfg.routes?.[role]) {
     return deny(`[ai-relay] 派给 Codex 的派单必须在首行注明"角色：xxx"，可选：${validRoles.join(", ")}`);
   }
+  // 难度必填：Codex 是强档，简单的活应该交给便宜、额度多的模型，主管得先判断过
+  if (!levelOfBrief(brief)) {
+    return deny(`[ai-relay] 派给 Codex 的派单没写难度，已退回。在「角色」下一行写「难度：简单|中等|困难」。简单的活先用 relay pick <角色> --level 简单 看看有没有更便宜的模型`);
+  }
   // 派单写了 Codex 做不到的能力就退回，避免它在断网沙箱里硬做或臆测
   const needs = needsOfBrief(brief);
   const codexCaps = prov?.caps || {};
@@ -150,6 +154,7 @@ function main() {
     provider: "codex",
     model: "default",
     role,
+    level: levelOfBrief(brief),
     reason: pick?.provider === "codex" ? `${pick.reason}${pick.skipped.length ? `；跳过 ${pick.skipped.join("、")}` : ""}` : "主模型指定 Codex",
     write,
     scope,

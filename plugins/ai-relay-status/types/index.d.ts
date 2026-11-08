@@ -96,6 +96,12 @@ export type JobView = {
   cwd?: string
   /** 任务结束时 CLI 报告的 token 消耗；取不到时不填 */
   usage?: TokenUsage | null
+  /** 任务难度：easy、medium、hard；早期记录没有 */
+  level?: string | null
+  /** 返工任务：原任务 id；不是返工不填 */
+  reworkOf?: string
+  /** 返工第几次，从 1 开始 */
+  reworkRound?: number
 }
 
 /** 一轮对话里主模型启动的子代理（Agent 工具），含经 Codex 插件外派的 Codex */
