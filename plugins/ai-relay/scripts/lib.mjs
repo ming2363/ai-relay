@@ -133,6 +133,38 @@ export function loadConfig() {
 // 内置厂商缺少的模型清单字段从默认配置补齐；某厂商本次刚补上 defaultModels 时，
 // 把路由里与池默认模型相同的条目改写成 default（解析结果不变，之后才会跟随用户选的默认模型）。
 // 只在补字段的那一次改写路由，避免以后改了默认模型又把单独指定的条目吞掉
+// 0.19 及以前的默认路由：Codex 只有一条 codex:codex:default。用户没改过（只在末尾加了新厂商）的角色，升级成按模型分档的新路由
+const OLD_CODEX_ROUTES = {
+  implement: ["codex:codex:default", "agy:gemini-argon:default:0.9", "grok:supergrok-weekly:default:0.85", "agy:claude-gpt:claude-sonnet-5-5-high", "agy:gemini:default"],
+  debug: ["codex:codex:default", "grok:supergrok-weekly:default", "agy:gemini-argon:default", "agy:claude-gpt:default", "agy:gemini:default"],
+  review: ["grok:supergrok-weekly:default", "agy:gemini-argon:default", "agy:gemini:default", "codex:codex:default"],
+  deep: ["agy:gemini-argon:default", "agy:claude-gpt:default", "codex:codex:default"],
+  "claude-backup": ["agy:claude-gpt:default", "agy:gemini-argon:default", "codex:codex:default"],
+};
+const OLD_CODEX_POOL = ["default", "gpt-6.1-terra", "spark"];
+
+function migrateCodexRoutes(cfg, def) {
+  let changed = false;
+  for (const [role, old] of Object.entries(OLD_CODEX_ROUTES)) {
+    const route = cfg.routes?.[role];
+    const fresh = def.routes?.[role];
+    if (!Array.isArray(route) || !Array.isArray(fresh)) continue;
+    // 用户自己加的条目（新厂商）保留在末尾；默认条目被删改过的不动
+    const extra = route.filter((e) => !old.includes(e));
+    const kept = route.filter((e) => old.includes(e));
+    if (JSON.stringify(kept) !== JSON.stringify(old)) continue;
+    cfg.routes[role] = [...fresh, ...extra.filter((e) => !fresh.includes(e))];
+    changed = true;
+  }
+  const pools = cfg.providers?.codex?.pools;
+  const freshPool = def.providers?.codex?.pools?.codex;
+  if (pools && freshPool && JSON.stringify(pools.codex) === JSON.stringify(OLD_CODEX_POOL)) {
+    pools.codex = [...freshPool];
+    changed = true;
+  }
+  return changed;
+}
+
 export function migrateModelFields(cfg, def) {
   if (!def) {
     try {
@@ -141,7 +173,7 @@ export function migrateModelFields(cfg, def) {
       return false;
     }
   }
-  let changed = false;
+  let changed = migrateCodexRoutes(cfg, def);
   const freshDefaults = new Set();
   for (const [name, dp] of Object.entries(def.providers || {})) {
     const p = cfg.providers?.[name];
@@ -887,7 +919,14 @@ export function recordPick(role, pick) {
   try {
     all = JSON.parse(fs.readFileSync(file, "utf8"));
   } catch {}
-  all[role] = { at: Date.now(), provider: pick.choice?.provider || null, reason: pick.choice?.reason || "", skipped: (pick.skipped || []).map((s) => `${s.provider}/${s.model}：${s.why}`) };
+  all[role] = {
+    at: Date.now(),
+    provider: pick.choice?.provider || null,
+    model: pick.choice?.model || null,
+    level: pick.level || null,
+    reason: pick.choice?.reason || "",
+    skipped: (pick.skipped || []).map((s) => `${s.provider}/${s.model}：${s.why}`),
+  };
   fs.writeFileSync(file, JSON.stringify(all, null, 2));
 }
 

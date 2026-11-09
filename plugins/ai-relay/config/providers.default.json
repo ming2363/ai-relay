@@ -46,8 +46,14 @@
       "pools": {
         "codex": [
           "default",
+          "gpt-6.1-sol",
+          "gpt-6-astra",
           "gpt-6.1-terra",
-          "spark"
+          "gpt-6-sol",
+          "gpt-6-luna",
+          "gpt-5.6-sol",
+          "gpt-5.6-terra",
+          "gpt-5.6-luna"
         ]
       },
       "sandbox": "workspace",
@@ -186,24 +192,29 @@
   },
   "routes": {
     "implement": [
-      "codex:codex:default",
+      "codex:codex:gpt-6.1-sol",
+      "codex:codex:gpt-6.1-terra:0.95",
       "agy:gemini-argon:default:0.9",
       "grok:supergrok-weekly:default:0.85",
-      "agy:claude-gpt:claude-sonnet-5-5-high",
-      "agy:gemini:default"
+      "agy:claude-gpt:claude-sonnet-5-5-high:0.55",
+      "codex:codex:gpt-6-luna:0.5",
+      "agy:gemini:default:0.4"
     ],
     "debug": [
-      "codex:codex:default",
-      "grok:supergrok-weekly:default",
-      "agy:gemini-argon:default",
-      "agy:claude-gpt:default",
-      "agy:gemini:default"
+      "codex:codex:gpt-6.1-sol",
+      "codex:codex:gpt-6-astra:0.95",
+      "grok:supergrok-weekly:default:0.85",
+      "codex:codex:gpt-6.1-terra:0.8",
+      "agy:gemini-argon:default:0.7",
+      "agy:claude-gpt:default:0.55",
+      "codex:codex:gpt-6-luna:0.45",
+      "agy:gemini:default:0.4"
     ],
     "review": [
       "grok:supergrok-weekly:default",
-      "agy:gemini-argon:default",
-      "agy:gemini:default",
-      "codex:codex:default"
+      "agy:gemini-argon:default:0.85",
+      "agy:gemini:default:0.7",
+      "codex:codex:gpt-6.1-sol:0.55"
     ],
     "read": [
       "agy:gemini:default",
@@ -212,8 +223,9 @@
     ],
     "deep": [
       "agy:gemini-argon:default",
-      "agy:claude-gpt:default",
-      "codex:codex:default"
+      "codex:codex:gpt-6-astra:0.9",
+      "agy:claude-gpt:default:0.85",
+      "codex:codex:gpt-6.1-sol:0.7"
     ],
     "quick": [
       "agy:gemini:gemini-3.8-flash-medium",
@@ -221,8 +233,8 @@
     ],
     "claude-backup": [
       "agy:claude-gpt:default",
-      "agy:gemini-argon:default",
-      "codex:codex:default"
+      "agy:gemini-argon:default:0.85",
+      "codex:codex:gpt-6.1-sol:0.7"
     ]
   }
 }

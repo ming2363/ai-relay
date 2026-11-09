@@ -134,7 +134,7 @@ While throttling or conserving, a turn in which the lead reads files more than 8
 
 ### Routing
 
-Every brief must state a difficulty, `难度：简单|中等|困难` (easy / medium / hard), or the run is refused. Models sit in three tiers (`modelTiers`): light (Gemini 3.8 Flash), mid (Grok, Argon medium/low, Sonnet) and strong (Codex, Argon high, Opus). Easy work may go to any tier and favours cheap models with spare quota. Medium work needs mid or strong. Hard work goes to strong models only; when none has quota, Claude does it or passes `--downgrade "<reason>"`.
+Every brief must state a difficulty, `难度：简单|中等|困难` (easy / medium / hard), or the run is refused. Models sit in three tiers (`modelTiers`): light (Gemini 3.8 Flash, Codex GPT-6-Luna and GPT-5.6), mid (Grok, Argon medium/low, Sonnet, Codex GPT-6.1-Terra and GPT-6-Sol) and strong (Codex GPT-6-Astra and GPT-6.1-Sol, Argon high, Opus). Codex models share one quota, and the reasoning effort follows the difficulty (`--effort low|medium|high`). Easy work may go to any tier and favours cheap models with spare quota. Medium work needs mid or strong. Hard work goes to strong models only; when none has quota, Claude does it or passes `--downgrade "<reason>"`.
 
 `relay pick <role> --level <difficulty>` prints the first choice, the backups, and the models it skipped, each with a reason.
 
@@ -395,7 +395,7 @@ From each product, on this machine. Claude reads the current session. Codex read
 
 **Why does `relay run auto` stop when Codex is the first choice?**
 
-Codex is not started by `relay run`. It goes through the official Codex plugin, so the lead hands over the brief with the Agent tool and `subagent_type` set to `codex:codex-rescue`. When `relay run auto` ranks Codex first, it stops and prints that instruction. The next worker is used only if you pass `--skip-codex`. A write target outside the current project skips Codex on its own, because the sandbox cannot write there.
+Codex is not started by `relay run`. It goes through the official Codex plugin, so the lead hands over the brief with the Agent tool and `subagent_type` set to `codex:codex-rescue`. The first line of the prompt carries the run flags from `relay pick`, such as `--model gpt-6.1-sol --effort high`; when it is missing, the hook fills it in from the last pick and the difficulty. When `relay run auto` ranks Codex first, it stops and prints that instruction. The next worker is used only if you pass `--skip-codex`. A write target outside the current project skips Codex on its own, because the sandbox cannot write there.
 
 ## 🤝 Contributing
 

@@ -146,7 +146,7 @@ Claude 自己的 5h 额度低于 20% 时，连第 5 条也改为外派；低于 
 | 中等 | 常规实现、一般排查、单模块的改动 | 中档以上 | 和原来一样按综合分；有几档的用 medium |
 | 困难 | 跨模块设计、疑难排查、需要深度推理的 | 只派强档 | 看擅长度和可靠度，额度几乎不算；有几档的用 high |
 
-模型档位（配置 `modelTiers` 可改，按「厂商:模型」匹配，`*` 通配）：轻档是 Gemini 3.8 Flash；中档是 Grok、Gemini 4 Argon medium/low、agy 上的 Claude Sonnet；强档是 Codex、Gemini 4 Argon high、agy 上的 Claude Opus。没列到的模型按中档算。
+模型档位（配置 `modelTiers` 可改，按「厂商:模型」匹配，`*` 通配）：轻档是 Gemini 3.8 Flash、Codex GPT-6-Luna 和 GPT-5.6 系列；中档是 Grok、Gemini 4 Argon medium/low、agy 上的 Claude Sonnet、Codex GPT-6.1-Terra（Codex 命令行默认）和 GPT-6-Sol；强档是 Codex GPT-6-Astra 和 GPT-6.1-Sol、Gemini 4 Argon high、agy 上的 Claude Opus。没列到的模型按中档算。Codex 的几个模型共用一份额度，换成 Luna 只是少用一些，不像 Flash 那样有单独的额度。
 
 档位不够的模型会被跳过或退回（点名的也一样）。困难任务的强档都没额度时，**不会悄悄降级**：你自己做，或确认降一档也能做好时加 `--downgrade "<原因>"`，原因会记进分派理由。
 
@@ -170,7 +170,7 @@ relay pick <角色> --level 简单|中等|困难
 
 拿到选择后这样派：
 
-- **Codex**：用 Agent 工具，`subagent_type: "codex:codex-rescue"`，prompt 按派单模板写（若 Codex 设了具体默认模型，prompt 开头加 `--model <id>`）。`relay run auto` 的首选是 Codex 时会直接停下提示你走这条路，不会悄悄改派；确有理由不用 Codex（比如目标目录在项目外）才加 `--skip-codex`。
+- **Codex**：用 Agent 工具，`subagent_type: "codex:codex-rescue"`。prompt **第一行**写 `relay pick` 给出的运行参数（如 `--model gpt-6.1-sol --effort high`），下面按派单模板写。第一行不写时，钩子会按最近一次 `relay pick` 选中的 Codex 模型补上；没有 pick 记录就用 Codex 自己 `config.toml` 里的默认模型。推理强度按难度补（简单 low、中等 medium、困难 high）。最后用的模型和强度都钉在第一行；正文里任何位置写的 `--model` / `--effort` 也会被拿出来检查，档位不够难度、写了两个不同的值、强度不是 Codex 认的取值，都会退回。`relay run auto` 的首选是 Codex 时会直接停下提示你走这条路，不会悄悄改派；确有理由不用 Codex（比如目标目录在项目外）才加 `--skip-codex`。
 - **其他模型**：用 `relay run <厂商名> --role <角色> --model <模型>`，或者 `relay run auto --role <角色>` 让脚本自己选。
 - 想点名某个模型可以，脚本仍会记下它的打分，事后可以对照。
 

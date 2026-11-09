@@ -14,7 +14,7 @@ import {
   getWorkspaceActivityMtime,
 } from "./lib.mjs";
 import { refreshCache, refreshGrok, loadCache } from "./quota.mjs";
-import { scoreRoute, parseLevel, modelTier, tierAllowed, LEVEL_TEXT, TIER_TEXT } from "./score.mjs";
+import { scoreRoute, parseLevel, modelTier, tierAllowed, levelEffort, LEVEL_TEXT, TIER_TEXT } from "./score.mjs";
 import {
   getModels, loadModelsCache, findModelPool, setProviderDefaultModel, buildModelPools,
 } from "./models.mjs";
@@ -199,8 +199,8 @@ function cmdPick(opts) {
   console.log(`${role}（难度${LEVEL_TEXT[level]}）→ ${c.provider} / ${c.pool} / ${c.model}（${TIER_TEXT[c.tier]}）  [${fmtPool(c.status)}]`);
   console.log(`  理由：${c.reason}`);
   if (c.via === "codex-plugin") {
-    const modelHint = c.model && c.model !== "default" ? `；Agent prompt 开头加 --model ${c.model}` : "";
-    console.log(`→ 用 Codex 官方插件执行：Agent 工具 subagent_type=codex:codex-rescue，prompt 按派单模板写（relay brief 查看）${modelHint}`);
+    const flags = [c.model && c.model !== "default" ? `--model ${c.model}` : "", `--effort ${levelEffort(level)}`].filter(Boolean).join(" ");
+    console.log(`→ 用 Codex 官方插件执行：Agent 工具 subagent_type=codex:codex-rescue，prompt 第一行写「${flags}」，下面按派单模板写（relay brief 查看，含「难度：${LEVEL_TEXT[level]}」）。第一行不写时，钩子会按这次 pick 的结果补上`);
   } else {
     // 降级选出来的，派的时候也要带上同样的 --downgrade，否则会被档位检查退回
     const down = opts.downgrade ? ` --downgrade "${String(opts.downgrade === true ? "<原因>" : opts.downgrade).replace(/"/g, '\\"')}"` : "";
@@ -563,7 +563,7 @@ async function cmdRun(opts) {
     // 首选是 Codex 时不悄悄改派：Codex 要走 Agent 工具（官方插件），交给主管去派
     if (!opts.model && !opts.skipCodex && r.choice?.via === "codex-plugin") {
       recordPick(role, r);
-      const modelHint = r.choice.model && r.choice.model !== "default" ? `（Agent prompt 开头加 --model ${r.choice.model}）` : "";
+      const modelHint = `（Agent prompt 第一行写「${[r.choice.model && r.choice.model !== "default" ? `--model ${r.choice.model}` : "", `--effort ${levelEffort(level)}`].filter(Boolean).join(" ")}」）`;
       console.error(`首选是 Codex（${r.choice.reason}）。请用 Agent 工具 subagent_type=codex:codex-rescue 把这张派单交给它${modelHint}；确有理由不用 Codex 时，加 --skip-codex 改派第二名。`);
       process.exit(3);
     }
@@ -578,7 +578,7 @@ async function cmdRun(opts) {
         process.exit(3);
       }
       const first = r.choice;
-      const modelHint = first?.model && first.model !== "default" ? `（Agent prompt 开头加 --model ${first.model}）` : "";
+      const modelHint = `（Agent prompt 第一行写「${[first?.model && first.model !== "default" ? `--model ${first.model}` : "", `--effort ${levelEffort(level)}`].filter(Boolean).join(" ")}」）`;
       console.error(first?.via === "codex-plugin"
         ? `首选是 Codex：请用 Agent 工具 subagent_type=codex:codex-rescue 执行${modelHint}`
         : noModelText(role, level, r.skipped));
@@ -604,7 +604,7 @@ async function cmdRun(opts) {
   if (prov.via === "codex-plugin") {
     const codexPool = providerPools(prov)[0];
     const codexModel = resolveModel(cfg, provName, codexPool, model || "default");
-    const modelHint = codexModel && codexModel !== "default" ? `（Agent prompt 开头加 --model ${codexModel}）` : "";
+    const modelHint = `（Agent prompt 第一行写「${[codexModel && codexModel !== "default" ? `--model ${codexModel}` : "", `--effort ${levelEffort(level)}`].filter(Boolean).join(" ")}」）`;
     console.error(`Codex 走官方插件：请用 Agent 工具 subagent_type=codex:codex-rescue（或 /codex:rescue）${modelHint}，审查用 /codex:review`);
     process.exit(3);
   }

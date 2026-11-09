@@ -26,7 +26,14 @@ const DEFAULT_SCORE_WEIGHTS = {
 // 模型分三档：light 轻（便宜、额度多，适合简单活）、mid 中、strong 强（留给难活）
 // 按「厂商:模型」匹配，* 是通配；多条都匹配时取最长的那条。配置里的 modelTiers 覆盖这里的同名条目，没列到的模型按中档算
 export const DEFAULT_MODEL_TIERS = {
-  "codex:*": "strong",
+  // Codex 各模型共用一份额度，但能力和消耗不同：Astra、6.1-Sol 强；6.1-Terra（命令行默认）、6-Sol 中；Luna 和上一代 5.6 轻
+  "codex:*": "mid",
+  "codex:gpt-6-astra": "strong",
+  "codex:gpt-6.1-sol": "strong",
+  "codex:gpt-6.1-terra": "mid",
+  "codex:gpt-6-sol": "mid",
+  "codex:gpt-6-luna": "light",
+  "codex:gpt-5.6-*": "light",
   "grok:*": "mid",
   "agy:gemini-3.8-flash*": "light",
   "agy:gpt-oss*": "light",
@@ -49,6 +56,11 @@ const LEVEL_RULES = {
   medium: { minTier: "mid", weights: null, effort: "medium", note: "中档以上按综合分" },
   hard: { minTier: "strong", weights: { fit: 3, reliability: 3, quota: 0.1, speed: 0.25, load: 0.25 }, effort: "high", note: "只派强档，看擅长和可靠" },
 };
+
+// 难度对应的推理强度：low / medium / high。Codex 用 --effort 传，agy 用模型名后缀
+export function levelEffort(level) {
+  return LEVEL_RULES[level]?.effort || null;
+}
 
 // 这个档位的模型能不能接这个难度的活；downgrade 为真时门槛降一档
 export function tierAllowed(level, tier, downgrade = false) {
@@ -74,10 +86,11 @@ function globMatch(pattern, text) {
 
 export function modelTier(cfg, provider, model) {
   const table = { ...DEFAULT_MODEL_TIERS, ...(cfg?.modelTiers || {}) };
-  const key = `${provider}:${model}`;
+  // 不分大小写：配置文件或 --model 里写成 GPT-6.1-Sol 也能认出来
+  const key = `${provider}:${model}`.toLowerCase();
   let best = null;
   for (const [pattern, tier] of Object.entries(table)) {
-    if (!TIER_RANK.hasOwnProperty(tier) || !globMatch(pattern, key)) continue;
+    if (!TIER_RANK.hasOwnProperty(tier) || !globMatch(pattern.toLowerCase(), key)) continue;
     if (!best || pattern.length > best.pattern.length) best = { pattern, tier };
   }
   return best ? best.tier : "mid";

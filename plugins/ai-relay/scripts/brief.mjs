@@ -87,6 +87,35 @@ export function levelOfBrief(text) {
   return null;
 }
 
+// 派给 Codex 的 prompt 里的运行参数。codex-rescue 会把全文任何位置的 --model / --effort 当运行参数，
+// 所以这里全文查找（--model x 和 --model=x 两种写法），全部拿出来交给钩子检查，并从正文里去掉；
+// 开头整行的其他参数（如 --background）原样保留。
+// 返回 { model, effort, conflict（同一参数写了不同的值）, others, rest（去掉参数后的派单正文） }
+export function codexFlagsOf(text) {
+  const values = { model: new Set(), effort: new Set() };
+  const cleaned = String(text || "").replace(/(^|[ \t])--(model|effort)(?:=|[ \t]+)([^\s]+)/gm, (_, lead, key, value) => {
+    values[key].add(value);
+    return lead;
+  });
+  const lines = cleaned.split(/\r?\n/);
+  const others = [];
+  let i = 0;
+  for (; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    if (!line.startsWith("--")) break;
+    others.push(...line.split(/\s+/));
+  }
+  const conflict = [...Object.entries(values)].filter(([, set]) => set.size > 1).map(([key]) => key);
+  return {
+    model: [...values.model][0] || null,
+    effort: [...values.effort][0] || null,
+    conflict,
+    others,
+    rest: lines.slice(i).join("\n"),
+  };
+}
+
 // 从派单里读出写入范围
 export function scopeOfBrief(text) {
   const lines = String(text || "").split(/\r?\n/);

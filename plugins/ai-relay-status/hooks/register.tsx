@@ -236,6 +236,7 @@ function modelText(provider: string, model: string) {
   const base = model.replace(/-(high|medium|low)$/, '')
   const name = base
     .replace(/^claude-(opus|sonnet|haiku)-(\d+)-(\d+)$/i, (_, f: string, a: string, b: string) => `Claude ${f.charAt(0).toUpperCase()}${f.slice(1)} ${a}.${b}`)
+    .replace(/^gpt-([\d.]+)-([a-z]+)$/i, (_, v: string, f: string) => `GPT-${v} ${f.charAt(0).toUpperCase()}${f.slice(1)}`)
     .replace(/^gemini-/i, 'Gemini ')
     .replace(/-(flash|argon|pro)$/i, (_, f: string) => ` ${f.charAt(0).toUpperCase()}${f.slice(1)}`)
     .replace(/-(argon|flash|pro)-/i, (_, f: string) => ` ${f.charAt(0).toUpperCase()}${f.slice(1)} `)

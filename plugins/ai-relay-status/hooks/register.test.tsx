@@ -3307,6 +3307,7 @@ test('对话页：一级标题的目标也能取到，返工任务和原任务�
   const base = { provider: 'grok', model: 'default', role: 'implement', level: 'easy', write: true, task, changedFiles: 1, reason: '擅长 0.80 → 0.80' }
   relay.jobs = JSON.stringify([
     { ...base, id: 'j-orig', status: 'done', startedAt: '2026-11-04T12:00:10.000Z', finishedAt: '2026-11-04T12:00:40.000Z', verdict: 'partial', verdictNote: '退回返工：term-03 自检没过' },
+    { ...base, id: 'j-gpt', provider: 'grok', model: 'gpt-6.1-sol', status: 'done', startedAt: '2026-11-04T12:00:45.000Z', finishedAt: '2026-11-04T12:00:48.000Z', verdict: 'pass', verdictNote: '' },
     { ...base, id: 'j-redo', status: 'running', startedAt: '2026-11-04T12:00:50.000Z', finishedAt: null, verdict: null, verdictNote: '', reworkOf: 'j-orig', reworkRound: 1 },
   ])
   await $.session.start({ cwd: '/projects/fj', surface: 'desktop', isInteractive: true })
@@ -3321,5 +3322,6 @@ test('对话页：一级标题的目标也能取到，返工任务和原任务�
   expect(await shownIncludes(ui, '已退回原员工返工：')).toBe(true)
   expect(await shownIncludes(ui, '第 1 次返工 · 原任务 ')).toBe(true)
   expect(await shownIncludes(ui, '实现 · 简单 · 可写')).toBe(true)
+  expect(await shownIncludes(ui, 'GPT-6.1 Sol')).toBe(true)
   await ui.unmount()
 })
