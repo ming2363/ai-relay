@@ -35,7 +35,7 @@ export const BRIEF_TEMPLATE = `角色：<implement|debug|review|read|deep|quick|
 <可写任务必填：允许改动的文件或目录，每行一个，相对工作目录；并行的可写任务范围不能重叠>
 
 ## 需要的能力
-<联网 / 执行命令 / 无。只写外派模型自己要用到的；浏览器、Word、连接器等 Claude 专属工具由主控先做好，结果写进背景>
+<联网 / 执行命令 / 看图 / 无。只写外派模型自己要用到的；浏览器、Word、连接器等 Claude 专属工具由主控先做好，结果写进背景>
 
 ## 约束
 <不许做的事、必须遵守的规范、不能碰的文件>
@@ -192,6 +192,23 @@ export function needsOfBrief(text) {
   const needs = [];
   if (/联网|搜索|网页/.test(body)) needs.push("web");
   if (/执行命令|跑测试|运行测试|构建/.test(body)) needs.push("exec");
+  if (/看图|图片|截图|图像|多模态/.test(body)) needs.push("vision");
+  return needs;
+}
+
+// 返回派单全文里出现的图片文件路径（以 .png .jpg .jpeg .gif .webp .bmp 结尾、不含空白的连续字符串，大小写不敏感）
+export function imagePathsOf(text) {
+  if (!text) return [];
+  const matches = String(text).match(/(?:[^\s"'`()\[\]<>，。；：]+)\.(?:png|jpg|jpeg|gif|webp|bmp)(?=[^\w./-]|$)/gi) || [];
+  return [...new Set(matches)];
+}
+
+// needsOfBrief 的结果，若 imagePathsOf 非空且结果里没有 "vision" 就加上
+export function needsWithImages(text) {
+  const needs = needsOfBrief(text);
+  if (imagePathsOf(text).length > 0 && !needs.includes("vision")) {
+    needs.push("vision");
+  }
   return needs;
 }
 
@@ -331,6 +348,9 @@ export function buildDispatchPrompt({ task, cwd, write, role, shared, attachment
     );
     const globalRules = userGlobalRules();
     if (globalRules) parts.push("", "## 用户全局规则（~/.claude/CLAUDE.md，必须遵守）", globalRules);
+  }
+  if (caps?.vision !== true) {
+    parts.push("你看不了图片：不要用读文件工具打开图片文件；需要图片内容时在汇报的『需要主控协助』里写明。");
   }
   if (hasCaps) {
     const mark = (on) => (on ? "✓" : "✗");

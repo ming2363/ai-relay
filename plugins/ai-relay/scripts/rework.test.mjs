@@ -20,6 +20,7 @@ function setup() {
   const argsOut = path.join(home, "fake-args.txt");
   fs.writeFileSync(fake, `#!/bin/sh\nprintf '%s\\n' "$@" > "${argsOut}"\necho 已按意见改完\n`, { mode: 0o755 });
   const cfg = JSON.parse(fs.readFileSync(DEFAULT_CFG, "utf8"));
+  cfg.quotaDb = "";
   cfg.providers.grok.cli.bin = fake;
   fs.writeFileSync(path.join(home, "providers.json"), JSON.stringify(cfg, null, 2));
   const repo = path.join(home, "repo");

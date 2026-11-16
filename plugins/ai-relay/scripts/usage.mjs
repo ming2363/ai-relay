@@ -427,9 +427,44 @@ export function agyUsageFor(job, opts = {}) {
   return null;
 }
 
+function finiteNumber(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+// Claude Code --output-format json。不是合法 JSON 时返回 null，调用方把原文当文本。
+export function parseClaudeOutput(text) {
+  const trimmed = String(text ?? "").trim();
+  if (!trimmed) return null;
+  try {
+    const data = JSON.parse(trimmed);
+    if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+// 自定义接口的 JSON 输出：input_tokens / output_tokens 记成和其他厂商一样的用量对象。
+export function usageFromOutputJson(text) {
+  const data = text && typeof text === "object" && !Array.isArray(text) ? text : parseClaudeOutput(text);
+  const usage = data?.usage;
+  if (!usage || typeof usage !== "object") return null;
+  const input = finiteNumber(usage.input_tokens);
+  const output = finiteNumber(usage.output_tokens);
+  if (input === null && output === null) return null;
+  const inputN = input ?? 0;
+  const outputN = output ?? 0;
+  const cacheRead = finiteNumber(usage.cache_read_input_tokens) ?? 0;
+  return { input: inputN, output: outputN, cacheRead, total: inputN + outputN + cacheRead, source: "output-json" };
+}
+
 // 按任务 provider 自动分发读取 usage
 export function usageForJob(job, opts = {}) {
   if (!job || typeof job !== "object") return null;
+  if (opts.outputJsonText) {
+    const fromJson = usageFromOutputJson(opts.outputJsonText);
+    if (fromJson) return fromJson;
+  }
   if (job.provider === "grok") return grokUsageFor(job, opts);
   if (job.provider === "agy") return agyUsageFor(job, opts);
   return null;

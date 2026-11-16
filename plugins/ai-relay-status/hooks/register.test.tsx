@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { Round, RoundAgent } from '../types'
-import { foldSystemRounds } from './register'
+import { foldSystemRounds, maskSecrets } from './register'
 
 type TestOn = Parameters<Extract<Parameters<typeof test>[1], (...args: never[]) => unknown>>[1]
 
@@ -41,7 +41,7 @@ const ok = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isSt
 const fail = (stderr: string) => ({ value: { exitCode: 1, stdout: '', stderr, isStdoutTruncated: false, isStderrTruncated: false } })
 
 // relay status --json 的最小样例：手动模式，Codex 偏低，Argon 耗尽，Grok 已停用
-function statusJson(mode: string, grokEnabled: boolean, claudeWins?: unknown[]) {
+function statusJson(mode: string, grokEnabled: boolean, claudeWins?: unknown[], extraPools: Record<string, unknown>[] = []) {
   return JSON.stringify({
     mode,
     quotaAvailable: true,
@@ -51,6 +51,7 @@ function statusJson(mode: string, grokEnabled: boolean, claudeWins?: unknown[]) 
       { name: 'grok', pool: 'supergrok-weekly', level: 'ok', enabled: grokEnabled, source: 'AIQuota5h', windows: [{ key: 'weekly', remaining: 0.89 }] },
       { name: 'claude', pool: 'claude-subscription', level: 'ok', enabled: true, windows: claudeWins ?? [{ key: 'weekly', remaining: 0.55 }, { key: '5h', remaining: 0.77 }] },
       { name: 'codex', pool: 'codex', level: 'low', enabled: true, windows: [{ key: '5h', remaining: 0.78 }, { key: 'weekly', remaining: 0.28 }] },
+      ...extraPools,
     ],
   })
 }
@@ -62,6 +63,7 @@ function providersJson(
   pools: Record<string, readonly Record<string, unknown>[]> = {},
   more: { name: string; label: string; roles?: string[] }[] = [],
   roleList?: { key: string; text: string }[],
+  extraVendors: Record<string, unknown>[] = [],
 ) {
   const fullAccess = (name: string, via: string) => {
     if (via === 'self') return { supported: false, enabled: false, note: '主模型的权限在输入框的模式菜单里设置' }
@@ -82,6 +84,7 @@ function providersJson(
       v('grok', 'SuperGrok', 'relay', grokEnabled, ['review', 'read']),
       ...extra.map(n => v(n, `${n} 会员`, 'relay', true, ['read'])),
       ...more.map(n => v(n.name, n.label, 'relay', true, n.roles ?? ['read'])),
+      ...extraVendors,
     ],
     roles: roleList ?? [{ key: 'implement', text: '实现' }, { key: 'review', text: '审查' }, { key: 'read', text: '阅读' }],
     presets: {
@@ -99,6 +102,8 @@ function fakeRelay(on: TestOn) {
     claudeWins: undefined as unknown[] | undefined, access: { grok: true } as Record<string, boolean>,
     modelPools: {} as Record<string, Record<string, unknown>[]>,
     moreProviders: [] as { name: string; label: string; roles?: string[] }[],
+    extraVendors: [] as Record<string, unknown>[],
+    extraPools: [] as Record<string, unknown>[],
     roleList: undefined as { key: string; text: string }[] | undefined,
     models: null as unknown,
     // 非 null 时 models 子命令原样返回这段 stdout（用来测解析失败）
@@ -124,10 +129,10 @@ function fakeRelay(on: TestOn) {
     const argv = [...e.argv].slice(2)
     state.calls.push(argv)
     const [cmd, sub, arg] = argv
-    if (cmd === 'status') return ok(statusJson(state.mode, state.grok, state.claudeWins))
+    if (cmd === 'status') return ok(statusJson(state.mode, state.grok, state.claudeWins, state.extraPools))
     if (cmd === 'quota') return ok('')
     if (cmd === 'jobs') return ok(state.jobs)
-    if (cmd === 'providers') return ok(providersJson(state.grok, state.added, state.access, state.modelPools, state.moreProviders, state.roleList))
+    if (cmd === 'providers') return ok(providersJson(state.grok, state.added, state.access, state.modelPools, state.moreProviders, state.roleList, state.extraVendors))
     if (cmd === 'models') {
       if (state.modelsRaw !== null) return ok(state.modelsRaw)
       return ok(JSON.stringify(state.models ?? { updatedAt: '2026-11-05T00:00:00.000Z', providers: {} }))
@@ -165,6 +170,12 @@ function fakeRelay(on: TestOn) {
       if (hit) hit.current = modelId === 'default' ? null : modelId
       const shown = modelId === 'default' ? 'CLI 默认' : modelId
       return ok(`${name} 默认模型 → ${shown}（下一单起生效）`)
+    }
+    if (cmd === 'provider' && sub === 'models') {
+      const name = arg ?? ''
+      const flag = argv[3] ?? ''
+      const modelId = argv[4] ?? ''
+      return ok(`${name} 模型 ${modelId} 已${flag === '--add' ? '启用' : '停用'}`)
     }
     return fail('unknown')
   })
@@ -3323,5 +3334,414 @@ test('对话页：一级标题的目标也能取到，返工任务和原任务�
   expect(await shownIncludes(ui, '第 1 次返工 · 原任务 ')).toBe(true)
   expect(await shownIncludes(ui, '实现 · 简单 · 可写')).toBe(true)
   expect(await shownIncludes(ui, 'GPT-6.1 Sol')).toBe(true)
+  await ui.unmount()
+})
+
+test('新增厂商：选"自定义接口"模板提交，规格含 preset, name, label, baseUrl, models 且无任何密钥字段', async ($, on) => {
+  baseStubs(on)
+  const relay = fakeRelay(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab-vendors' })
+  await ui.press({ key: 'add-vendor' })
+  await ui.select({ key: 'form-preset', value: 'endpoint' })
+
+  // 选"自定义接口"时显示三个输入：名称、接口地址、模型；不显示命令行相关输入项，不包含密钥输入框
+  expect(await ui.find({ type: 'Input', key: 'form-name' })).toBeDefined()
+  expect(await ui.find({ type: 'Input', key: 'form-baseUrl' })).toBeDefined()
+  expect(await ui.find({ type: 'Input', key: 'form-models' })).toBeDefined()
+  expect(await ui.find({ type: 'Input', key: 'form-bin' })).toBeUndefined()
+  expect(await ui.find({ type: 'Input', key: 'form-promptArgs' })).toBeUndefined()
+  expect(await ui.find({ type: 'Input', key: 'form-modelArgs' })).toBeUndefined()
+  expect(await ui.find({ type: 'Input', key: 'form-readArgs' })).toBeUndefined()
+  expect(await ui.find({ type: 'Input', key: 'form-writeArgs' })).toBeUndefined()
+  expect(await ui.find({ type: 'Input', key: 'form-secret' })).toBeUndefined()
+  expect(await ui.find({ type: 'Input', key: 'form-key' })).toBeUndefined()
+  expect(await ui.find({ type: 'Input', key: 'form-apiKey' })).toBeUndefined()
+
+  await ui.input({ key: 'form-name', text: 'maas', kind: 'change' })
+  await ui.input({ key: 'form-baseUrl', text: 'https://model-api.maas.com.cn', kind: 'change' })
+  await ui.input({ key: 'form-models', text: 'qwen3.8-max, deepseek-v4-pro-0813\nglm-5.3', kind: 'change' })
+  await ui.press({ key: 'form-save' })
+
+  const add = relay.calls.find(a => a[0] === 'provider' && a[1] === 'add')
+  expect(add).toBeDefined()
+  const spec = JSON.parse(add![3]!) as Record<string, unknown>
+  expect(spec).toMatchObject({
+    preset: 'endpoint',
+    name: 'maas',
+    label: 'maas',
+    baseUrl: 'https://model-api.maas.com.cn',
+    models: ['qwen3.8-max', 'deepseek-v4-pro-0813', 'glm-5.3'],
+  })
+  // 没有任何密钥字段
+  expect(spec.secret).toBeUndefined()
+  expect(spec.key).toBeUndefined()
+  expect(spec.apiKey).toBeUndefined()
+  expect(spec.token).toBeUndefined()
+  expect(spec.password).toBeUndefined()
+  await ui.unmount()
+})
+
+test('厂商卡片与额度页：endpoint 厂商显示接口地址、按量计费与密钥状态及命令', async ($, on) => {
+  baseStubs(on)
+  const relay = fakeRelay(on)
+  relay.extraVendors = [
+    {
+      name: 'maas-nokey',
+      label: '国产模型未配密钥',
+      via: 'relay',
+      enabled: true,
+      canDisable: true,
+      canRemove: true,
+      canTest: false,
+      bin: '',
+      binFound: false,
+      roles: ['implement'],
+      note: '',
+      fullAccess: { supported: false, enabled: false, note: '' },
+      modelPools: [],
+      billing: 'metered',
+      endpoint: { baseUrl: 'https://model-api.maas.com.cn' },
+      hasKey: false,
+      models: ['qwen3.8-max'],
+    },
+    {
+      name: 'maas-haskey',
+      label: '国产模型已配密钥',
+      via: 'relay',
+      enabled: true,
+      canDisable: true,
+      canRemove: true,
+      canTest: false,
+      bin: '',
+      binFound: false,
+      roles: ['implement'],
+      note: '',
+      fullAccess: { supported: false, enabled: false, note: '' },
+      modelPools: [],
+      billing: 'metered',
+      endpoint: { baseUrl: 'https://api.custom.com' },
+      hasKey: true,
+      models: ['deepseek-v4-pro-0813'],
+    },
+  ]
+  relay.extraPools = [
+    {
+      name: 'maas-nokey',
+      pool: 'maas-nokey',
+      level: 'unknown',
+      billing: 'metered',
+      enabled: true,
+      windows: [],
+    },
+  ]
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  // 额度页：billing 为 "metered" 的厂商不显示百分比，显示"按量计费"
+  expect(await ui.find({ type: 'Text', text: '按量计费' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '● 按量计费' })).toBeDefined()
+
+  await ui.press({ key: 'tab-vendors' })
+  // 厂商 1（未配密钥）：显示接口地址、"按量计费"、"未设置"，以及终端运行命令
+  expect(await ui.find({ type: 'Text', text: 'https://model-api.maas.com.cn' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '未设置' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'node /opt/ai-relay/scripts/relay.mjs provider key maas-nokey' })).toBeDefined()
+
+  // 厂商 2（已配密钥）：显示接口地址、"已设置"，不显示设置命令
+  expect(await ui.find({ type: 'Text', text: 'https://api.custom.com' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '已设置' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'node /opt/ai-relay/scripts/relay.mjs provider key maas-haskey' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('看图能力：modelCaps 优先于 caps，vision 为 true 标"能看图"，老厂商无字段与原来一致', async ($, on) => {
+  baseStubs(on)
+  const relay = fakeRelay(on)
+  relay.extraVendors = [
+    {
+      name: 'vision-vendor',
+      label: '多模态厂商',
+      via: 'relay',
+      enabled: true,
+      canDisable: true,
+      canRemove: true,
+      canTest: false,
+      bin: '',
+      binFound: false,
+      roles: ['implement'],
+      note: '',
+      fullAccess: { supported: false, enabled: false, note: '' },
+      modelPools: [],
+      endpoint: { baseUrl: 'https://vision-api.com' },
+      hasKey: true,
+      caps: { vision: false },
+      modelCaps: {
+        'qwen3.8-max': { vision: true },
+        'glm-5.3': { vision: false },
+      },
+      models: ['qwen3.8-max', 'glm-5.3', 'other-model'],
+    },
+  ]
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab-vendors' })
+
+  // qwen3.8-max 在 modelCaps 中为 true，标"能看图"
+  expect(await ui.find({ type: 'Text', text: '能看图' })).toBeDefined()
+  // glm-5.3 为 false，other-model 跟随厂商级 false，不标能看图
+  const visionTexts = await ui.findAll({ type: 'Text', text: '能看图' })
+  expect(visionTexts).toHaveLength(1)
+
+  // 老厂商没有 caps 和 modelCaps 字段，不会显示能看图
+  expect(await ui.find({ type: 'Text', text: /^SuperGrok$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^Codex · ChatGPT Plus$/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('白名单管理：未启用模型标"未启用"且可点启用，已启用可点停用', async ($, on) => {
+  baseStubs(on)
+  const relay = fakeRelay(on)
+  relay.extraVendors = [
+    {
+      name: 'maas',
+      label: '国产模型',
+      via: 'relay',
+      enabled: true,
+      canDisable: true,
+      canRemove: true,
+      canTest: false,
+      bin: '',
+      binFound: false,
+      roles: ['implement'],
+      note: '',
+      fullAccess: { supported: false, enabled: false, note: '' },
+      modelPools: [],
+      endpoint: { baseUrl: 'https://model-api.maas.com.cn' },
+      hasKey: true,
+      models: ['qwen3.8-max'], // 只有 qwen3.8-max 在白名单中已启用
+    },
+  ]
+  relay.models = {
+    updatedAt: '2026-11-11T00:00:00.000Z',
+    providers: {
+      maas: {
+        ok: true,
+        error: null,
+        fetchedAt: '2026-11-11T00:00:00.000Z',
+        cliDefault: null,
+        models: [
+          { id: 'qwen3.8-max', label: '千问 3.8 Max', pool: null },
+          { id: 'deepseek-v4-pro-0813', label: 'DeepSeek V4 Pro', pool: null },
+        ],
+      },
+    },
+  }
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab-vendors' })
+
+  // deepseek-v4-pro-0813 不在白名单，标"未启用"并有启用按钮
+  expect(await ui.find({ type: 'Text', text: '未启用' })).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: 'enable-model-maas-deepseek-v4-pro-0813' })).toBeDefined()
+
+  // qwen3.8-max 在白名单中，有停用按钮
+  expect(await ui.find({ type: 'Button', key: 'disable-model-maas-qwen3.8-max' })).toBeDefined()
+
+  // 点启用：调 provider models maas --add deepseek-v4-pro-0813
+  await ui.press({ key: 'enable-model-maas-deepseek-v4-pro-0813' })
+  expect(relay.calls.some(a => a.join(' ') === 'provider models maas --add deepseek-v4-pro-0813')).toBe(true)
+
+  // 点停用：调 provider models maas --remove qwen3.8-max
+  await ui.press({ key: 'disable-model-maas-qwen3.8-max' })
+  expect(relay.calls.some(a => a.join(' ') === 'provider models maas --remove qwen3.8-max')).toBe(true)
+
+  await ui.unmount()
+})
+
+test('密钥打码：保存轮次自动打码，读取已有旧轮次文件显示也是打码的', async ($, on) => {
+  // 1. maskSecrets 基础逻辑验证
+  expect(maskSecrets('sk-1234567890123456')).toBe('sk-***')
+  expect(maskSecrets('ghp_abcdefghijklmnop')).toBe('ghp_***')
+  expect(maskSecrets('AKIAIOSFODNN7EXAMPLE')).toBe('AKIA***')
+  expect(maskSecrets('xoxb-123456789012')).toBe('xoxb-***')
+  expect(maskSecrets('xoxa-123456789012')).toBe('xoxa-***')
+  expect(maskSecrets('xoxp-123456789012')).toBe('xoxp-***')
+  expect(maskSecrets('Bearer mysecrettoken12345678')).toBe('Bearer ***')
+  expect(maskSecrets('sk-short')).toBe('sk-short') // 少于 12 位不打码
+  expect(maskSecrets('Bearer short')).toBe('Bearer short') // 少于 16 位不打码
+
+  // 2. 用户消息里有 sk- 长串时，保存的轮次 text 自动打码
+  const now = 1793712984000
+  baseStubs(on, new Set<string>(), () => now)
+  fakeRelay(on)
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('turn.complete', () => ({ text: 'ok' }))
+
+  await $.session.start({ cwd: '/projects/fj', surface: 'desktop', isInteractive: true })
+  await $.turn.start({ text: '请用密钥 sk-1234567890123456 进行测试', turnId: 't-mask' })
+  await $.turn.complete({ turnId: 't-mask', reason: 'answer', answer: 'ok', durationMs: 1000, isAborted: false })
+
+  const saved = JSON.parse(fileMap.get(`${ROUNDS_DIR}/s-cur.json`)!.text) as Round[]
+  expect(saved[0]?.text).toBe('请用密钥 sk-*** 进行测试')
+  expect(saved[0]?.text).not.toContain('sk-1234567890123456')
+
+  // 3. 读取磁盘上含明文的旧轮次文件，详情与列表显示也是打码的
+  putRoundFile('s-old', [
+    {
+      id: 't-old',
+      sessionId: 's-old',
+      project: { name: 'fj', path: '/projects/fj' },
+      env: 'desktop',
+      text: '旧消息中包含 sk-oldsecretkey123456 和 Bearer secrettoken1234567890',
+      mainModel: 'claude-opus-5-5',
+      startedAt: now - 10_000,
+      finishedAt: now - 5_000,
+      status: 'answer',
+      agents: [],
+      selfLines: 0,
+    },
+  ], now)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab-jobs' })
+  await ui.press({ key: 'open-t-old' })
+
+  // 详情里显示的是打码后的
+  expect(await shownIncludes(ui, 'sk-***')).toBe(true)
+  expect(await shownIncludes(ui, 'Bearer ***')).toBe(true)
+  expect(await shownIncludes(ui, 'sk-oldsecretkey123456')).toBe(false)
+  expect(await shownIncludes(ui, 'secrettoken1234567890')).toBe(false)
+
+  await ui.unmount()
+})
+
+test('新模型与未归池标记：isNew 显示"新"标记与下拉"（新）"，unpooled 显示"未归入额度池"，标题旁显示新模型数', async ($, on) => {
+  const NOW = 1793712984000
+  baseStubs(on, new Set<string>(), () => NOW)
+  const relay = fakeRelay(on)
+  const updatedAt = new Date(NOW - 5 * 60_000).toISOString()
+  relay.modelPools = {
+    grok: [
+      { pool: 'supergrok-weekly', label: 'Grok', current: null, allowCliDefault: true, followRoles: ['review'], fixedRoles: [] },
+    ],
+  }
+  relay.models = {
+    updatedAt,
+    providers: {
+      grok: {
+        ok: true,
+        error: null,
+        fetchedAt: updatedAt,
+        cliDefault: 'grok-4.7-build-fast',
+        models: [
+          { id: 'grok-4.7', label: 'Grok 4.7', pool: 'supergrok-weekly', isNew: true },
+          { id: 'grok-4.7-build-fast', label: 'Grok 4.7 Build Fast', pool: 'supergrok-weekly', isNew: true },
+          { id: 'grok-4.6', label: 'Grok 4.6', pool: 'supergrok-weekly', isNew: false },
+          { id: 'orphan', label: 'Orphan Model', pool: null, unpooled: true, isNew: false },
+        ],
+      },
+    },
+  }
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab-vendors' })
+
+  // 1. 验收标准 4：有 2 个新模型的厂商，标题旁显示"2 个新模型"
+  expect(await ui.find({ type: 'Text', text: '模型列表更新于 5 分钟前 · 2 个新模型' })).toBeDefined()
+
+  // 2. 验收标准 2：默认模型下拉选项
+  const select = await ui.find({ type: 'Select', key: 'model-grok-supergrok-weekly' })
+  expect(select).toBeDefined()
+  const labels = optionLabels(select)
+  // isNew 为 true 的带"（新）"
+  expect(labels).toContain('Grok 4.7 · grok-4.7（新）')
+  expect(labels).toContain('Grok 4.7 Build Fast · grok-4.7-build-fast（新）')
+  // isNew 为 false 的不带"（新）"
+  expect(labels).toContain('Grok 4.6 · grok-4.6')
+  expect(labels.find(l => l.includes('Grok 4.6'))).not.toContain('（新）')
+  expect(labels.find(l => l.includes('跟随 CLI 默认'))).not.toContain('（新）')
+
+  // 3. 验收标准 2 & 3：厂商卡片上的模型列表标记
+  const newBadges = (await ui.findAll({ type: 'Text', text: /^新$/ }))
+  // grok-4.7 和 grok-4.7-build-fast 各一个"新"标记
+  expect(newBadges).toHaveLength(2)
+  for (const b of newBadges) {
+    expect(b.props.color).toBe('accent')
+  }
+
+  // unpooled 显示"未归入额度池"
+  const unpooledText = await ui.find({ type: 'Text', text: '未归入额度池' })
+  expect(unpooledText).toBeDefined()
+  expect(unpooledText?.props.dimColor).toBe(true)
+
+  await ui.unmount()
+})
+
+test('厂商页：模型清单 updatedAt 超过 6 小时打开时后台拉取，未超过不拉取', async ($, on) => {
+  let currentTime = 1793712984000
+  baseStubs(on, new Set<string>(), () => currentTime)
+  const relay = fakeRelay(on)
+  // 初始模型清单时间：1 小时前（未超过 6 小时）
+  const updatedAt = new Date(currentTime - 3600_000).toISOString()
+  relay.models = {
+    updatedAt,
+    providers: {
+      grok: {
+        ok: true,
+        error: null,
+        fetchedAt: updatedAt,
+        cliDefault: 'grok-4.6',
+        models: [{ id: 'grok-4.6', label: 'Grok 4.6', pool: 'supergrok-weekly' }],
+      },
+    },
+  }
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  // 第一次打开厂商页：初始状态为 idle，触发一次拉取
+  await ui.press({ key: 'tab-vendors' })
+  const callsAfterFirstOpen = relay.calls.filter(a => a[0] === 'models' && a.includes('--json')).length
+  expect(callsAfterFirstOpen).toBe(1)
+
+  // 切到对话页，再切回厂商页（此时距离 updatedAt 依然只有 1 小时，未超过 6 小时）
+  await ui.press({ key: 'tab-jobs' })
+  await ui.press({ key: 'tab-vendors' })
+  const callsAfterSecondOpen = relay.calls.filter(a => a[0] === 'models' && a.includes('--json')).length
+  // 未超过 6 小时，不重新拉取
+  expect(callsAfterSecondOpen).toBe(1)
+
+  // 时间推进 7 小时（此时距离之前的 updatedAt 已经过去 8 小时，超过 6 小时）
+  currentTime += 7 * 3600_000
+  await ui.press({ key: 'tab-jobs' })
+  await ui.press({ key: 'tab-vendors' })
+
+  const callsAfterThirdOpen = relay.calls.filter(a => a[0] === 'models' && a.includes('--json')).length
+  // 超过 6 小时，多调一次 models --json
+  expect(callsAfterThirdOpen).toBe(2)
+
+  await ui.unmount()
+})
+
+test('额度页：切换模式成功后的 toast 含"从下一条消息起生效"，不含"新会话"', async ($, on) => {
+  baseStubs(on)
+  const relay = fakeRelay(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  await ui.press({ key: 'mode-auto' })
+  expect(relay.calls.some(a => a[0] === 'mode' && a[1] === 'auto')).toBe(true)
+
+  const modeToast = toastLog.find(t => t.includes('ai-relay 已切换为「自动」'))
+  expect(modeToast).toBeDefined()
+  expect(modeToast).toContain('从下一条消息起生效')
+  expect(modeToast).not.toContain('新会话')
+
   await ui.unmount()
 })

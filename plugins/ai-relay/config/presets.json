@@ -90,5 +90,65 @@
       "read"
     ],
     "note": "任何能用一条命令无交互执行任务、把结果输出到终端的官方 CLI 都可以接入"
+  },
+  "endpoint": {
+    "title": "自定义接口",
+    "label": "自定义接口",
+    "kind": "endpoint",
+    "install": "需要已安装 Claude Code（claude 命令）。密钥不要写在命令里，添加后运行 relay provider key <名称>",
+    "billing": "metered",
+    "cli": {
+      "bin": "claude",
+      "prompt": [
+        "--bare",
+        "-p",
+        "{prompt}",
+        "--output-format",
+        "json"
+      ],
+      "model": [
+        "--model",
+        "{model}"
+      ],
+      "read": [
+        "--permission-mode",
+        "plan"
+      ],
+      "write": [
+        "--permission-mode",
+        "acceptEdits"
+      ],
+      "cwd": null,
+      "fullAccess": [
+        "--dangerously-skip-permissions"
+      ],
+      "fullAccessWriteOnly": true
+    },
+    "env": {
+      "ANTHROPIC_BASE_URL": "{baseUrl}",
+      "ANTHROPIC_API_KEY": "{secret}",
+      "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+      "DISABLE_TELEMETRY": "1"
+    },
+    "envUnset": [
+      "ANTHROPIC_AUTH_TOKEN",
+      "CLAUDECODE",
+      "CLAUDE_CODE_ENTRYPOINT"
+    ],
+    "caps": {
+      "web": false,
+      "exec": false,
+      "vision": false
+    },
+    "knownModelCaps": {
+      "qwen3.8-max": { "vision": true },
+      "kimi-k3.1-pro": { "vision": true },
+      "doubao-seed-2-0-pro-260215": { "vision": true },
+      "deepseek-v4.1-flash-1017": { "vision": true }
+    },
+    "modelList": {
+      "format": "openai-http"
+    },
+    "note": "按量计费。只读固定为计划模式；可写在最高权限打开时跳过逐项确认。密钥单独存放，不会写进配置。"
   }
 }

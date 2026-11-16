@@ -53,7 +53,7 @@ export const LEVEL_TEXT = { easy: "简单", medium: "中等", hard: "困难" };
 // 每档难度：最低模型档位、打分权重（覆盖默认值）、同一模型有 low/medium/high 几档时用哪一档
 const LEVEL_RULES = {
   easy: { minTier: "light", weights: { fit: 1, reliability: 2, quota: 2, speed: 0.5, load: 0.5, cost: 2 }, effort: "low", note: "优先额度充足、便宜的模型" },
-  medium: { minTier: "mid", weights: null, effort: "medium", note: "中档以上按综合分" },
+  medium: { minTier: "mid", preferTier: "mid", weights: null, effort: "medium", note: "中档以上按综合分" },
   hard: { minTier: "strong", weights: { fit: 3, reliability: 3, quota: 0.1, speed: 0.25, load: 0.25 }, effort: "high", note: "只派强档，看擅长和可靠" },
 };
 
@@ -136,13 +136,34 @@ function calcFit(index, explicitFit) {
   return Math.max(0.4, 1 - 0.15 * index);
 }
 
+// 配速值：对每个有剩余比例和重置时间的窗口算 remaining - clamp(距重置小时数 / windowTotalHours(key), 0, 1)，取最小值；算不出返回 null
+export function paceOf(status, now = Date.now()) {
+  let minPace = null;
+  for (const w of status?.windows || []) {
+    if (w.remaining === null || w.remaining === undefined) continue;
+    if (w.resetAt === null || w.resetAt === undefined) continue;
+    if (w.resetPassed) continue;
+    const totalHours = windowTotalHours(w.key);
+    const hoursUntilReset = Math.max(0, (w.resetAt - now) / 3_600_000);
+    const cycleRemaining = clamp(hoursUntilReset / totalHours, 0, 1);
+    const p = w.remaining - cycleRemaining;
+    if (minPace === null || p < minPace) minPace = p;
+  }
+  return minPace;
+}
+
 // 2. quota 额度：
 //   - level 为 unknown: 0.8
-//   - 否则: binding = status.remaining; expiring = 各窗口中 remaining * clamp(1 - 距重置小时数 / 窗口总小时数, 0, 1) 的最大值
-//   - quota = 0.6 + 0.4 * binding + 0.4 * expiring; level 为 low 时再乘 0.7
+//   - 配速不为 null: clamp(0.8 + 0.6 * pace, 0.5, 1.4)，配速不为负时不打七折
+//   - 配速为 null: binding = status.remaining; expiring = 各窗口中 remaining * clamp(1 - 距重置小时数 / 窗口总小时数, 0, 1) 的最大值
+//     quota = 0.6 + 0.4 * binding + 0.4 * expiring; level 为 low 时再乘 0.7
 function calcQuota(status, now) {
   if (status.level === "unknown") {
     return 0.8;
+  }
+  const pace = paceOf(status, now);
+  if (pace !== null) {
+    return clamp(0.8 + 0.6 * pace, 0.5, 1.4);
   }
   const binding = typeof status.remaining === "number" ? status.remaining : 0;
   let expiring = 0;
@@ -297,14 +318,15 @@ function formatReason(parts, score, status, now, running = 0) {
   return text;
 }
 
-// needs 里任一能力在 caps 中不为 true 就跳过。空或不传不检查。文案顺序固定为联网、执行命令
-function capsSkipWhy(caps, needs) {
+// needs 里任一能力在 caps 中不为 true 就跳过。空或不传不检查。文案顺序固定为联网、执行命令、看图
+export function capsSkipWhy(caps, needs) {
   if (!Array.isArray(needs) || needs.length === 0) return "";
   const labels = [];
   if (needs.includes("web") && caps?.web !== true) labels.push("联网");
   if (needs.includes("exec") && caps?.exec !== true) labels.push("执行命令");
+  if (needs.includes("vision") && caps?.vision !== true) labels.push("看图");
   for (const name of needs) {
-    if (name === "web" || name === "exec") continue;
+    if (name === "web" || name === "exec" || name === "vision") continue;
     if (caps?.[name] !== true) labels.push(String(name));
   }
   return labels.length ? `不具备：${labels.join("、")}` : "";
@@ -352,7 +374,7 @@ export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now
     }
 
     // 能力检查在额度之前：缺能力就不要拿额度去比较
-    const capsWhy = capsSkipWhy(capsOf(cfg, prov), needs);
+    const capsWhy = capsSkipWhy(capsOf(cfg, prov, model), needs);
     if (capsWhy) {
       skipped.push({
         provider: provName,
@@ -424,7 +446,40 @@ export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now
     let reason = formatReason(parts, score, st, now, running);
     if (rule) reason = `难度${LEVEL_TEXT[level]}${downgrade ? "（已降级）" : ""}：${rule.note}，它是${TIER_TEXT[tier]}；${reason}`;
 
-    cands.push({
+    const rawPace = paceOf(st, now);
+    const pace = rawPace === null ? null : round(rawPace, 3);
+    const metered = prov?.billing === "metered";
+    const reserveBelow = cfg?.paceReserveBelow ?? -0.15;
+    const reserved = !metered && rawPace !== null && rawPace < reserveBelow && (level === "easy" || level === "medium");
+
+    let group = 0;
+    let demoted;
+    if (level === "medium") {
+      if (reserved) {
+        group = 3;
+        demoted = "用得比进度快，留给困难任务";
+      } else if (metered) {
+        group = 2;
+        demoted = "按量计费，会员候选优先";
+      } else if (tier !== (rule?.preferTier || "mid")) {
+        group = 1;
+      }
+    } else if (level === "easy") {
+      if (reserved) {
+        group = 2;
+        demoted = "用得比进度快，留给困难任务";
+      } else if (metered) {
+        group = 1;
+        demoted = "按量计费，会员候选优先";
+      }
+    } else if (!level) {
+      if (metered) {
+        group = 1;
+        demoted = "按量计费，会员候选优先";
+      }
+    }
+
+    const cand = {
       provider: provName,
       pool,
       model,
@@ -432,19 +487,42 @@ export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now
       tier,
       via: prov?.via,
       status: st,
+      pace,
       score,
       parts,
       reason,
+      _group: group,
+      _rawPace: rawPace,
       _index: i,
-    });
+    };
+    if (demoted) cand.demoted = demoted;
+    cands.push(cand);
+  }
+
+  const tieBand = cfg?.paceTieBand ?? 0.05;
+  const maxByGroup = new Map();
+  for (const c of cands) {
+    const prev = maxByGroup.get(c._group);
+    if (prev === undefined || c.score > prev) maxByGroup.set(c._group, c.score);
   }
 
   cands.sort((a, b) => {
+    if (a._group !== b._group) return a._group - b._group;
+    if (level !== "hard") {
+      const top = maxByGroup.get(a._group) || 0;
+      const aInBand = top > 0 && (top - a.score) / top <= tieBand + 1e-9;
+      const bInBand = top > 0 && (top - b.score) / top <= tieBand + 1e-9;
+      if (aInBand && bInBand) {
+        const pa = a._rawPace ?? 0;
+        const pb = b._rawPace ?? 0;
+        if (Math.abs(pb - pa) > 1e-9) return pb - pa;
+      }
+    }
     if (b.score !== a.score) return b.score - a.score;
     return a._index - b._index;
   });
 
-  const ordered = cands.map(({ _index, ...cand }) => cand);
+  const ordered = cands.map(({ _group, _rawPace, _index, ...cand }) => cand);
 
   return {
     role,

@@ -8,10 +8,10 @@ import {
   ULW_RE, MENTION_RE, STATE_DIR, loadConfig, getMode, readQuotaRows, poolStatus,
   loadPrompt, fmtPool, isEnabled, appendHistory, lastPick, runningWriters, scopesOverlap,
   normScope, withWriteLock, gitSnapshot, workspaceRoot, isInside, writePendingDispatch,
-  readSelfEdits, writeSelfEdits, isScratchPath, divisionReason, resolveRepos, lineSnapshot, writeBashSnap,
-  isRelayRunCommand,
+  readSelfEdits, writeSelfEdits, isScratchPath, blockReason, resolveRepos, lineSnapshot, writeBashSnap,
+  isRelayRunCommand, capsOf,
 } from "./lib.mjs";
-import { BRIEF_TEMPLATE, checkBrief, roleOfBrief, levelOfBrief, buildDispatchPrompt, readSharedContext, scopeOfBrief, needsOfBrief, codexFlagsOf } from "./brief.mjs";
+import { BRIEF_TEMPLATE, checkBrief, roleOfBrief, levelOfBrief, buildDispatchPrompt, readSharedContext, scopeOfBrief, needsWithImages, codexFlagsOf } from "./brief.mjs";
 import { modelTier, tierAllowed, levelEffort, LEVEL_TEXT, TIER_TEXT } from "./score.mjs";
 import { loadModelsCache } from "./models.mjs";
 
@@ -49,7 +49,7 @@ function handleBash(input) {
   if (input.agent_id || !sessionId || getMode() !== "auto") return;
   const stat = readSelfEdits(sessionId);
   if (!stat.decision && stat.bashPending && !isRelay) {
-    deny(divisionReason());
+    deny(blockReason(stat));
     return;
   }
   // relay 自己的命令不拍快照，避免把脚本的输出和仓库扫描搅在一起
@@ -71,7 +71,7 @@ function handleEditGate(input) {
   if (isScratchPath(target)) return;
   const stat = readSelfEdits(sessionId);
   if (stat.decision) return;
-  deny(divisionReason());
+  deny(blockReason(stat));
 }
 
 function deny(reason) {
@@ -154,13 +154,16 @@ function main() {
   }
   const effort = flags.effort || levelEffort(level);
   // 派单写了 Codex 做不到的能力就退回，避免它在断网沙箱里硬做或臆测
-  const needs = needsOfBrief(brief);
-  const codexCaps = prov?.caps || {};
+  const needs = needsWithImages(brief);
+  const codexCaps = capsOf(cfg, prov, usedModel);
   if (needs.includes("web") && codexCaps.web !== true) {
     return deny("[ai-relay] Codex 不具备：联网（沙箱默认断网）。需要联网的部分请先由主控完成或改派 Grok / agy，把结果写进派单背景");
   }
   if (needs.includes("exec") && codexCaps.exec !== true) {
     return deny("[ai-relay] Codex 不具备：执行命令。需要执行命令的部分请先由主控完成或改派有能力的模型，把结果写进派单背景");
+  }
+  if (needs.includes("vision") && codexCaps.vision !== true) {
+    return deny("[ai-relay] Codex 不具备：看图。带图的部分请改派能看图的模型（relay pick <角色> --needs vision），或由主控看图后把结论写进派单背景。");
   }
   const WRITE_ROLES = new Set(["implement", "debug", "claude-backup"]);
   const forceReadOnly = brief.split(/\r?\n/).some((line) => /^[ \t]*权限\s*[:：]\s*只读[ \t]*$/.test(line));
@@ -232,9 +235,9 @@ function main() {
   } else {
     appendHistory(historyEntry);
   }
-  // 检查都过了、记录也落了：这一轮算已经外派，后面主模型改代码不再拦
+  // 检查都过了、记录也落了：只有可写派单才算定分工，只读审查不算
   const sessionId = String(input.session_id ?? "").trim();
-  if (sessionId && !input.agent_id) {
+  if (write && sessionId && !input.agent_id) {
     try {
       const stat = readSelfEdits(sessionId);
       if (!stat.decision) {

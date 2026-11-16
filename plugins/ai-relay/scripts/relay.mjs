@@ -8,28 +8,55 @@ import { spawn, spawnSync, execFileSync } from "node:child_process";
 import {
   RELAY_SCRIPT, JOBS_DIR, MODES, PLUGIN_ROOT, STATE_DIR, ROLE_TEXT, isEnabled, loadConfig, quotaSource, readHistory, getMode, setMode, readQuotaRows, poolStatus,
   providerPools, poolOfModel, resolveModel, fmtPool, fmtTime, resolveBin, ensureStateDir,
+  hasProviderKey, loadSecrets, maskSecretValue, normalizeBaseUrl, saveSecrets, secretsPath,
   allJobRecords, setVerdict, VERDICTS, recordPick, pickReason, capsOf, fullAccessOn, fullAccessSupported, cleanup, storageUsage, RETENTION_DAYS,
   runningWriters, scopesOverlap, normScope, isPathInScope, withWriteLock, gitSnapshot, claimPendingDispatch,
   parseGitStatusPath, parseGitStatusPaths, diffSnapshots, checkOutOfScope, workspaceRoot,
-  getWorkspaceActivityMtime,
+  getWorkspaceActivityMtime, recordMeteredUsage, meteredUsedToday, meteredCapReached,
 } from "./lib.mjs";
 import { refreshCache, refreshGrok, loadCache } from "./quota.mjs";
 import { scoreRoute, parseLevel, modelTier, tierAllowed, levelEffort, LEVEL_TEXT, TIER_TEXT } from "./score.mjs";
 import {
   getModels, loadModelsCache, findModelPool, setProviderDefaultModel, buildModelPools,
 } from "./models.mjs";
-import { usageForJob, backfill, attachLiveUsage, getSessionActivityMtime } from "./usage.mjs";
+import { usageForJob, usageFromOutputJson, parseClaudeOutput, backfill, attachLiveUsage, getSessionActivityMtime } from "./usage.mjs";
 import {
   BRIEF_TEMPLATE, checkBrief, roleOfBrief, levelOfBrief, buildDispatchPrompt, readSharedContext, writeSharedContext, clearSharedContext,
-  attachJobs, gitDiff, projectContext, scopeOfBrief, needsOfBrief, helpRequestOf,
+  attachJobs, gitDiff, projectContext, scopeOfBrief, needsWithImages, helpRequestOf,
 } from "./brief.mjs";
 
 // 按打分选模型：擅长度 × 额度（含快到期加成）× 历史可靠度（含验收结论）× 速度
 // write / target / workspace 原样传给打分，缺了就不做沙箱检查
 // needs 是这次要的能力（web / exec），缺的厂商由打分跳过
 // level 是任务难度，决定候选模型的最低档位和打分侧重；downgrade 为真时门槛降一档；exactModel 时不按难度换 low/medium/high
+// 按量计费厂商当天用量到上限后，自动选人把它从首选和备选移到跳过（点名厂商不拦）。
 function route(cfg, rows, role, only, { write, target, workspace, needs, level, downgrade, exactModel } = {}) {
-  return scoreRoute(cfg, rows, role, { only, history: allJobRecords(), write, target, workspace, needs, level, downgrade, exactModel });
+  if (only) return scoreRoute(cfg, rows, role, { only, history: allJobRecords(), write, target, workspace, needs, level, downgrade, exactModel });
+  const r = scoreRoute(cfg, rows, role, { history: allJobRecords(), write, target, workspace, needs, level, downgrade, exactModel });
+  const capped = new Set();
+  const keep = [];
+  for (const cand of [r.choice, ...r.alternatives]) {
+    if (!cand) continue;
+    if (meteredCapReached(cfg, cand.provider)) {
+      capped.add(cand.provider);
+      r.skipped.push({
+        provider: cand.provider,
+        pool: cand.pool,
+        model: cand.model,
+        routeModel: cand.routeModel,
+        via: cand.via,
+        status: cand.status,
+        why: "今日按量用量已到上限",
+      });
+    } else {
+      keep.push(cand);
+    }
+  }
+  r.choice = keep[0] || null;
+  r.alternatives = keep.slice(1);
+  // 上限到顶的厂商，其余候选同样不参与（无论它在 ordered 里出现与否，scoreRoute 已经把 candidate 都放进了 choice/alternatives）
+  r.skipped = r.skipped.filter((s) => !capped.has(s.provider) || s.why === "今日按量用量已到上限");
+  return r;
 }
 
 const LEVEL_HELP = "难度必填：派单里写一行「难度：简单|中等|困难」，或加 --level 简单|中等|困难。简单：照样子改、补注释、整理资料，派便宜、额度多的轻档；中等：常规实现和排查；困难：跨模块设计、疑难排查，只派强档";
@@ -55,7 +82,7 @@ const CODEX_PLUGIN_ID = "codex@openai-codex";
 
 function parseArgs(argv) {
   const opts = { _: [] };
-  const valueFlags = new Set(["--role", "--model", "--cwd", "--prompt-file", "--timeout", "--provider", "--json-spec", "--preset", "--claude-json", "--limit", "--with", "--scope", "--target", "--needs", "--idle-timeout", "--max-runtime", "--verdict", "--level", "--downgrade"]);
+  const valueFlags = new Set(["--role", "--model", "--cwd", "--prompt-file", "--timeout", "--provider", "--json-spec", "--preset", "--claude-json", "--limit", "--with", "--scope", "--target", "--needs", "--idle-timeout", "--max-runtime", "--verdict", "--level", "--downgrade", "--add", "--remove"]);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--") {
@@ -78,11 +105,11 @@ function readStdin() {
   }
 }
 
-// --needs web,exec。只认这两项，顺序固定，方便和打分里的文案对齐
+// --needs web,exec,vision。顺序固定，方便和打分里的文案对齐
 function parseNeedsFlag(raw) {
   if (!raw || raw === true) return [];
   const wanted = new Set(String(raw).split(/[,，]/).map((s) => s.trim().toLowerCase()).filter(Boolean));
-  return ["web", "exec"].filter((k) => wanted.has(k));
+  return ["web", "exec", "vision"].filter((k) => wanted.has(k));
 }
 
 function missingNeedLabels(caps, needs) {
@@ -90,6 +117,7 @@ function missingNeedLabels(caps, needs) {
   const labels = [];
   if (needs.includes("web") && caps?.web !== true) labels.push("联网");
   if (needs.includes("exec") && caps?.exec !== true) labels.push("执行命令");
+  if (needs.includes("vision") && caps?.vision !== true) labels.push("看图");
   return labels;
 }
 
@@ -101,7 +129,15 @@ function cmdStatus(opts) {
   const pools = [];
   for (const [name, prov] of Object.entries(cfg.providers)) {
     for (const pool of providerPools(prov)) {
-      pools.push({ name, label: prov.label, via: prov.via || (prov.self ? "self" : ""), enabled: isEnabled(prov), source: quotaSource(cfg, prov.quota.provider, pool), ...poolStatus(cfg, rows, prov.quota.provider, pool) });
+      pools.push({
+        name,
+        label: prov.label,
+        via: prov.via || (prov.self ? "self" : ""),
+        enabled: isEnabled(prov),
+        source: quotaSource(cfg, prov.quota.provider, pool),
+        ...(prov.billing === "metered" ? { billing: "metered" } : {}),
+        ...poolStatus(cfg, rows, prov.quota.provider, pool),
+      });
     }
   }
   const picks = Object.keys(cfg.routes || {}).map((role) => route(cfg, rows, role));
@@ -117,7 +153,7 @@ function cmdStatus(opts) {
   console.log("\n额度：");
   for (const p of pools) {
     const mark = p.enabled ? { ok: "🟢", low: "🟡", blocked: "🔴", unknown: "⚪" }[p.level] : "⏸";
-    console.log(`  ${mark} ${p.label} [${p.name}/${p.pool}]  ${p.enabled ? fmtPool(p) : "已停用"}  （来源：${p.source}）`);
+    console.log(`  ${mark} ${p.label} [${p.name}/${p.pool}]  ${p.enabled ? quotaText(cfg, p.name, p) : "已停用"}  （来源：${p.source}）`);
   }
   console.log("\n当前各类任务的首选：");
   for (const r of picks) {
@@ -155,10 +191,9 @@ function cmdMode(opts) {
   }
   const prev = getMode();
   setMode(target);
-  console.log(`ai-relay 模式：${prev} → ${target}`);
-  if ((prev === "off") !== (target === "off") || opts.sync) {
+  console.log(`ai-relay 模式：${prev} → ${target}，从下一条消息起生效`);
+  if (opts.sync) {
     console.log(togglePlugin(target !== "off"));
-    console.log("插件启停在新会话中完全生效；当前会话内 ai-relay 钩子已立即按新模式执行。");
   }
 }
 
@@ -196,7 +231,7 @@ function cmdPick(opts) {
     process.exit(3);
   }
   const c = r.choice;
-  console.log(`${role}（难度${LEVEL_TEXT[level]}）→ ${c.provider} / ${c.pool} / ${c.model}（${TIER_TEXT[c.tier]}）  [${fmtPool(c.status)}]`);
+  console.log(`${role}（难度${LEVEL_TEXT[level]}）→ ${c.provider} / ${c.pool} / ${c.model}（${TIER_TEXT[c.tier]}）  [${quotaText(cfg, c.provider, c.status)}]`);
   console.log(`  理由：${c.reason}`);
   if (c.via === "codex-plugin") {
     const flags = [c.model && c.model !== "default" ? `--model ${c.model}` : "", `--effort ${levelEffort(level)}`].filter(Boolean).join(" ");
@@ -206,28 +241,113 @@ function cmdPick(opts) {
     const down = opts.downgrade ? ` --downgrade "${String(opts.downgrade === true ? "<原因>" : opts.downgrade).replace(/"/g, '\\"')}"` : "";
     console.log(`→ relay run ${c.provider} --role ${role} --model ${c.model}${down} --cwd <项目根> <<'RELAY_EOF' …派单（含「难度：${LEVEL_TEXT[level]}」）… RELAY_EOF`);
   }
-  for (const a of r.alternatives) console.log(`  备选：${a.provider} / ${a.model}  [${fmtPool(a.status)}]  ${a.reason}`);
-  for (const s of r.skipped) console.log(`  跳过：${s.provider} / ${s.model}  ${s.why}  [${fmtPool(s.status)}]`);
+  for (const a of r.alternatives) console.log(`  备选：${a.provider} / ${a.model}  [${quotaText(cfg, a.provider, a.status)}]  ${a.reason}`);
+  for (const s of r.skipped) console.log(`  跳过：${s.provider} / ${s.model}  ${s.why}  [${quotaText(cfg, s.provider, s.status)}]`);
+}
+
+// 按量计费没有剩余比例。排序仍按额度未知处理，只把展示改成「按量计费」。
+// relay status 对按量厂商多显示一行：按量计费 · 今日 N 万 token / 上限 M 万
+function quotaText(cfg, providerName, st) {
+  const prov = cfg.providers?.[providerName];
+  if (prov?.billing === "metered") {
+    if (st?.level !== "unknown") return fmtPool(st);
+    const cap = Number(cfg.meteredDailyTokenCap ?? 20_000_000);
+    const used = meteredUsedToday(providerName);
+    const wan = (n) => {
+      const v = n / 10_000;
+      return Number.isInteger(v) ? String(v) : String(Math.round(v * 10) / 10);
+    };
+    return `按量计费 · 今日 ${wan(used)} 万 token / 上限 ${wan(cap)} 万`;
+  }
+  return fmtPool(st);
 }
 
 // ---------- run ----------
-function buildCommand(cfg, job) {
+// 拼出命令行参数。fullAccessWriteOnly 的厂商：只读永远只用 read；可写在最高权限打开时用 fullAccess 换掉 write。
+// 没有这个字段的厂商保持原来的顺序：read/write、cwd、再追加 fullAccess。
+export function assembleArgs(cfg, job) {
   const prov = cfg.providers[job.provider];
   const cli = prov.cli;
-  const bin = resolveBin(cli.bin);
-  if (!bin) throw new Error(`找不到 ${cli.bin} 命令，请确认已安装并登录`);
   const actualModel = resolveModel(cfg, job.provider, job.pool || poolOfModel(prov, job.model), job.model);
   // 占位符只按整个参数匹配，避免任务文本里的 {model} 之类被误替换
   const vars = { "{prompt}": job.wrappedPrompt, "{model}": actualModel, "{cwd}": job.cwd };
   const fill = (arr) => (arr || []).map((s) => (s in vars ? vars[s] : s));
   const args = [];
   if (actualModel && actualModel !== "default") args.push(...fill(cli.model));
-  args.push(...fill(job.write ? cli.write : cli.read));
-  if (cli.cwd) args.push(...fill(cli.cwd));
-  // 员工最高权限（默认开）：不再逐个批准命令；安全靠派单里的硬性规则和事后的越界检查
-  if (fullAccessOn(cfg, prov)) args.push(...fill(cli.fullAccess));
+  if (cli.fullAccessWriteOnly) {
+    if (job.write && fullAccessOn(cfg, prov)) args.push(...fill(cli.fullAccess));
+    else args.push(...fill(job.write ? cli.write : cli.read));
+    if (cli.cwd) args.push(...fill(cli.cwd));
+  } else {
+    args.push(...fill(job.write ? cli.write : cli.read));
+    if (cli.cwd) args.push(...fill(cli.cwd));
+    // 员工最高权限（默认开）：不再逐个批准命令；安全靠派单里的硬性规则和事后的越界检查
+    if (fullAccessOn(cfg, prov)) args.push(...fill(cli.fullAccess));
+  }
   args.push(...fill(cli.prompt));
-  return { bin, args };
+  return args;
+}
+
+export function buildCommand(cfg, job) {
+  const cli = cfg.providers[job.provider].cli;
+  const bin = resolveBin(cli.bin);
+  if (!bin) throw new Error(`找不到 ${cli.bin} 命令，请确认已安装并登录`);
+  return { bin, args: assembleArgs(cfg, job) };
+}
+
+function fillPlaceholder(text, vars) {
+  let out = String(text);
+  for (const [key, value] of Object.entries(vars)) {
+    if (out === key) return value;
+    if (out.includes(key)) out = out.split(key).join(value);
+  }
+  return out;
+}
+
+// 厂商配了 env / envUnset 时，在继承的环境上覆盖和删除。没配的厂商不传 env，行为和原来一样。
+// 返回的 secret 只用于打码，不能写进任务文件。
+export function resolveJobEnv(cfg, job, secrets) {
+  const prov = cfg?.providers?.[job?.provider];
+  const envSpec = prov?.env;
+  const unsetSpec = prov?.envUnset;
+  const hasEnv = !!envSpec && typeof envSpec === "object" && !Array.isArray(envSpec) && Object.keys(envSpec).length > 0;
+  const hasUnset = Array.isArray(unsetSpec) && unsetSpec.length > 0;
+  if (!hasEnv && !hasUnset) return { env: undefined, secret: "" };
+
+  let secret = "";
+  if (hasEnv && Object.values(envSpec).some((value) => String(value).includes("{secret}"))) {
+    const secretName = prov?.endpoint?.secret || job.provider;
+    secret = secrets?.[secretName] || "";
+    if (!secret) throw new Error(`还没有密钥。请运行 relay provider key ${job.provider}`);
+  }
+  const env = { ...process.env };
+  if (hasEnv) {
+    const baseUrl = prov?.endpoint?.baseUrl || "";
+    for (const [key, value] of Object.entries(envSpec)) {
+      env[key] = fillPlaceholder(value, { "{baseUrl}": baseUrl, "{secret}": secret });
+    }
+  }
+  if (hasUnset) {
+    for (const key of unsetSpec) delete env[key];
+  }
+  return { env, secret };
+}
+
+function expectsJsonOutput(prov) {
+  const prompt = prov?.cli?.prompt;
+  if (!Array.isArray(prompt)) return false;
+  for (let i = 0; i < prompt.length - 1; i++) {
+    if (prompt[i] === "--output-format" && prompt[i + 1] === "json") return true;
+  }
+  return false;
+}
+
+// 只认带 result / is_error / usage 的对象。别的 JSON 原样当文本。
+function claudeResultOf(stdout) {
+  const data = parseClaudeOutput(stdout);
+  if (!data) return null;
+  if (!Object.prototype.hasOwnProperty.call(data, "result") && data.is_error !== true && !data.usage) return null;
+  return data;
 }
 
 function jobPath(id, ext = "json", customDir = null) {
@@ -288,7 +408,7 @@ export function formatTimeoutReason(job) {
 
 // 真正执行 CLI（前台或后台 worker 共用）
 export async function executeJob(job, testOpts = {}) {
-  const cfg = loadConfig();
+  const cfg = testOpts.cfg || loadConfig();
   const idleTimeoutMin = Number(job.idleTimeoutMin ?? cfg.idleTimeoutMin ?? 20);
   const maxRuntimeMin = Number(job.maxRuntimeMin ?? cfg.maxRuntimeMin ?? cfg.jobTimeoutMinutes ?? 240);
   const idleTimeoutMs = job.idleTimeoutMs ?? testOpts.idleTimeoutMs ?? (idleTimeoutMin * 60_000);
@@ -298,27 +418,37 @@ export async function executeJob(job, testOpts = {}) {
   job.idleTimeoutMin = idleTimeoutMin;
   job.maxRuntimeMin = maxRuntimeMin;
 
-  let bin, args;
-  if (testOpts.bin || job._bin) {
-    bin = testOpts.bin || job._bin;
-    args = testOpts.args || job._args || [];
-  } else {
-    try {
+  let bin;
+  let args;
+  let spawnEnv;
+  let taskSecret = "";
+  try {
+    const prov = cfg.providers?.[job.provider];
+    const needsSecret = !!prov?.env && Object.values(prov.env).some((value) => String(value).includes("{secret}"));
+    const secrets = testOpts.secrets || (needsSecret ? loadSecrets() : {});
+    ({ env: spawnEnv, secret: taskSecret } = resolveJobEnv(cfg, job, secrets));
+    if (testOpts.bin || job._bin) {
+      bin = testOpts.bin || job._bin;
+      args = testOpts.args || job._args || [];
+    } else {
       ({ bin, args } = buildCommand(cfg, job));
-    } catch (e) {
-      // 启动前就失败（找不到命令等）：记为失败，免得一直占着"运行中"挡住后续可写任务
-      Object.assign(job, { status: "failed", finishedAt: new Date().toISOString(), error: String(e.message || e) });
-      saveJob(job);
-      throw e;
     }
+  } catch (e) {
+    // 启动前就失败（找不到命令、没有密钥等）：记为失败，免得一直占着"运行中"挡住后续可写任务
+    Object.assign(job, { status: "failed", finishedAt: new Date().toISOString(), error: String(e.message || e) });
+    saveJob(job);
+    throw e;
   }
 
   const before = gitSnapshot(job.cwd);
-  const child = spawn(bin, args, {
+  const spawnOpts = {
     cwd: job.cwd,
     stdio: ["ignore", "pipe", "pipe"],
     detached: process.platform !== "win32",
-  });
+  };
+  // 没配 env 的厂商不传，子进程继续继承当前环境
+  if (spawnEnv) spawnOpts.env = spawnEnv;
+  const child = spawn(bin, args, spawnOpts);
 
   job.childPid = child.pid;
   if (!job.pid) job.pid = child.pid;
@@ -426,7 +556,6 @@ export async function executeJob(job, testOpts = {}) {
   const stdoutStr = Buffer.concat(stdoutChunks).toString("utf8");
   const stderrStr = Buffer.concat(stderrChunks).toString("utf8");
   const output = stdoutStr + (stderrStr ? `\n[stderr]\n${stderrStr}` : "");
-  fs.writeFileSync(jobPath(job.id, "log", job._jobsDir), output);
 
   job.exitCode = code;
   if (timedOut) {
@@ -440,8 +569,25 @@ export async function executeJob(job, testOpts = {}) {
   }
   job.finishedAt = new Date().toISOString();
 
-  const usage = usageForJob(job, testOpts);
+  const prov = cfg.providers?.[job.provider];
+  let parsed = null;
+  if (expectsJsonOutput(prov)) {
+    parsed = claudeResultOf(stdoutStr);
+    if (parsed && Object.prototype.hasOwnProperty.call(parsed, "result")) {
+      job.result = typeof parsed.result === "string" ? parsed.result : JSON.stringify(parsed.result);
+    }
+    if (parsed?.is_error === true && job.status === "done") {
+      job.status = "failed";
+      if (!job.error) job.error = "对方返回错误（is_error）";
+    }
+  }
+
+  const usage = (parsed && usageFromOutputJson(parsed)) || usageForJob(job, testOpts);
   if (usage) job.usage = usage;
+  // 按量计费厂商的任务结束后，把本次输入 + 输出 token 累计到当天用量里（供每日上限判断和 status 展示）
+  if (cfg.providers?.[job.provider]?.billing === "metered" && usage && Number.isFinite(usage.input + usage.output)) {
+    recordMeteredUsage(job.provider, usage.input + usage.output);
+  }
   if (before !== null && after !== null) {
     job.changedFiles = diffSnapshots(before, after);
   }
@@ -455,8 +601,12 @@ export async function executeJob(job, testOpts = {}) {
   job.permissionDenied = /permission required|auto-denied|cannot (ask|prompt) for/i.test(output);
   // 权限被拒后中断、没有产出：即使退出码为 0 也算失败
   if (job.status === "done" && job.permissionDenied && !stdoutStr.trim()) job.status = "failed";
-  // 日志落盘后再抽协助请求，result / jobs 都能读到同一份
-  job.helpRequest = helpRequestOf(output);
+  // 写日志和结果前打掉本任务密钥的原值。标准错误留在日志里，结果只取 JSON 的 result。
+  const maskedLog = maskSecretValue(output, taskSecret);
+  if (typeof job.result === "string") job.result = maskSecretValue(job.result, taskSecret);
+  if (typeof job.error === "string") job.error = maskSecretValue(job.error, taskSecret);
+  fs.writeFileSync(jobPath(job.id, "log", job._jobsDir), maskedLog);
+  job.helpRequest = helpRequestOf(typeof job.result === "string" ? job.result : maskedLog);
   saveJob(job);
   return job;
 }
@@ -492,7 +642,7 @@ export function printJob(job) {
   if (job.helpRequest) {
     console.log(`\n⚠️ 对方请求主控协助：\n${job.helpRequest}\n请决定：自己用工具完成后用 --with 带上结果重派，或改派有能力的模型，或请用户处理。`);
   }
-  let out = job.output;
+  let out = typeof job.result === "string" ? job.result : job.output;
   if (out === undefined) {
     try {
       out = fs.readFileSync(jobPath(job.id, "log", job._jobsDir), "utf8");
@@ -547,7 +697,7 @@ async function cmdRun(opts) {
   }
   const downgrade = opts.downgrade ? String(opts.downgrade) : "";
   // --needs 优先；否则从派单「需要的能力」读。空数组表示不按能力筛选
-  const needs = opts.needs ? parseNeedsFlag(opts.needs) : needsOfBrief(task);
+  const needs = opts.needs ? parseNeedsFlag(opts.needs) : needsWithImages(task);
 
   let provName = opts._[1];
   const rows = readQuotaRows(cfg);
@@ -592,7 +742,7 @@ async function cmdRun(opts) {
 
   const prov = cfg.providers[provName];
   if (!prov) throw new Error(`未知提供方 ${provName}，可选：${Object.keys(cfg.providers).join(", ")}`);
-  const missingNeeds = missingNeedLabels(capsOf(cfg, prov), needs);
+  const missingNeeds = missingNeedLabels(capsOf(cfg, prov, opts.model || model), needs);
   if (missingNeeds.length) {
     console.error(`${provName} 不具备：${missingNeeds.join("、")}；需要这项能力的部分请改派，或由主控先完成后把结果写进背景`);
     process.exit(3);
@@ -635,6 +785,11 @@ async function cmdRun(opts) {
     throw new Error(`模型 ${model} 不在 ${provName} 的配置里，可选：${allowed.join(", ")}`);
   }
   model = resolveModel(cfg, provName, pool, model);
+  const missingNeedsAfter = missingNeedLabels(capsOf(cfg, prov, model), needs);
+  if (missingNeedsAfter.length) {
+    console.error(`${provName} 不具备：${missingNeedsAfter.join("、")}；需要这项能力的部分请改派，或由主控先完成后把结果写进背景`);
+    process.exit(3);
+  }
   // 点名的厂商和模型也要过难度门槛：档位不够就退回，不悄悄派
   const tier = modelTier(cfg, provName, model);
   if (!tierAllowed(level, tier, !!downgrade)) {
@@ -646,7 +801,7 @@ async function cmdRun(opts) {
 
   const st = poolStatus(cfg, rows, prov.quota.provider, pool);
   if (st.level === "blocked" && !opts.force) {
-    console.error(`${provName}/${pool} 额度不足：${fmtPool(st)}。可换模型或加 --force 强制`);
+    console.error(`${provName}/${pool} 额度不足：${quotaText(cfg, provName, st)}。可换模型或加 --force 强制`);
     process.exit(3);
   }
 
@@ -690,9 +845,9 @@ async function cmdRun(opts) {
       shared: readSharedContext(STATE_DIR, cwd),
       attachments: withJobs.length ? attachJobs(withJobs) : null,
       diff: opts.diff ? gitDiff(cwd) : null,
-      caps: capsOf(cfg, prov),
+      caps: capsOf(cfg, prov, model),
     }),
-    status: "running", startedAt: new Date().toISOString(), quotaAtStart: fmtPool(st),
+    status: "running", startedAt: new Date().toISOString(), quotaAtStart: quotaText(cfg, provName, st),
   };
 
   // 真正落盘时才认领。写入范围冲突时任务不会创建，记录留给下一次。
@@ -972,33 +1127,44 @@ function providerRoles(cfg, name) {
     .map(([role]) => role);
 }
 
+export function summarizeProvider(cfg, name, prov, secrets) {
+  const bin = prov.cli?.bin || (prov.via === "codex-plugin" ? "codex" : prov.self ? "claude" : "");
+  const item = {
+    name,
+    label: prov.label || name,
+    via: prov.via || (prov.self ? "self" : ""),
+    enabled: isEnabled(prov),
+    // 主控 Claude 不能停用或删除；Codex 走官方插件，只能停用不能删除
+    canDisable: !prov.self,
+    canRemove: !prov.self && prov.via !== "codex-plugin",
+    canTest: prov.via === "relay",
+    bin,
+    binFound: bin ? !!resolveBin(bin) : false,
+    models: Object.values(prov.pools || {}).flat(),
+    modelPools: buildModelPools(cfg, name, prov),
+    roles: providerRoles(cfg, name),
+    note: prov.note || "",
+    // 最高权限开关：只有配了 cli.fullAccess 的员工能开关
+    fullAccess: {
+      supported: fullAccessSupported(prov),
+      enabled: fullAccessOn(cfg, prov),
+      note: prov.self ? "主模型的权限在输入框的模式菜单里设置" : prov.via === "codex-plugin" ? "由 Codex 插件固定为只能写当前项目的沙箱" : fullAccessSupported(prov) ? "" : "这家没有配置最高权限参数",
+    },
+    // 只报有没有密钥，不带出密钥原文，也不带出 endpoint.secret 这个名字里的值
+    hasKey: hasProviderKey(prov, secrets),
+    caps: capsOf(cfg, prov),
+  };
+  if (prov.billing) item.billing = prov.billing;
+  if (prov.endpoint?.baseUrl) item.endpoint = { baseUrl: prov.endpoint.baseUrl };
+  if (prov.modelCaps && typeof prov.modelCaps === "object") item.modelCaps = prov.modelCaps;
+  else if (prov.endpoint) item.modelCaps = {};
+  return item;
+}
+
 function cmdProviders(opts) {
   const cfg = loadConfig();
-  const list = Object.entries(cfg.providers).map(([name, prov]) => {
-    const bin = prov.cli?.bin || (prov.via === "codex-plugin" ? "codex" : prov.self ? "claude" : "");
-    return {
-      name,
-      label: prov.label || name,
-      via: prov.via || (prov.self ? "self" : ""),
-      enabled: isEnabled(prov),
-      // 主控 Claude 不能停用或删除；Codex 走官方插件，只能停用不能删除
-      canDisable: !prov.self,
-      canRemove: !prov.self && prov.via !== "codex-plugin",
-      canTest: prov.via === "relay",
-      bin,
-      binFound: bin ? !!resolveBin(bin) : false,
-      models: Object.values(prov.pools || {}).flat(),
-      modelPools: buildModelPools(cfg, name, prov),
-      roles: providerRoles(cfg, name),
-      note: prov.note || "",
-      // 最高权限开关：只有配了 cli.fullAccess 的员工能开关
-      fullAccess: {
-        supported: fullAccessSupported(prov),
-        enabled: fullAccessOn(cfg, prov),
-        note: prov.self ? "主模型的权限在输入框的模式菜单里设置" : prov.via === "codex-plugin" ? "由 Codex 插件固定为只能写当前项目的沙箱" : fullAccessSupported(prov) ? "" : "这家没有配置最高权限参数",
-      },
-    };
-  });
+  const secrets = loadSecrets();
+  const list = Object.entries(cfg.providers).map(([name, prov]) => summarizeProvider(cfg, name, prov, secrets));
   if (opts.json) {
     console.log(JSON.stringify({ providers: list, roles: Object.keys(cfg.routes || {}).map((r) => ({ key: r, text: ROLE_TEXT[r] || r })), presets: loadPresets() }, null, 2));
     return;
@@ -1033,12 +1199,152 @@ function setFullAccess(name, value) {
   console.log(`${prov.label || name} 最高权限已${value === "on" ? "开启：执行命令不再逐个审批" : "关闭：只能改文件，不能执行命令"}`);
 }
 
+const ENDPOINT_ROUTE_FIT = {
+  implement: { mid: 0.75, light: 0.5 },
+  review: { mid: 0.75, light: 0.5 },
+  debug: { mid: 0.65 },
+  deep: { mid: 0.65 },
+  read: { light: 0.8, mid: 0.7 },
+  quick: { light: 0.8 },
+};
+const MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+function endpointModelTier(modelId) {
+  return /flash|lite/i.test(modelId) ? "light" : "mid";
+}
+
+function endpointModelsOf(spec, fallback) {
+  const raw = spec.models === undefined ? fallback : spec.models;
+  const list = Array.isArray(raw) ? raw : String(raw ?? "").split(/[\s,，]+/);
+  const models = [];
+  for (const item of list) {
+    const id = String(item ?? "").trim();
+    if (!id || models.includes(id)) continue;
+    if (!MODEL_ID_RE.test(id)) throw new Error(`模型 id 不合法：${id}`);
+    models.push(id);
+  }
+  return models;
+}
+
+function buildEndpointEnv(preset, models) {
+  const src = preset.env || {};
+  const light = models.find((id) => endpointModelTier(id) === "light");
+  const env = {
+    ANTHROPIC_BASE_URL: src.ANTHROPIC_BASE_URL || "{baseUrl}",
+    ANTHROPIC_API_KEY: src.ANTHROPIC_API_KEY || "{secret}",
+  };
+  if (light) env.ANTHROPIC_SMALL_FAST_MODEL = light;
+  for (const [key, value] of Object.entries(src)) {
+    if (key in env) continue;
+    env[key] = value;
+  }
+  return env;
+}
+
+function pickEndpointDefault(models) {
+  return models.find((id) => endpointModelTier(id) === "mid") || models[0] || null;
+}
+
+// 按白名单重写这一家的档位和路由。先清掉自己的旧条目再追加，重复添加不会叠出两份。
+function rebuildEndpointRouting(cfg, name, models) {
+  if (!cfg.modelTiers || typeof cfg.modelTiers !== "object" || Array.isArray(cfg.modelTiers)) cfg.modelTiers = {};
+  for (const key of Object.keys(cfg.modelTiers)) {
+    if (key.startsWith(`${name}:`)) delete cfg.modelTiers[key];
+  }
+  for (const id of models) cfg.modelTiers[`${name}:${id}`] = endpointModelTier(id);
+
+  const lights = models.filter((id) => endpointModelTier(id) === "light");
+  const mids = models.filter((id) => endpointModelTier(id) !== "light");
+  for (const role of Object.keys(cfg.routes || {})) {
+    cfg.routes[role] = (cfg.routes[role] || []).filter((entry) => !String(entry).startsWith(`${name}:`));
+  }
+  for (const [role, fit] of Object.entries(ENDPOINT_ROUTE_FIT)) {
+    if (!Array.isArray(cfg.routes?.[role])) continue;
+    const ordered = [];
+    if (role === "read") {
+      for (const id of lights) if (fit.light != null) ordered.push([id, fit.light]);
+      for (const id of mids) if (fit.mid != null) ordered.push([id, fit.mid]);
+    } else {
+      for (const id of mids) if (fit.mid != null) ordered.push([id, fit.mid]);
+      for (const id of lights) if (fit.light != null) ordered.push([id, fit.light]);
+    }
+    for (const [id, score] of ordered) cfg.routes[role].push(`${name}:${name}:${id}:${score}`);
+  }
+}
+
+function syncEndpointSideFields(prov, pool, models) {
+  const current = prov.defaultModels?.[pool];
+  const next = current && models.includes(current) ? current : pickEndpointDefault(models);
+  if (!prov.defaultModels) prov.defaultModels = {};
+  if (next) prov.defaultModels[pool] = next;
+  else delete prov.defaultModels[pool];
+  if (prov.env && typeof prov.env === "object") {
+    const light = models.find((id) => endpointModelTier(id) === "light");
+    if (light) prov.env.ANTHROPIC_SMALL_FAST_MODEL = light;
+    else delete prov.env.ANTHROPIC_SMALL_FAST_MODEL;
+  }
+}
+
+function isEndpointPreset(name, preset) {
+  return name === "endpoint" || preset?.kind === "endpoint";
+}
+
+function addEndpointProvider(cfg, spec, preset) {
+  const name = String(spec.name || "").trim().toLowerCase();
+  if (!NAME_RE.test(name)) throw new Error("标识只能用小写字母、数字和短横线，以字母开头，2–24 个字符，例如 maas");
+  if (cfg.providers[name]) throw new Error(`已存在名为 ${name} 的厂商，换个标识或先删除旧的`);
+  if (!preset?.cli?.prompt?.includes("{prompt}")) throw new Error("自定义接口模板缺少 {prompt} 占位");
+  const baseUrl = normalizeBaseUrl(spec.baseUrl);
+  const models = endpointModelsOf(spec, []);
+  if (!models.length) throw new Error("至少要填一个模型");
+  const pool = name;
+  const cli = structuredClone(preset.cli);
+  cli.bin = preset.cli.bin || "claude";
+  const known = preset?.knownModelCaps || {};
+  const modelCaps = {};
+  for (const m of models) {
+    if (known[m]) {
+      modelCaps[m] = structuredClone(known[m]);
+    }
+  }
+  cfg.providers[name] = {
+    label: String(spec.label || preset.label || name).trim() || name,
+    via: "relay",
+    billing: preset.billing || "metered",
+    endpoint: { baseUrl, secret: name },
+    quota: { provider: name, pools: [pool] },
+    cli,
+    env: buildEndpointEnv(preset, models),
+    envUnset: Array.isArray(preset.envUnset) ? [...preset.envUnset] : ["ANTHROPIC_AUTH_TOKEN", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"],
+    pools: { [pool]: models },
+    caps: structuredClone(preset.caps || { web: false, exec: false, vision: false }),
+    modelCaps,
+    modelList: structuredClone(preset.modelList || { format: "openai-http" }),
+    ...(preset.note ? { note: preset.note } : {}),
+  };
+  syncEndpointSideFields(cfg.providers[name], pool, models);
+  rebuildEndpointRouting(cfg, name, models);
+  return cfg.providers[name];
+}
+
 // 新增厂商：spec 来自面板表单（JSON），或 --preset 加少量覆盖参数
 function cmdProviderAdd(opts) {
   const presets = loadPresets();
   let spec = opts.jsonSpec ? JSON.parse(opts.jsonSpec) : {};
-  const preset = presets[spec.preset || opts.preset || "custom"];
-  if (!preset) throw new Error(`未知模板 ${spec.preset || opts.preset}，可选：${Object.keys(presets).join(", ")}`);
+  const presetName = spec.preset || opts.preset || "custom";
+  const preset = presets[presetName];
+  if (!preset) throw new Error(`未知模板 ${presetName}，可选：${Object.keys(presets).join(", ")}`);
+  if (isEndpointPreset(presetName, preset)) {
+    const name = String(spec.name || opts._[2] || "").trim().toLowerCase();
+    spec = { ...spec, name };
+    const cfg = loadConfig();
+    const prov = addEndpointProvider(cfg, spec, preset);
+    saveConfig(cfg);
+    const found = resolveBin(prov.cli.bin);
+    console.log(`已添加 ${prov.label}（${name}）。按量计费，密钥还没写入配置。请运行 relay provider key ${name}`);
+    if (!found) console.log(`⚠️ 本机还没找到 ${prov.cli.bin} 命令${preset.install ? `。${preset.install}` : ""}`);
+    return;
+  }
   const name = String(spec.name || opts._[2] || "").trim().toLowerCase();
   if (!NAME_RE.test(name)) throw new Error("标识只能用小写字母、数字和短横线，以字母开头，2–24 个字符，例如 kimi");
   const cfg = loadConfig();
@@ -1083,6 +1389,11 @@ function cmdProviderRemove(opts) {
   if (prov.via === "codex-plugin") throw new Error("Codex 走官方插件，不能删除，只能停用");
   delete cfg.providers[name];
   for (const r of Object.keys(cfg.routes || {})) cfg.routes[r] = cfg.routes[r].filter((e) => !e.startsWith(`${name}:`));
+  if (cfg.modelTiers && typeof cfg.modelTiers === "object") {
+    for (const key of Object.keys(cfg.modelTiers)) {
+      if (key.startsWith(`${name}:`)) delete cfg.modelTiers[key];
+    }
+  }
   saveConfig(cfg);
   console.log(`已删除 ${prov.label || name}，并从所有角色路由中移除（旧配置备份在 ${cfg._file}.bak）`);
 }
@@ -1102,9 +1413,13 @@ function cmdProviderTest(opts) {
   const started = Date.now();
   let result;
   try {
-    const { bin, args } = buildCommand(cfg, { provider: name, pool: firstPool, model, write: false, cwd, wrappedPrompt: "这是连通性测试：不要读写任何文件，不要执行命令，只回复两个字：在线" });
-    const res = spawnSync(bin, args, { cwd, encoding: "utf8", timeout: Number(opts.timeout || 120) * 1000, stdio: ["ignore", "pipe", "pipe"] });
-    const out = `${res.stdout || ""}${res.stderr ? `\n${res.stderr}` : ""}`.trim();
+    const job = { provider: name, pool: firstPool, model, write: false, cwd, wrappedPrompt: "这是连通性测试：不要读写任何文件，不要执行命令，只回复两个字：在线" };
+    const { env, secret } = resolveJobEnv(cfg, job, loadSecrets());
+    const { bin, args } = buildCommand(cfg, job);
+    const spawnOpts = { cwd, encoding: "utf8", timeout: Number(opts.timeout || 120) * 1000, stdio: ["ignore", "pipe", "pipe"] };
+    if (env) spawnOpts.env = env;
+    const res = spawnSync(bin, args, spawnOpts);
+    const out = maskSecretValue(`${res.stdout || ""}${res.stderr ? `\n${res.stderr}` : ""}`.trim(), secret);
     const timedOut = res.error?.code === "ETIMEDOUT";
     result = { ok: res.status === 0 && !timedOut && !!(res.stdout || "").trim(), exitCode: res.status, timedOut, seconds: Math.round((Date.now() - started) / 1000), output: out.slice(-400) };
   } catch (e) {
@@ -1117,6 +1432,162 @@ function cmdProviderTest(opts) {
   }
   console.log(`${result.ok ? "✅ 可用" : "❌ 失败"}（${result.timedOut ? "超时" : `退出码 ${result.exitCode}`}，${result.seconds} 秒）\n${result.output}`);
   if (!result.ok) process.exit(5);
+}
+
+function endpointPoolName(prov, name) {
+  const pools = providerPools(prov);
+  if (pools.length !== 1) throw new Error(`${name} 有多个额度池，不能用 provider models 改白名单`);
+  return pools[0];
+}
+
+function assertEndpointProvider(prov, name) {
+  if (prov?.modelList?.format === "openai-http" || prov?.endpoint) return;
+  throw new Error(`${name} 不是自定义接口。默认模型用 provider model`);
+}
+
+// 查看或改自定义接口的模型白名单，并同步档位和路由
+function cmdProviderModels(opts) {
+  const name = opts._[2];
+  if (!name) throw new Error("用法：provider models <厂商> [--add <模型id>] [--remove <模型id>]");
+  const cfg = loadConfig();
+  const prov = cfg.providers?.[name];
+  if (!prov || prov.self) throw new Error(`未知厂商 ${name}`);
+  assertEndpointProvider(prov, name);
+  const pool = endpointPoolName(prov, name);
+  if (!prov.pools) prov.pools = {};
+  if (!Array.isArray(prov.pools[pool])) prov.pools[pool] = [];
+  const adding = opts.add ? String(opts.add).trim() : "";
+  const removing = opts.remove ? String(opts.remove).trim() : "";
+  if (("add" in opts && !adding) || ("remove" in opts && !removing)) {
+    throw new Error("用法：provider models <厂商> [--add <模型id>] [--remove <模型id>]");
+  }
+  if (!adding && !removing) {
+    const models = prov.pools[pool].map((id) => ({ id, tier: endpointModelTier(id) }));
+    if (opts.json) {
+      console.log(JSON.stringify({ provider: name, models }, null, 2));
+      return;
+    }
+    if (!models.length) return console.log(`${name} 还没有启用的模型`);
+    for (const item of models) console.log(`${item.id}  ${item.tier === "light" ? "轻档" : "中档"}`);
+    return;
+  }
+  const hadRemove = removing ? prov.pools[pool].includes(removing) : false;
+  let models = prov.pools[pool].filter((id) => id && id !== removing);
+  const presets = loadPresets();
+  const known = presets?.endpoint?.knownModelCaps || {};
+  if (adding) {
+    if (!MODEL_ID_RE.test(adding)) throw new Error(`模型 id 不合法：${adding}`);
+    if (!models.includes(adding)) models.push(adding);
+    if (known[adding]) {
+      if (!prov.modelCaps) prov.modelCaps = {};
+      prov.modelCaps[adding] = structuredClone(known[adding]);
+    }
+  }
+  if (removing) {
+    if (prov.modelCaps && prov.modelCaps[removing]) {
+      delete prov.modelCaps[removing];
+    }
+  }
+  prov.pools[pool] = models;
+  syncEndpointSideFields(prov, pool, models);
+  rebuildEndpointRouting(cfg, name, models);
+  saveConfig(cfg);
+  if (adding) console.log(`${name} 已启用 ${adding}（${endpointModelTier(adding) === "light" ? "轻档" : "中档"}）`);
+  if (removing) console.log(hadRemove ? `${name} 已移出 ${removing}` : `${name} 的白名单里没有 ${removing}`);
+}
+
+const KEY_FLAG_ALLOW = new Set(["_", "text", "clear", "stdin"]);
+
+function assertNoKeyArgument(opts) {
+  if (opts._.length > 3 || opts.text) {
+    throw new Error("不能把密钥写在命令后面或参数里（会留在历史记录和进程列表里）。请运行 relay provider key <厂商>，在终端里输入，或加 --stdin 从标准输入读");
+  }
+  for (const key of Object.keys(opts)) {
+    if (!KEY_FLAG_ALLOW.has(key)) {
+      throw new Error("不能把密钥写在命令后面或参数里（会留在历史记录和进程列表里）。请运行 relay provider key <厂商>，在终端里输入，或加 --stdin 从标准输入读");
+    }
+  }
+}
+
+function readSecretInteractive(promptText) {
+  return new Promise((resolve) => {
+    process.stderr.write(promptText);
+    const stdin = process.stdin;
+    stdin.setRawMode(true);
+    stdin.resume();
+    stdin.setEncoding("utf8");
+    let buf = "";
+    const cleanup = () => {
+      stdin.removeListener("data", onData);
+      try { stdin.setRawMode(false); } catch {}
+      stdin.pause();
+    };
+    const onData = (ch) => {
+      if (ch === "\u0003") {
+        cleanup();
+        process.stderr.write("\n");
+        process.exit(130);
+      }
+      if (ch === "\r" || ch === "\n" || ch === "\u0004") {
+        cleanup();
+        process.stderr.write("\n");
+        resolve(buf);
+        return;
+      }
+      if (ch === "\u007f" || ch === "\b") {
+        buf = Array.from(buf).slice(0, -1).join("");
+        return;
+      }
+      if (ch.charCodeAt(0) < 32) return;
+      buf += ch;
+    };
+    stdin.on("data", onData);
+  });
+}
+
+function providerSecretName(prov, name) {
+  return prov?.endpoint?.secret || name;
+}
+
+// 密钥只从终端或标准输入读。--clear 删除对应条目。
+async function cmdProviderKey(opts) {
+  const name = opts._[2];
+  if (!name) throw new Error("用法：provider key <厂商> [--stdin] [--clear]");
+  assertNoKeyArgument(opts);
+  const cfg = loadConfig();
+  const prov = cfg.providers?.[name];
+  if (!prov || prov.self) throw new Error(`未知厂商 ${name}`);
+  assertEndpointProvider(prov, name);
+  const secretName = providerSecretName(prov, name);
+  const secrets = loadSecrets();
+  if (opts.clear) {
+    if (Object.prototype.hasOwnProperty.call(secrets, secretName)) {
+      delete secrets[secretName];
+      if (Object.keys(secrets).length === 0) {
+        try { fs.unlinkSync(secretsPath()); } catch {}
+      } else {
+        saveSecrets(secrets);
+      }
+      console.log(`已删除 ${name} 的密钥`);
+    } else {
+      console.log(`${name} 本来就没有密钥`);
+    }
+    return;
+  }
+  let secretText = "";
+  if (opts.stdin) {
+    secretText = readStdin().replace(/\r?\n$/, "");
+    if (secretText.includes("\n") || secretText.includes("\r")) throw new Error("密钥里不能有换行");
+  } else if (process.stdin.isTTY) {
+    secretText = await readSecretInteractive(`请输入 ${name} 的密钥（不会回显）：`);
+  } else {
+    throw new Error("请在终端里运行 relay provider key <厂商>，或加 --stdin 从标准输入传入密钥");
+  }
+  secretText = secretText.trim();
+  if (!secretText) throw new Error("没有读到密钥");
+  secrets[secretName] = secretText;
+  saveSecrets(secrets);
+  console.log(`已保存 ${name} 的密钥`);
 }
 
 // 设置某厂商某额度池的默认模型
@@ -1135,17 +1606,31 @@ async function cmdProviderModel(opts) {
 }
 
 // 拉取或查看各厂商官方 CLI 的可用模型清单
+function withEnabledMarks(cfg, cache) {
+  const out = structuredClone(cache);
+  for (const [name, entry] of Object.entries(out?.providers || {})) {
+    const prov = cfg.providers?.[name];
+    if (prov?.modelList?.format !== "openai-http" || !Array.isArray(entry?.models)) continue;
+    const allow = new Set(Object.values(prov.pools || {}).flat());
+    entry.models = entry.models.map((m) => ({ ...m, enabled: allow.has(m.id) }));
+  }
+  return out;
+}
+
 async function cmdModels(opts) {
   const cfg = loadConfig();
   const cache = await getModels(cfg, { stateDir: STATE_DIR, refresh: !!opts.refresh });
-  if (opts.json) return console.log(JSON.stringify(cache, null, 2));
+  if (opts.json) return console.log(JSON.stringify(withEnabledMarks(cfg, cache), null, 2));
   console.log(`模型清单（更新于 ${cache.updatedAt || "从未"}）：`);
   for (const [name, p] of Object.entries(cache.providers || {})) {
     const prov = cfg.providers?.[name];
+    const http = prov?.modelList?.format === "openai-http";
+    const allow = http ? new Set(Object.values(prov?.pools || {}).flat()) : null;
     console.log(`\n${prov?.label || name} [${name}]：${p.ok ? `${p.models.length} 个模型` : `失败 — ${p.error}`}（CLI 默认：${p.cliDefault || "无"}）`);
     for (const m of p.models || []) {
       const def = m.pool && resolveModel(cfg, name, m.pool, "default") === m.id ? " ★默认" : "";
-      console.log(`  - ${m.id}${m.label && m.label !== m.id ? ` (${m.label})` : ""}  [${m.pool || "未归池"}]${def}`);
+      const enabledText = allow ? (allow.has(m.id) ? " 已启用" : " 未启用") : "";
+      console.log(`  - ${m.id}${m.label && m.label !== m.id ? ` (${m.label})` : ""}  [${m.pool || "未归池"}]${def}${enabledText}`);
     }
   }
 }
@@ -1162,6 +1647,28 @@ function cmdUsage(opts) {
   }
 }
 
+function cmdProviderCaps(opts) {
+  const [, , name, modelId, capName, val] = opts._;
+  if (!name || !modelId || !capName || !val) {
+    throw new Error("用法：provider caps <厂商> <模型id> vision on|off");
+  }
+  if (capName !== "vision") {
+    throw new Error(`暂不支持设置能力 ${capName}，目前仅支持 vision`);
+  }
+  const on = val === "on" ? true : val === "off" ? false : null;
+  if (on === null) {
+    throw new Error(`值必须是 on 或 off，收到：${val}`);
+  }
+  const cfg = loadConfig();
+  const prov = cfg.providers?.[name];
+  if (!prov) throw new Error(`未知厂商 ${name}`);
+  if (!prov.modelCaps) prov.modelCaps = {};
+  if (!prov.modelCaps[modelId]) prov.modelCaps[modelId] = {};
+  prov.modelCaps[modelId][capName] = on;
+  saveConfig(cfg);
+  console.log(`已将 ${name} 的模型 ${modelId} 的 ${capName} 设置为 ${val}`);
+}
+
 async function cmdProvider(opts) {
   const sub = opts._[1];
   switch (sub) {
@@ -1171,8 +1678,11 @@ async function cmdProvider(opts) {
     case "remove": return cmdProviderRemove(opts);
     case "test": return cmdProviderTest(opts);
     case "access": return setFullAccess(opts._[2], opts._[3]);
+    case "caps": return cmdProviderCaps(opts);
     case "model": return await cmdProviderModel(opts);
-    default: throw new Error("用法：provider enable|disable|remove|test <名称>，provider access <名称> on|off，provider model <名称> <额度池> <模型id|default>，或 provider add --json-spec '<JSON>' / provider add <名称> --preset kimi");
+    case "models": return cmdProviderModels(opts);
+    case "key": return await cmdProviderKey(opts);
+    default: throw new Error("用法：provider enable|disable|remove|test <名称>，provider access <名称> on|off，provider caps <名称> <模型id> vision on|off，provider model <名称> <额度池> <模型id|default>，provider models <名称> [--add 模型] [--remove 模型]，provider key <名称> [--stdin] [--clear]，或 provider add --json-spec '<JSON>' / provider add <名称> --preset kimi|endpoint");
   }
 }
 
@@ -1199,8 +1709,14 @@ function help() {
   providers [--json]              列出厂商：启用状态、命令是否已安装、参与哪些角色、额度池默认模型
   provider enable|disable <名称>   启用 / 停用某厂商（停用后路由与外派都跳过它）
   provider model <名称> <额度池> <模型id|default>   设置某额度池的默认模型（单池厂商写 default 恢复跟随 CLI 默认）
-  provider add <名称> --preset kimi|qwen|custom   新增厂商（面板里用 --json-spec）
-  provider remove <名称>           删除厂商并移出所有路由（配置先备份为 .bak）
+  provider models <名称> [--add 模型id] [--remove 模型id]
+                                  查看或修改自定义接口的模型白名单，并同步档位和路由
+  provider caps <名称> <模型id> vision on|off
+                                  设置某模型的看图能力
+  provider key <名称> [--stdin] [--clear]
+                                  设置或删除自定义接口的密钥。只从终端（不回显）或 --stdin 读取，不能写在命令参数里
+  provider add <名称> --preset kimi|qwen|custom|endpoint   新增厂商（面板里用 --json-spec；endpoint 需要 baseUrl 和 models）
+  provider remove <名称>           删除厂商并移出所有路由和档位（配置先备份为 .bak）
   provider test <名称>             只读试运行一句话，确认命令可用
   run <厂商名|auto> --role r [--model m] [--write] [--scope 路径1,路径2] [--background] [--cwd 目录] [--with id1,id2] [--diff] [--force] [--needs web,exec] [--idle-timeout 分钟] [--max-runtime 分钟] [--level 难度] [--downgrade 原因] [-- 派单]
                                   调用官方 CLI 执行任务；派单走标准输入或 --prompt-file，必须含「目标」「验收标准」和「难度：简单|中等|困难」（或 --level）

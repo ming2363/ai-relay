@@ -29,6 +29,8 @@ export type PoolView = {
   stale: boolean
   /** 额度数据来源：自带、AIQuota5h、无 */
   source: string
+  /** 计费类型：metered 按量计费 */
+  billing?: string
 }
 
 /** 最近一次读取到的 ai-relay 状态 */
@@ -181,6 +183,18 @@ export type Vendor = {
   }
   /** 可设置默认模型的额度池；主模型和没有清单的厂商为空 */
   modelPools: ModelPool[]
+  /** 计费方式：值为 "metered" 表示按量计费 */
+  billing?: string
+  /** 自定义接口配置 */
+  endpoint?: { baseUrl: string }
+  /** 是否已设置密钥 */
+  hasKey?: boolean
+  /** 厂商能力标记 */
+  caps?: { web?: boolean; exec?: boolean; vision?: boolean }
+  /** 单模型能力覆盖 */
+  modelCaps?: Record<string, { vision?: boolean }>
+  /** 该厂商启用的模型白名单 */
+  models?: string[]
 }
 
 /** 路由里写死了具体模型的角色 */
@@ -211,6 +225,12 @@ export type CatalogModel = {
   label: string
   /** 所属额度池；归不进任何池为 null，不能被选 */
   pool: string | null
+  /** 首次出现时间（ISO 字符串），早期数据可能没有 */
+  firstSeen?: string
+  /** 7 天内首次出现为 true */
+  isNew?: boolean
+  /** 归不进任何额度池时为 true */
+  unpooled?: boolean
 }
 
 /** relay models --json 里的单个厂商 */
@@ -242,12 +262,13 @@ export type ModelsView = {
 export type Preset = {
   title: string
   label: string
-  bin: string
-  install: string
-  cli: { prompt: string[]; model: string[]; read: string[]; write: string[]; cwd: string[] | null }
+  bin?: string
+  install?: string
+  baseUrl?: string
+  cli?: { prompt: string[]; model: string[]; read: string[]; write: string[]; cwd: string[] | null }
   models: string[]
-  roles: string[]
-  note: string
+  roles?: string[]
+  note?: string
 }
 
 /** 厂商页的数据 */
@@ -260,11 +281,12 @@ export type VendorData = {
 
 /** 新增厂商表单 */
 export type AddForm = {
-  /** 模板键：kimi、qwen、gemini-cli、custom */
+  /** 模板键：kimi、qwen、gemini-cli、endpoint、custom */
   preset: string
   name: string
   label: string
   bin: string
+  baseUrl?: string
   /** 模型，逗号分隔，留空用默认 */
   models: string
   /** 以下四项只在自定义模板下填写，空格分隔 */

@@ -1,31 +1,58 @@
-// UserPromptSubmit 钩子：记录用户输入，并按模式注入额度摘要、编排提示和 Claude 额度节流
+// UserPromptSubmit 钩子：记录用户输入，并按模式注入额度摘要、编排提示、模式切换说明和 Claude 额度节流
 import fs from "node:fs";
 import {
-  RELAY_SCRIPT, ULW_RE, MENTION_RE, loadConfig, getMode, readQuotaRows, claudeThrottle,
+  RELAY_SCRIPT, ULW_RE, MENTION_RE, loadConfig, getMode, getModeSeen, setModeSeen, readQuotaRows, claudeThrottle,
   compactStatus, savePrompt, fmtPct, mentionsProvider,
 } from "./lib.mjs";
+
+function writeContext(additionalContext) {
+  process.stdout.write(
+    JSON.stringify({ hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext } }),
+  );
+}
 
 function main() {
   const input = JSON.parse(fs.readFileSync(0, "utf8") || "{}");
   const prompt = String(input.prompt || "");
+  // 无论什么模式都先记下这条提问，供 PreToolUse 判断用户有没有点名
   savePrompt(input.session_id, prompt);
 
   const mode = getMode();
-  if (mode === "off") return;
+  // 先读上次注入时的模式，再写下这次的。提前 return 的分支也要记下，否则切模式后对不上
+  const prev = getModeSeen(input.session_id);
+  setModeSeen(input.session_id, mode);
+
+  if (mode === "off") {
+    // 刚从别的模式切过来才注入一句，盖掉上下文里残留的外派要求；本来就是纯 Claude 则不注入
+    if (prev && prev !== "off") {
+      writeContext("[ai-relay] 已切换为纯 Claude 模式：从这条消息起不外派任何任务（Codex、agy、Grok、Agent 外派都不用），也不需要运行 relay self 定分工；忽略本会话前面关于外派、分工、节流的 ai-relay 提示。");
+    }
+    return;
+  }
 
   const cfg = loadConfig();
   const ulw = ULW_RE.test(prompt);
   const mention = MENTION_RE.test(prompt) || mentionsProvider(cfg, prompt);
-  if (!ulw && !mention && mode !== "auto") return;
+  if (!ulw && !mention && mode !== "auto") {
+    if (mode === "manual" && prev === "auto") {
+      writeContext("[ai-relay] 已从自动切到手动：只外派用户点名的部分，前面自动模式的外派要求不再适用。");
+    }
+    return;
+  }
 
   const rows = readQuotaRows(cfg);
   const lines = [];
+  if (mode === "auto" && (prev === "off" || prev === "manual")) {
+    lines.push("[ai-relay] 已切换为自动模式：从这条消息起按主管 + 员工方式工作。");
+  } else if (mode === "manual" && prev === "auto") {
+    lines.push("[ai-relay] 已从自动切到手动：只外派用户点名的部分，前面自动模式的外派要求不再适用。");
+  }
   if (ulw) {
     lines.push("[ai-relay] 用户用 ulw 触发了多模型编排：先调用 Skill「ai-relay:orchestrate」，严格按其流程执行。");
   } else if (mode === "auto") {
     lines.push(
       "[ai-relay 自动模式] 你是主管（主模型），其他模型是员工。大方向：统筹拆解、派发、核验和汇报，也可以自己干活；具体谁做什么按任务具体分析，方法见 Skill「ai-relay:orchestrate」。",
-      "倾向于外派：成块的阅读、实现、排查、独立审查，能并行的子任务，别家更擅长或额度更充足的活。倾向于自己做：小改动、纯问答、外派往返不划算的、涉及密钥等敏感内容的、需要 Claude 专属工具的。汇报时说清谁做了什么、为什么这样分工。",
+      "倾向于外派：成块的阅读、实现、排查、独立审查，能并行的子任务，别家更擅长或额度更充足的活。倾向于自己做：小改动、纯问答、外派往返不划算的、涉及密钥等敏感内容的、需要 Claude 专属工具的。方案是在本会话里定的不算自己做的理由：把结论写进派单背景或共享背景再派。汇报时说清谁做了什么、为什么这样分工。",
       "Claude 专属工具（浏览器、你已登录的网站、Word/Excel/PPT、文档连接器、MCP、需要用户确认的操作）外派模型用不了：这部分你先做，把结果写进派单背景再派其余部分。各家员工能不能联网、执行命令看厂商能力和最高权限开关（relay providers 可查），派单里用「## 需要的能力」写明，选人时会自动筛选；它们汇报里的「需要主控协助」由你决定下一步。",
     );
   } else {
@@ -39,25 +66,25 @@ function main() {
   if (mode === "auto") {
     const t = claudeThrottle(cfg, rows);
     // 质量底线：任何档位都不放松，节流只减少主管亲自执行的部分
-    const qualityFloor = "质量优先，节流不降标准：节流只减少主管亲自执行的部分，子任务结果的复核一个都不能省；员工都不擅长、或需要本会话上下文才能判断的活，主管自己做。";
+    const qualityFloor = "质量优先，节流不降标准：节流只减少主管亲自执行的部分，子任务结果的复核一个都不能省；员工都不擅长的活，主管自己做。";
     if (t.level >= 1) lines.push(`[质量底线] ${qualityFloor}`);
     if (t.level === 1) {
       const who = t.richHelpers?.length ? `（其他家充足：${t.richHelpers.join("、")}）` : "";
+      const cycle = t.cycleLeft === null || t.cycleLeft === undefined ? "" : `，周期还剩 ${fmtPct(t.cycleLeft)}`;
       lines.push(
-        `[节流] Claude 额度只剩 ${fmtPct(t.remaining)}${who}。主管只做：理解需求、拆任务、写派单、验收、汇报。读代码超过 2 个文件、排查、实现、审查、需要看代码才能回答的问题，都外派（阅读 / 快速问答类派给额度最充足的模型）。派单和汇报都写短。`,
+        `[节流] Claude 额度剩 ${fmtPct(t.remaining)}${cycle}${who}。主管只做：理解需求、拆任务、写派单、验收、汇报。读代码超过 2 个文件、排查、实现、审查、需要看代码才能回答的问题，都外派（阅读 / 快速问答类派给额度最充足的模型）。派单和汇报都写短。`,
       );
     } else if (t.level === 2) {
+      const cycle = t.cycleLeft === null || t.cycleLeft === undefined ? "" : `，周期还剩 ${fmtPct(t.cycleLeft)}`;
       lines.push(
-        `⚠️ Claude 自身额度只剩 ${fmtPct(t.remaining)}：进入省 Claude 状态——执行类的活（读代码、排查、实现、审查、修补）尽量外派，主管专注拆解、写清派单和严格验收；汇报写短但结论要完整。低于 5% 时建议用户用 /codex:transfer 交接，不要降低标准硬做。`,
+        `⚠️ Claude 自身额度剩 ${fmtPct(t.remaining)}${cycle}：进入省 Claude 状态——执行类的活（读代码、排查、实现、审查、修补）尽量外派，主管专注拆解、写清派单和严格验收；汇报写短但结论要完整。低于 5% 时建议用户用 /codex:transfer 交接，不要降低标准硬做。`,
       );
     }
   }
   lines.push(`relay 脚本：node "${RELAY_SCRIPT}"`);
   lines.push(`额度：\n${compactStatus(cfg, rows)}`);
 
-  process.stdout.write(
-    JSON.stringify({ hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: lines.join("\n") } }),
-  );
+  writeContext(lines.join("\n"));
 }
 
 try {

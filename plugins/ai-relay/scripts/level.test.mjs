@@ -207,6 +207,7 @@ test("换档后的模型共用同一家族的历史验收记录", () => {
 test("pick 降级选出的模型，打印的派单命令带上同样的 --downgrade", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-level-pick-"));
   const cfg = JSON.parse(fs.readFileSync(path.join(DIR, "..", "config", "providers.default.json"), "utf8"));
+  cfg.quotaDb = "";
   // 强档都停用，只剩中档 Grok
   cfg.providers.codex.enabled = false;
   cfg.routes.implement = cfg.routes.implement.filter((e) => !e.startsWith("agy:"));

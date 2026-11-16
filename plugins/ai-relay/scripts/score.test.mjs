@@ -74,7 +74,7 @@ test("2. 两个候选 fit 不同但额度相同时，靠前的胜出", () => {
   assert.ok(res.choice.score > res.alternatives[0].score);
 });
 
-test("3. 默认权重下额度不能反超更擅长的候选；调高额度权重后才会反超", () => {
+test("3. 默认权重下额度不能反超明显更擅长的候选；调高额度权重后才会反超", () => {
   const cfg = {
     minRemaining: 0.15,
     lowRemaining: 0.3,
@@ -84,8 +84,8 @@ test("3. 默认权重下额度不能反超更擅长的候选；调高额度权�
     },
     routes: {
       implement: [
-        "codex:codex:default",
-        "agy:gemini:gemini-3.8-flash-high",
+        "codex:codex:default:1.0",
+        "agy:gemini:gemini-3.8-flash-high:0.75",
       ],
     },
   };
@@ -97,7 +97,7 @@ test("3. 默认权重下额度不能反超更擅长的候选；调高额度权�
     { provider: "antigravity", pool_id: "gemini", window_key: "5h", remaining_fraction: 1.0, reset_at: now + 1800000, allowance: "available", updated_at: now },
   ];
 
-  // 默认权重（额度 0.25，最低）：更擅长的 codex 保持第一
+  // 默认权重（额度 0.25，最低）：明显更擅长的 codex 保持第一（差距超过 5% 近似同分带宽）
   const res = scoreRoute(cfg, rows, "implement", { now });
   assert.equal(res.choice?.provider, "codex");
   assert.equal(res.alternatives[0]?.provider, "agy");
@@ -137,7 +137,7 @@ test("4. history 里有 verdict fail 的候选可靠度下降", () => {
   assert.ok(resFail.choice.score < resNoHist.choice.score);
 });
 
-test("5. level 为 low 时乘 0.7", () => {
+test("5. level 为 low 时：配速不为 null 按配速公式算（不乘 0.7），配速为 null 时保持旧公式乘 0.7", () => {
   const cfg = {
     minRemaining: 0.15,
     lowRemaining: 0.3,
@@ -149,17 +149,23 @@ test("5. level 为 low 时乘 0.7", () => {
     },
   };
   const now = 1700000000000;
-  // remaining = 0.20 在 [0.15, 0.3) 之间，level 为 low
-  // binding = 0.2; 4小时后重置 -> expiring = 0.2 * (1 - 4/5) = 0.04
-  // 未乘 0.7: 0.6 + 0.4*0.2 + 0.4*0.04 = 0.696
-  // 乘 0.7: 0.696 * 0.7 = 0.4872
-  const rows = [
+  // 1) 有重置时间：remaining = 0.20, 4h 后重置 -> 周期剩余 0.8 -> 配速 = -0.6 -> clamp(0.8 + 0.6*(-0.6), 0.5, 1.4) = 0.5
+  const rowsWithReset = [
     { provider: "codex", pool_id: "codex", window_key: "5h", remaining_fraction: 0.20, reset_at: now + 4 * 3600000, allowance: "available", updated_at: now },
   ];
+  const resWithReset = scoreRoute(cfg, rowsWithReset, "implement", { now });
+  assert.equal(resWithReset.choice?.status.level, "low");
+  assert.equal(resWithReset.choice?.pace, -0.6);
+  assert.equal(resWithReset.choice?.parts.quota, 0.5);
 
-  const res = scoreRoute(cfg, rows, "implement", { now });
-  assert.equal(res.choice?.status.level, "low");
-  assert.ok(Math.abs(res.choice?.parts.quota - 0.4872) < 1e-3);
+  // 2) 无重置时间（配速为 null）：remaining = 0.20, expiring = 0 -> (0.6 + 0.4*0.2) * 0.7 = 0.476
+  const rowsNoReset = [
+    { provider: "codex", pool_id: "codex", window_key: "5h", remaining_fraction: 0.20, reset_at: null, allowance: "available", updated_at: now },
+  ];
+  const resNoReset = scoreRoute(cfg, rowsNoReset, "implement", { now });
+  assert.equal(resNoReset.choice?.status.level, "low");
+  assert.equal(resNoReset.choice?.pace, null);
+  assert.equal(resNoReset.choice?.parts.quota, 0.476);
 });
 
 test("6. reason 字符串格式正确，包括\"优先用掉\"的追加", () => {
@@ -367,7 +373,7 @@ test("13. 质量优先：A 排第 0 位（fit 1.0）额度 low，B 排第 2 位�
     lowRemaining: 0.3,
     providers: {
       provA: { via: "relay", quota: { provider: "provA" } },
-      dummy: { via: "relay", quota: { provider: "dummy" } },
+      dummy: { via: "relay", enabled: false, quota: { provider: "dummy" } },
       provB: { via: "relay", quota: { provider: "provB" } },
     },
     routes: {

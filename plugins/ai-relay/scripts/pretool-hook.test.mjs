@@ -196,3 +196,54 @@ test("钩子读到坏 JSON 时什么都不输出", () => {
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("超限重置后还没定分工时，Bash 和编辑都用超限理由拒绝", () => {
+  withHome((home) => {
+    fs.writeFileSync(path.join(home, "mode"), "auto\n");
+    fs.mkdirSync(path.join(home, "prompts"), { recursive: true });
+    fs.writeFileSync(path.join(home, "prompts", "s-limit.edits.json"), JSON.stringify({
+      lines: 41,
+      warned: true,
+      reads: 0,
+      readWarned: false,
+      decision: null,
+      selfReason: "先做了一点",
+      bashPending: true,
+      limitReset: true,
+      repos: null,
+    }));
+    const env = { ...process.env, AI_RELAY_HOME: home, CLAUDE_PROJECT_DIR: "" };
+    const bash = spawnSync(process.execPath, [hook], {
+      input: JSON.stringify({
+        tool_name: "Bash",
+        session_id: "s-limit",
+        cwd: "/work/a",
+        tool_input: { command: "echo hi" },
+      }),
+      encoding: "utf8",
+      env,
+    });
+    assert.equal(bash.status, 0, bash.stderr);
+    const bashOut = JSON.parse(bash.stdout);
+    assert.equal(bashOut.hookSpecificOutput.permissionDecision, "deny");
+    assert.match(bashOut.hookSpecificOutput.permissionDecisionReason, /已亲手写了 41 行，超过上限/);
+    assert.match(bashOut.hookSpecificOutput.permissionDecisionReason, /relay run --write/);
+    assert.doesNotMatch(bashOut.hookSpecificOutput.permissionDecisionReason, /第一次改项目代码前/);
+
+    const edit = spawnSync(process.execPath, [hook], {
+      input: JSON.stringify({
+        tool_name: "Edit",
+        session_id: "s-limit",
+        cwd: "/work/a",
+        tool_input: { file_path: "/work/a/src/app.js", old_string: "a", new_string: "b" },
+      }),
+      encoding: "utf8",
+      env,
+    });
+    assert.equal(edit.status, 0, edit.stderr);
+    const editOut = JSON.parse(edit.stdout);
+    assert.equal(editOut.hookSpecificOutput.permissionDecision, "deny");
+    assert.match(editOut.hookSpecificOutput.permissionDecisionReason, /超过上限/);
+    assert.doesNotMatch(editOut.hookSpecificOutput.permissionDecisionReason, /第一次改项目代码前/);
+  });
+});

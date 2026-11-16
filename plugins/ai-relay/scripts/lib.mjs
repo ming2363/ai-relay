@@ -13,12 +13,69 @@ export const STATE_DIR = process.env.AI_RELAY_HOME || path.join(os.homedir(), ".
 export const JOBS_DIR = path.join(STATE_DIR, "jobs");
 export const MODES = ["off", "manual", "auto"];
 
+// 按量计费厂商的每日用量文件：{ "2026-11-15": { "maas": 12345 } }，只保留最近 7 天
+export function meteredUsagePath() {
+  return path.join(STATE_DIR, "metered-usage.json");
+}
+
 const expandHome = (p) => (p && p.startsWith("~") ? path.join(os.homedir(), p.slice(1)) : p);
 
 export function ensureStateDir() {
   fs.mkdirSync(JOBS_DIR, { recursive: true });
   fs.mkdirSync(path.join(STATE_DIR, "prompts"), { recursive: true });
+  fs.mkdirSync(path.join(STATE_DIR, "mode-seen"), { recursive: true });
   fs.mkdirSync(path.join(STATE_DIR, "locks"), { recursive: true });
+}
+
+// 本地日期（如 2026-11-15）。now 是时间戳（毫秒）。
+function localDateKey(now = Date.now()) {
+  const d = new Date(now);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function readMeteredUsage() {
+  try {
+    const data = JSON.parse(fs.readFileSync(meteredUsagePath(), "utf8"));
+    if (data && typeof data === "object" && !Array.isArray(data)) return data;
+  } catch {}
+  return {};
+}
+
+// 按本地日期累加用量，只保留最近 7 天（含今天，即从今天往前推 6 天起）。
+export function recordMeteredUsage(provider, tokens, now = Date.now()) {
+  const key = localDateKey(now);
+  const n = Number(tokens);
+  if (!Number.isFinite(n) || n <= 0) return;
+  ensureStateDir();
+  const data = readMeteredUsage();
+  const cutoff = new Date(now);
+  cutoff.setDate(cutoff.getDate() - 6);
+  const cutoffKey = localDateKey(cutoff.getTime());
+  const kept = {};
+  for (const [day, byProvider] of Object.entries(data)) {
+    if (day < cutoffKey) continue;
+    if (byProvider && typeof byProvider === "object" && !Array.isArray(byProvider)) {
+      kept[day] = { ...byProvider };
+    }
+  }
+  kept[key] = { ...(kept[key] || {}), [provider]: (Number(kept[key]?.[provider]) || 0) + Math.round(n) };
+  fs.writeFileSync(meteredUsagePath(), JSON.stringify(kept, null, 2) + "\n");
+}
+
+// 某厂商当天已累计的 token 数；没有记录返回 0
+export function meteredUsedToday(provider, now = Date.now()) {
+  const data = readMeteredUsage();
+  return Number(data[localDateKey(now)]?.[provider]) || 0;
+}
+
+// 厂商是 metered 且当天累计达到 cfg.meteredDailyTokenCap（默认 2000 万）时为 true
+export function meteredCapReached(cfg, provider, now = Date.now()) {
+  const prov = cfg?.providers?.[provider];
+  if (prov?.billing !== "metered") return false;
+  const cap = Number(cfg?.meteredDailyTokenCap ?? 20_000_000);
+  if (!Number.isFinite(cap) || cap <= 0) return false;
+  return meteredUsedToday(provider, now) >= cap;
 }
 
 // Bash 的 PreToolUse 只把当前会话落到这里，不改命令。
@@ -129,6 +186,69 @@ export function loadConfig() {
   return cfg;
 }
 
+// 密钥只放在这个文件里。配置、任务和日志都不写原值。
+export function secretsPath() {
+  return path.join(STATE_DIR, "secrets.json");
+}
+
+export function loadSecrets() {
+  try {
+    const data = JSON.parse(fs.readFileSync(secretsPath(), "utf8"));
+    if (!data || typeof data !== "object" || Array.isArray(data)) return {};
+    const out = {};
+    for (const [key, value] of Object.entries(data)) {
+      if (typeof value === "string") out[key] = value;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+// 先把权限收成 600，再写入内容，避免密钥以创建时的默认权限落盘。
+export function saveSecrets(data) {
+  const file = secretsPath();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const body = JSON.stringify(data, null, 2) + "\n";
+  const fd = fs.openSync(file, "w", 0o600);
+  try {
+    fs.fchmodSync(fd, 0o600);
+    fs.writeSync(fd, body, 0, "utf8");
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// 有 endpoint.secret，且密钥文件里有对应的非空条目，才算已设置。
+export function hasProviderKey(prov, secrets) {
+  const secretName = prov?.endpoint?.secret;
+  if (!secretName || !secrets) return false;
+  const value = secrets[secretName];
+  return typeof value === "string" && value.length > 0;
+}
+
+// 按原文字替换。不用正则，密钥里的点、加号不会被当成特殊符号。
+export function maskSecretValue(text, secret) {
+  if (text == null) return text;
+  const raw = String(text);
+  if (typeof secret !== "string" || secret.length === 0 || !raw.includes(secret)) return raw;
+  return raw.split(secret).join("***");
+}
+
+// 去掉末尾的斜杠和 /v1。外壳会自己拼 /v1/messages，地址里再带一份会打到错误路径。
+export function normalizeBaseUrl(raw) {
+  let url = String(raw ?? "").trim();
+  if (!url) throw new Error("接口地址不能为空");
+  let prev = null;
+  while (url !== prev) {
+    prev = url;
+    url = url.replace(/\/+$/, "");
+    url = url.replace(/\/v1$/i, "");
+  }
+  if (!/^https?:\/\//i.test(url)) throw new Error("接口地址要以 http:// 或 https:// 开头");
+  return url;
+}
+
 // 旧配置升级（默认模型功能之前复制的用户配置不含这些字段）：
 // 内置厂商缺少的模型清单字段从默认配置补齐；某厂商本次刚补上 defaultModels 时，
 // 把路由里与池默认模型相同的条目改写成 default（解析结果不变，之后才会跟随用户选的默认模型）。
@@ -184,6 +304,13 @@ export function migrateModelFields(cfg, def) {
       changed = true;
       if (key === "defaultModels") freshDefaults.add(name);
     }
+    if (dp.caps && typeof dp.caps.vision === "boolean") {
+      if (!p.caps) p.caps = {};
+      if (p.caps.vision === undefined) {
+        p.caps.vision = dp.caps.vision;
+        changed = true;
+      }
+    }
   }
   for (const [role, route] of Object.entries(cfg.routes || {})) {
     if (!Array.isArray(route)) continue;
@@ -212,6 +339,25 @@ export function getMode() {
 export function setMode(mode) {
   ensureStateDir();
   fs.writeFileSync(path.join(STATE_DIR, "mode"), mode + "\n");
+}
+
+// 按会话记录上次注入时的模式，供 UserPromptSubmit 钩子判断是否在同一会话中切换了模式
+export function getModeSeen(sessionId) {
+  const id = String(sessionId ?? "").trim();
+  if (!id) return "";
+  try {
+    const m = fs.readFileSync(path.join(STATE_DIR, "mode-seen", `${id}.txt`), "utf8").trim();
+    return MODES.includes(m) ? m : "";
+  } catch {
+    return "";
+  }
+}
+
+export function setModeSeen(sessionId, mode) {
+  const id = String(sessionId ?? "").trim();
+  if (!id || !MODES.includes(mode)) return;
+  ensureStateDir();
+  fs.writeFileSync(path.join(STATE_DIR, "mode-seen", `${id}.txt`), mode + "\n");
 }
 
 // 额度来源：先用 ai-relay 自己获取的缓存（quota.mjs），缺的再从 AIQuota5h 的本地库补（目前只有 Grok 需要）
@@ -297,15 +443,31 @@ export function providerPools(prov) {
 // Claude 自身额度分档，供自动模式节流：
 //   0 正常或额度未知；1 低于 claudeThrottleBelow（默认 0.5）；2 低于 claudeConserveBelow（默认 0.2）
 // remaining 是主模型各额度池、各窗口剩余比例的最小值
+// cycleLeft 是这些窗口里"周期剩余比例"最小的那个（距重置小时数 / 窗口总时长，5h 窗口按 5、weekly 按 168）；
+// 主模型没有任何带重置时间的窗口时 cycleLeft 为 null
 // 1 档且有员工的某个额度池剩余 ≥ 0.5 时，附上这些员工的显示名 richHelpers
-export function claudeThrottle(cfg, rows) {
+const CLAUDE_WINDOW_HOURS = { "5h": 5, weekly: 168 };
+
+export function claudeThrottle(cfg, rows, now = Date.now()) {
   const self = Object.values(cfg.providers || {}).find((p) => p && p.self);
   let remaining = null;
+  let cycleLeft = null;
   if (self?.quota) {
     const known = providerPools(self)
-      .map((pool) => poolStatus(cfg, rows, self.quota.provider, pool).remaining)
+      .map((pool) => poolStatus(cfg, rows, self.quota.provider, pool, now).remaining)
       .filter((r) => r !== null);
     if (known.length) remaining = Math.min(...known);
+    const pools = providerPools(self).map((pool) => poolStatus(cfg, rows, self.quota.provider, pool, now));
+    for (const st of pools) {
+      for (const w of st.windows || []) {
+        if (w.remaining === null || w.remaining === undefined) continue;
+        if (w.resetAt === null || w.resetAt === undefined || w.resetPassed) continue;
+        const totalHours = CLAUDE_WINDOW_HOURS[w.key] || 24;
+        const hoursUntilReset = Math.max(0, (w.resetAt - now) / 3_600_000);
+        const ratio = Math.min(1, Math.max(0, hoursUntilReset / totalHours));
+        if (cycleLeft === null || ratio < cycleLeft) cycleLeft = ratio;
+      }
+    }
   }
   const conserveBelow = cfg.claudeConserveBelow ?? 0.2;
   const throttleBelow = cfg.claudeThrottleBelow ?? 0.5;
@@ -314,7 +476,7 @@ export function claudeThrottle(cfg, rows) {
     if (remaining < conserveBelow) level = 2;
     else if (remaining < throttleBelow) level = 1;
   }
-  const out = { level, remaining };
+  const out = { level, remaining, cycleLeft };
   if (level !== 1) return out;
   const richHelpers = [];
   for (const [name, prov] of Object.entries(cfg.providers || {})) {
@@ -445,11 +607,19 @@ export function resolveBin(bin) {
   return null;
 }
 
+// 过滤长密钥和 Token，避免出现在日志、存储或界面中
+export function maskSecrets(text) {
+  if (!text || typeof text !== "string") return text ?? "";
+  return text
+    .replace(/\b(sk-|ghp_|AKIA|xoxb-|xoxa-|xoxp-)[A-Za-z0-9_-]{12,}/g, "$1***")
+    .replace(/Bearer\s+[A-Za-z0-9_.~+/=-]{16,}/g, "Bearer ***");
+}
+
 // 记录每个会话最近一条用户输入，供 PreToolUse 钩子判断用户是否点名
 export function savePrompt(sessionId, prompt) {
   if (!sessionId) return;
   ensureStateDir();
-  fs.writeFileSync(path.join(STATE_DIR, "prompts", `${sessionId}.txt`), String(prompt || "").slice(0, 4000));
+  fs.writeFileSync(path.join(STATE_DIR, "prompts", `${sessionId}.txt`), maskSecrets(String(prompt || "")).slice(0, 4000));
   // 每条新消息重新统计主模型亲手改动的行数、读文件次数，以及这一轮的分工决定。
   // repos 用 null 表示还没扫过仓库；空数组表示扫过但没有，避免和「未扫描」混在一起。
   fs.writeFileSync(selfEditFile(sessionId), JSON.stringify({
@@ -460,6 +630,7 @@ export function savePrompt(sessionId, prompt) {
     decision: null,
     selfReason: "",
     bashPending: false,
+    limitReset: false,
     repos: null,
   }));
   // 每天自动清理一次历史数据
@@ -497,6 +668,7 @@ export function cleanup(now = Date.now()) {
     }
   };
   prune(path.join(STATE_DIR, "prompts"), RETENTION_DAYS.prompts);
+  prune(path.join(STATE_DIR, "mode-seen"), RETENTION_DAYS.prompts);
   prune(JOBS_DIR, RETENTION_DAYS.jobs);
   prune(path.join(STATE_DIR, "rounds"), RETENTION_DAYS.rounds);
   prune(path.join(STATE_DIR, "context"), RETENTION_DAYS.context);
@@ -517,6 +689,29 @@ export function cleanup(now = Date.now()) {
     });
     fs.writeFileSync(hist, lines.length ? lines.join("\n") + "\n" : "");
   } catch {}
+  // 对 STATE_DIR 下 prompts/ 和 rounds/ 里的现有文件逐个读出、打码、内容有变化才写回；单个文件出错跳过
+  for (const sub of ["prompts", "rounds"]) {
+    const dir = path.join(STATE_DIR, sub);
+    if (!fs.existsSync(dir)) continue;
+    let files = [];
+    try {
+      files = fs.readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const f of files) {
+      const p = path.join(dir, f);
+      try {
+        const st = fs.statSync(p);
+        if (!st.isFile()) continue;
+        const raw = fs.readFileSync(p, "utf8");
+        const masked = maskSecrets(raw);
+        if (masked !== raw) {
+          fs.writeFileSync(p, masked, "utf8");
+        }
+      } catch {}
+    }
+  }
   try {
     fs.writeFileSync(CLEAN_STAMP(), String(now));
   } catch {}
@@ -986,6 +1181,7 @@ export function readSelfEdits(sessionId) {
     decision: null,
     selfReason: "",
     bashPending: false,
+    limitReset: false,
     repos: [],
     reposKnown: false,
   });
@@ -998,6 +1194,7 @@ export function readSelfEdits(sessionId) {
     if (data.decision !== "self" && data.decision !== "dispatch") data.decision = null;
     if (typeof data.selfReason !== "string") data.selfReason = "";
     if (typeof data.bashPending !== "boolean") data.bashPending = false;
+    if (typeof data.limitReset !== "boolean") data.limitReset = false;
     if (Array.isArray(data.repos)) {
       data.repos = data.repos.filter((p) => typeof p === "string");
       data.reposKnown = true;
@@ -1049,22 +1246,187 @@ export function isRelayRunCommand(command) {
   return /relay\.mjs["']?\s+run(?:\s|$)/.test(String(command || ""));
 }
 
+// 只有带 --write 的 relay run 才算定了可写分工。--writer 这类前缀不算。
+export function isRelayRunWriteCommand(command) {
+  return isRelayRunCommand(command) && /(?:^|\s)--write(?:\s|=|$)/.test(String(command || ""));
+}
+
 // 自动模式下，第一次改项目代码前还没定分工时的拒绝理由
 export function divisionReason() {
-  return `[ai-relay 自动模式] 这一轮第一次改项目代码前，先定分工：成块的实现派给员工（relay pick implement --level <难度>，再 relay run 或 Codex 子代理）；确认自己做更合适，就先运行 node "${RELAY_SCRIPT}" self "<一句话原因>"，再继续改。原因会显示在面板这一轮的详情里。`;
+  return `[ai-relay 自动模式] 这一轮第一次改项目代码前，先定分工：成块的实现派给员工（relay pick implement --level <难度>，再 relay run --write 或 Codex 子代理）；只派只读任务不算定分工。确认自己做更合适，就先运行 node "${RELAY_SCRIPT}" self "<一句话原因>"，再继续改。原因会显示在面板这一轮的详情里。`;
 }
 
 // Bash 已经改了项目代码、但这一轮还没定分工
 export function bashWroteReminder(delta) {
-  return `[ai-relay 自动模式] 刚才的 Bash 已改了项目代码 ${delta} 行，这一轮还没定分工。下一步改动前必须先定：成块的实现派给员工（relay pick implement --level <难度>，再 relay run 或 Codex 子代理）；确认自己做更合适，就先运行 node "${RELAY_SCRIPT}" self "<一句话原因>"，再继续改。原因会显示在面板这一轮的详情里。`;
+  return `[ai-relay 自动模式] 刚才的 Bash 已改了项目代码 ${delta} 行，这一轮还没定分工。下一步改动前必须先定：成块的实现派给员工（relay pick implement --level <难度>，再 relay run --write 或 Codex 子代理）；只派只读任务不算定分工。确认自己做更合适，就先运行 node "${RELAY_SCRIPT}" self "<一句话原因>"，再继续改。原因会显示在面板这一轮的详情里。`;
 }
 
-// 超过上限时记 warned 并返回提醒；没超过返回空串
+// 自己做已经超过上限，这一轮必须重新定分工
+export function overLimitReason(lines, limit) {
+  const max = limit || 40;
+  return `[ai-relay 自动模式] 这一轮你已亲手写了 ${lines} 行，超过上限 ${max} 行。剩下成块的实现派给员工（relay pick implement --level <难度>，再 relay run --write 或 Codex 子代理）；确认剩下的仍自己做，就再运行一次 node "${RELAY_SCRIPT}" self "<原因>"。`;
+}
+
+// 编辑闸门和 Bash 闸门的拒绝理由：超限重置过用超限那段，否则用第一次定分工那段
+export function blockReason(stat) {
+  if (stat?.limitReset) {
+    let max = 40;
+    try {
+      max = loadConfig().selfEditMaxLines || 40;
+    } catch {}
+    return overLimitReason(stat.lines || 0, max);
+  }
+  return divisionReason();
+}
+
+// 超过上限时的提醒。decision 为 self 且本轮还没重置过：改回未定分工，只重置一次。
+// 已经派了可写任务时仍是原来的一次性提醒，不重置。
 export function selfEditLimitMessage(stat, limit) {
   const max = limit || 40;
-  if (!stat || stat.warned || !(stat.lines > max)) return "";
+  if (!stat || !(stat.lines > max)) return "";
+  if (stat.decision === "self" && !stat.limitReset) {
+    stat.limitReset = true;
+    stat.decision = null;
+    stat.bashPending = true;
+    stat.warned = true;
+    return overLimitReason(stat.lines, max);
+  }
+  if (stat.warned) return "";
   stat.warned = true;
   return `[ai-relay 自动模式] 这一轮你已亲手写了 ${stat.lines} 行。如果后面还有成块的实现，考虑交给更合适的员工模型（relay pick implement --level <难度>）；自己做更合适的，汇报时说明原因即可。`;
+}
+
+// 读文件超过上限时的提醒。任何档位都只提醒一次；档位 ≥1 沿用节流那段。
+export function selfReadLimitMessage(stat, limit, level) {
+  const max = limit ?? 8;
+  if (!stat || stat.readWarned || !(stat.reads > max)) return "";
+  stat.readWarned = true;
+  if ((level || 0) >= 1) {
+    return `[ai-relay 节流] 这一轮你已读了 ${stat.reads} 次文件，Claude 额度紧张。剩下的阅读、排查请派给 read / debug 角色（relay pick read），你只看它们的结论。`;
+  }
+  return `[ai-relay 自动模式] 这一轮你已读了 ${stat.reads} 次文件。剩下成块的阅读、排查考虑派给 read / debug 角色（relay pick read --level <难度>），你只看结论。`;
+}
+
+// Bash 里真正去读文件的命令。按 &&、||、;、换行切段；管道后面的过滤不计。
+const BASH_READ_CMDS = new Set(["cat", "head", "tail", "less", "nl", "bat", "grep", "rg", "awk"]);
+
+function splitShellSegments(command) {
+  const parts = [];
+  let cur = "";
+  let quote = "";
+  for (let i = 0; i < command.length; i++) {
+    const c = command[i];
+    if (quote) {
+      cur += c;
+      if (c === quote) quote = "";
+      continue;
+    }
+    if (c === "'" || c === "\"") {
+      quote = c;
+      cur += c;
+      continue;
+    }
+    if (c === "\\" && command[i + 1] === "\n") {
+      i++;
+      continue;
+    }
+    if (c === "\n" || c === ";") {
+      parts.push(cur);
+      cur = "";
+      continue;
+    }
+    if ((c === "&" && command[i + 1] === "&") || (c === "|" && command[i + 1] === "|")) {
+      parts.push(cur);
+      cur = "";
+      i++;
+      continue;
+    }
+    cur += c;
+  }
+  if (cur) parts.push(cur);
+  return parts;
+}
+
+// 段首到第一个管道为止的词。引号里的空格和管道留在词里。
+function tokensBeforePipe(segment) {
+  const tokens = [];
+  let buf = "";
+  let quote = "";
+  const push = () => {
+    if (buf) tokens.push(buf);
+    buf = "";
+  };
+  for (let i = 0; i < segment.length; i++) {
+    const c = segment[i];
+    if (quote) {
+      if (c === quote) quote = "";
+      else buf += c;
+      continue;
+    }
+    if (c === "'" || c === "\"") {
+      quote = c;
+      continue;
+    }
+    if (c === "|") break;
+    if (/\s/.test(c)) {
+      push();
+      continue;
+    }
+    buf += c;
+  }
+  push();
+  return tokens;
+}
+
+function sedUsesN(tokens) {
+  for (let i = 1; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t === "--") return false;
+    if (t === "-n" || /^-[A-Za-z]*n[A-Za-z]*$/.test(t)) return true;
+    if (t.startsWith("-")) continue;
+    return false;
+  }
+  return false;
+}
+
+// 去掉 heredoc 的正文：那是写给命令的内容，里面碰巧以 cat / grep 开头的行不是读文件
+function stripHeredocBodies(text) {
+  const out = [];
+  let end = "";
+  for (const line of text.split("\n")) {
+    if (end) {
+      if (line.trim() === end) end = "";
+      continue;
+    }
+    out.push(line);
+    const m = line.match(/<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/);
+    if (m) end = m[2];
+  }
+  return out.join("\n");
+}
+
+// relay.mjs 整条不计。git 看 diff 是验收，不计。每段命中一次计 1。
+// 带 heredoc 的 cat（cat > file <<EOF）是在写文件，不计。
+export function bashReadCount(command) {
+  const text = String(command || "");
+  if (!text || text.includes("relay.mjs")) return 0;
+  let n = 0;
+  for (const seg of splitShellSegments(stripHeredocBodies(text))) {
+    if (/<</.test(seg) && /^\s*cat(\s|$)/.test(seg)) continue;
+    const tokens = tokensBeforePipe(seg);
+    let i = 0;
+    while (i < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i])) i++;
+    const word = tokens[i];
+    if (!word) continue;
+    const name = path.basename(word);
+    if (name === "git") continue;
+    if (name === "sed") {
+      if (sedUsesN(tokens.slice(i))) n++;
+      continue;
+    }
+    if (BASH_READ_CMDS.has(name)) n++;
+  }
+  return n;
 }
 
 // ---------- Bash 写入的行数：改前改后各拍一次 git 快照，用差值计入亲手改动 ----------
@@ -1240,19 +1602,9 @@ function fileSig(full) {
   }
 }
 
-// base 是对比的提交：前快照用当时的 HEAD；后快照沿用前快照的 HEAD，
-// 这样命令里 git commit 让改动从工作区进了提交，行数不会被当成又改了一遍。
-async function snapshotRepo(root, base) {
-  const files = {};
-  const args = ["-C", root, "-c", "core.quotePath=false"];
-  const head = base || (await gitTextAsync([...args, "rev-parse", "--verify", "-q", "HEAD"]).catch(() => "")).trim();
-  const [numstat, listing] = await Promise.all([
-    (head ? gitTextAsync([...args, "diff", "--numstat", head]) : Promise.reject(new Error("no head")))
-      .catch(() => gitTextAsync([...args, "diff", "--numstat"]))
-      .catch(() => ""),
-    gitTextAsync([...args, "ls-files", "--others", "--exclude-standard"]).catch(() => ""),
-  ]);
-  for (const line of numstat.split("\n")) {
+function parseNumstat(text) {
+  const out = [];
+  for (const line of String(text || "").split("\n")) {
     if (!line) continue;
     const tab = line.indexOf("\t");
     const tab2 = tab < 0 ? -1 : line.indexOf("\t", tab + 1);
@@ -1263,11 +1615,36 @@ async function snapshotRepo(root, base) {
     if (!file) continue;
     const added = addedRaw === "-" ? 0 : Number(addedRaw) || 0;
     const deleted = deletedRaw === "-" ? 0 : Number(deletedRaw) || 0;
-    const n = added + deleted;
-    const full = path.join(root, file);
-    if (n > 0) files[full] = { n, sig: fileSig(full) };
+    out.push({ file, n: added + deleted });
   }
-  const untracked = listing.split("\n").filter(Boolean);
+  return out;
+}
+
+// base 是对比的提交：前快照用当时的 HEAD；后快照沿用前快照的 HEAD，
+// 这样命令里 git commit 让改动从工作区进了提交，行数不会被当成又改了一遍。
+// current 是命令结束后真正的 HEAD，用来判断这次 HEAD 是不是被 pull / checkout 挪走了。
+async function snapshotRepo(root, base) {
+  const files = {};
+  const args = ["-C", root, "-c", "core.quotePath=false"];
+  const [currentRaw, stashRaw] = await Promise.all([
+    gitTextAsync([...args, "rev-parse", "--verify", "-q", "HEAD"]).catch(() => ""),
+    gitTextAsync([...args, "rev-parse", "--verify", "-q", "refs/stash"]).catch(() => ""),
+  ]);
+  const current = String(currentRaw || "").trim();
+  const stash = String(stashRaw || "").trim();
+  const head = base || current;
+  const [numstat, listing] = await Promise.all([
+    (head ? gitTextAsync([...args, "diff", "--numstat", head]) : Promise.reject(new Error("no head")))
+      .catch(() => gitTextAsync([...args, "diff", "--numstat"]))
+      .catch(() => ""),
+    gitTextAsync([...args, "ls-files", "--others", "--exclude-standard"]).catch(() => ""),
+  ]);
+  for (const row of parseNumstat(numstat)) {
+    if (row.n <= 0) continue;
+    const full = path.join(root, row.file);
+    files[full] = { n: row.n, sig: fileSig(full) };
+  }
+  const untracked = String(listing || "").split("\n").filter(Boolean);
   const capped = untracked.length > UNTRACKED_MAX ? untracked.slice(0, UNTRACKED_MAX) : untracked;
   for (const rel of capped) {
     const full = path.join(root, rel);
@@ -1275,24 +1652,28 @@ async function snapshotRepo(root, base) {
     const n = untrackedLineCount(full);
     if (n > 0) files[full] = { n, sig: fileSig(full) };
   }
-  return { head, files };
+  return { head, current, stash, files };
 }
 
 // repos 是仓库根目录列表，不传时现发现；bases 是 { 仓库: 对比提交 }，后快照传前快照的 heads。
-// 返回 Promise<{ heads: { 仓库: 提交 }, files: { 绝对路径: { n: 行数, sig } } }>
+// 返回 Promise<{ heads, currents, stashes, files }>
 export async function lineSnapshot(cwd, repos, bases) {
   const roots = (Array.isArray(repos) ? repos : findRepos(cwd)).filter(Boolean);
   const parts = await Promise.all(
     roots.map((root) => snapshotRepo(root, bases?.[root]).then((r) => [root, r]).catch(() => [root, null])),
   );
   const heads = {};
+  const currents = {};
+  const stashes = {};
   const files = {};
   for (const [root, r] of parts) {
     if (!r) continue;
     heads[root] = r.head;
+    currents[root] = r.current;
+    stashes[root] = r.stash || "";
     Object.assign(files, r.files);
   }
-  return { heads, files };
+  return { heads, currents, stashes, files };
 }
 
 // 兼容旧格式：快照可以直接是 { 路径: 行数 }
@@ -1301,20 +1682,102 @@ function snapFiles(snap) {
   return snap.files && typeof snap.files === "object" ? snap.files : snap;
 }
 
-// 两边都出现的文件取行数差的绝对值；行数没变但签名变了，算改了 1 行；只在一边出现的，另一边按 0。
-export function snapshotDelta(before, after) {
+// 两边都在的文件取行数差的绝对值；行数没变但签名变了，算改了 1 行。
+// 只在后面出现的按行数计。前有后无（回到基准、restore、删掉未跟踪文件）计 0。
+// discount 是 HEAD 移动带来的行数，按文件减去，最低 0。
+export function snapshotDelta(before, after, discount) {
   const b = snapFiles(before);
   const a = snapFiles(after);
+  const off = discount && typeof discount === "object" ? discount : null;
   const norm = (v) => (v && typeof v === "object" ? { n: Number(v.n) || 0, sig: v.sig } : { n: Number(v) || 0 });
   let sum = 0;
   for (const key of new Set([...Object.keys(b), ...Object.keys(a)])) {
-    const x = norm(b[key]);
+    if (!(key in a)) continue;
+    const x = key in b ? norm(b[key]) : { n: 0 };
     const y = norm(a[key]);
-    const d = Math.abs(y.n - x.n);
-    if (d > 0) sum += d;
-    else if (key in b && key in a && x.sig && y.sig && x.sig !== y.sig) sum += 1;
+    let d = Math.abs(y.n - x.n);
+    if (d === 0 && key in b && x.sig && y.sig && x.sig !== y.sig) d = 1;
+    if (off && off[key]) d = Math.max(0, d - (Number(off[key]) || 0));
+    sum += d;
   }
   return sum;
+}
+
+// commit / commit (amend) / commit (initial) 保持原样；其余 reflog 动作带来的 HEAD 移动要减掉
+function isPureCommitSubject(subject) {
+  const action = String(subject || "").split(":")[0].trim().toLowerCase();
+  return action === "commit" || action.startsWith("commit (amend)") || action.startsWith("commit (initial)");
+}
+
+function stripRepoFiles(files, root) {
+  const prefix = root.endsWith(path.sep) ? root : root + path.sep;
+  for (const key of Object.keys(files)) {
+    if (key === root || key.startsWith(prefix)) delete files[key];
+  }
+}
+
+// HEAD 被 pull / merge / checkout / reset 等挪走时，返回 old..new 的行数；纯提交返回 null
+async function nonCommitDiscount(root, oldHead, newHead) {
+  const text = await gitTextAsync([
+    "-C", root, "reflog", "show", "-n", "40", "--format=%H%x09%gs", "HEAD",
+  ]);
+  const actions = [];
+  let sawOld = false;
+  for (const line of String(text || "").split("\n")) {
+    if (!line) continue;
+    const tab = line.indexOf("\t");
+    if (tab <= 0) continue;
+    const hash = line.slice(0, tab).trim();
+    const subject = line.slice(tab + 1).trim();
+    if (hash === oldHead) {
+      sawOld = true;
+      break;
+    }
+    actions.push(subject);
+  }
+  const nonCommit = !sawOld || actions.some((s) => !isPureCommitSubject(s));
+  if (!nonCommit) return null;
+  const numstat = await gitTextAsync([
+    "-C", root, "-c", "core.quotePath=false", "diff", "--numstat", oldHead, newHead,
+  ]);
+  const discount = {};
+  for (const row of parseNumstat(numstat)) {
+    if (row.n > 0) discount[path.join(root, row.file)] = row.n;
+  }
+  return discount;
+}
+
+// 一次 Bash 真正算手写的行数。git 失败时返回 0，避免把整段历史算进来，也不打断对话。
+// refs/stash 变了的仓库整次计 0（stash / pop / apply 之后 drop）。
+export async function handwrittenDelta(before, after) {
+  try {
+    const bFiles = { ...snapFiles(before) };
+    const aFiles = { ...snapFiles(after) };
+    const discount = {};
+    const roots = new Set([
+      ...Object.keys(before?.stashes || {}),
+      ...Object.keys(after?.stashes || {}),
+      ...Object.keys(before?.heads || {}),
+      ...Object.keys(after?.currents || {}),
+    ]);
+    for (const root of roots) {
+      const oldStash = before?.stashes?.[root] || "";
+      const newStash = after?.stashes?.[root] || "";
+      if (oldStash !== newStash) {
+        stripRepoFiles(bFiles, root);
+        stripRepoFiles(aFiles, root);
+        continue;
+      }
+      const oldHead = before?.heads?.[root] || "";
+      const newHead = after?.currents?.[root] || "";
+      if (!oldHead || !newHead || oldHead === newHead) continue;
+      const part = await nonCommitDiscount(root, oldHead, newHead);
+      if (part) Object.assign(discount, part);
+    }
+    return snapshotDelta({ files: bFiles }, { files: aFiles }, discount);
+  } catch {
+    return 0;
+  }
 }
 
 // 一次编辑工具调用新写入的行数
@@ -1343,7 +1806,10 @@ export function fullAccessOn(cfg, prov) {
   return typeof prov.fullAccessEnabled === "boolean" ? prov.fullAccessEnabled : workerFullAccess(cfg);
 }
 
-export function capsOf(cfg, prov) {
+export function capsOf(cfg, prov, model) {
   const full = fullAccessOn(cfg, prov);
-  return { web: prov?.caps?.web === true, exec: prov?.caps?.exec === true || full };
+  const vision = typeof prov?.modelCaps?.[model]?.vision === "boolean"
+    ? prov.modelCaps[model].vision
+    : prov?.caps?.vision === true;
+  return { web: prov?.caps?.web === true, exec: prov?.caps?.exec === true || full, vision };
 }

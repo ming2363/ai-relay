@@ -90,7 +90,7 @@ const POOL_META: Record<string, { name: string; provider: string; order: number 
 }
 const PROVIDER_TEXT: Record<string, string> = { codex: 'Codex', agy: 'Antigravity', grok: 'Grok', claude: 'Claude' }
 // 新增表单里预设模板的先后顺序
-const PRESET_ORDER = ['kimi', 'qwen', 'custom']
+const PRESET_ORDER = ['kimi', 'qwen', 'endpoint', 'custom']
 
 // 状态色（dataviz 规范的固定状态色，深浅色主题下都可读）；颜色从不单独表意，总配图标和文字
 const STATUS_HEX = { good: '#0ca30c', warning: '#fab219', critical: '#d03b3b', none: '#9a9a96' } as const
@@ -141,6 +141,7 @@ type RelayPool = {
   enabled?: boolean
   source?: string
   stale?: boolean
+  billing?: string
   windows: { key: string; remaining: number | null; resetAt?: number | null; source?: string | null }[]
 }
 
@@ -189,6 +190,14 @@ function fmtDateGroup(ms: number, now: number) {
   return `${md} ${w}`
 }
 
+// 过滤长密钥和 Token，避免出现在日志、存储或界面中
+export function maskSecrets(text: string): string {
+  if (!text || typeof text !== 'string') return text ?? ''
+  return text
+    .replace(/\b(sk-|ghp_|AKIA|xoxb-|xoxa-|xoxp-)[A-Za-z0-9_-]{12,}/g, '$1***')
+    .replace(/Bearer\s+[A-Za-z0-9_.~+/=-]{16,}/g, 'Bearer ***')
+}
+
 function toView(p: RelayPool): PoolView {
   const key = `${p.name}/${p.pool}`
   const meta = POOL_META[key]
@@ -209,6 +218,7 @@ function toView(p: RelayPool): PoolView {
     windows: windows.sort((a, b) => order(a.key) - order(b.key)),
     stale: Boolean(p.stale),
     source: p.source ?? '无',
+    billing: p.billing,
   }
 }
 
@@ -1062,7 +1072,7 @@ async function loadAllRounds($: Engine) {
       }
       try {
         const parsed: unknown = JSON.parse(await $.fs.read(`${roundsDir()}/${file.name}`))
-        if (Array.isArray(parsed)) merged.push(...(parsed as Round[]))
+        if (Array.isArray(parsed)) merged.push(...(parsed as Round[]).map(r => ({ ...r, text: maskSecrets(r.text) })))
       } catch {
         // 单个文件读取或解析失败就跳过
       }
@@ -1079,6 +1089,8 @@ async function loadAllRounds($: Engine) {
   }
 }
 
+let currentRelayScriptPath = ''
+
 // relay 脚本优先取已安装插件的路径，取不到时用源码路径
 async function relayScript($: Engine) {
   try {
@@ -1086,7 +1098,10 @@ async function relayScript($: Engine) {
     // 认任何插件市场来源的 ai-relay（ai-relay@<市场名>），不写死市场名
     const key = Object.keys(installed.plugins ?? {}).find(k => k.startsWith('ai-relay@'))
     const path = key ? installed.plugins[key]?.[0]?.installPath : undefined
-    if (path) return `${path}/scripts/relay.mjs`
+    if (path) {
+      currentRelayScriptPath = `${path}/scripts/relay.mjs`
+      return currentRelayScriptPath
+    }
   } catch {
     // 读不到安装记录时走下面的报错
   }
@@ -1144,7 +1159,10 @@ function poolOptions(pool: ModelPool, entry: ProviderCatalog | undefined): Selec
     options.push(opt)
   }
   if (known.length > 0 && pool.allowCliDefault) push(cliOption(entry))
-  for (const m of known) push({ value: m.id, label: catalogLabel(m.id, m.label) })
+  for (const m of known) {
+    const base = catalogLabel(m.id, m.label)
+    push({ value: m.id, label: m.isNew ? `${base}（新）` : base })
+  }
   if (pool.current && !seen.has(pool.current)) {
     const anywhere = (entry?.models ?? []).find(m => m.id === pool.current)
     push({ value: pool.current, label: `${catalogLabel(pool.current, anywhere?.label)}（清单里已没有）` })
@@ -1177,6 +1195,15 @@ function fmtAgo(iso: string, now: number) {
   if (min < 60) return `更新于 ${min} 分钟前`
   if (min < 24 * 60) return `更新于 ${Math.floor(min / 60)} 小时前`
   return `更新于 ${Math.floor(min / (24 * 60))} 天前`
+}
+
+const MODEL_CACHE_TTL_MS = 6 * 3600_000
+
+function isModelsStale(catalog: ModelsCatalog | null, now: number): boolean {
+  if (!catalog?.updatedAt) return false
+  const t = Date.parse(catalog.updatedAt)
+  if (Number.isNaN(t)) return false
+  return now - t > MODEL_CACHE_TTL_MS
 }
 
 function normalizeModelPools(raw: unknown): ModelPool[] {
@@ -1231,6 +1258,9 @@ function parseModels(stdout: string): ModelsCatalog {
             id: m.id,
             label: typeof m.label === 'string' && m.label ? m.label : m.id,
             pool: typeof m.pool === 'string' && m.pool ? m.pool : null,
+            firstSeen: typeof m.firstSeen === 'string' ? m.firstSeen : undefined,
+            isNew: m.isNew === true,
+            unpooled: m.unpooled === true,
           })
         }
       }
@@ -1333,6 +1363,19 @@ async function refreshVendors($: Engine) {
       fullAccess: p.fullAccess ?? { supported: false, enabled: false, note: '需要更新 ai-relay 插件' },
       modelPools: normalizeModelPools(p.modelPools),
     }))
+    data.presets = data.presets ?? {}
+    if (!data.presets.endpoint) {
+      data.presets.endpoint = {
+        title: '自定义接口',
+        label: '',
+        bin: '',
+        install: '',
+        cli: { prompt: [], model: [], read: [], write: [], cwd: null },
+        models: [],
+        roles: ['read', 'implement'],
+        note: '',
+      }
+    }
     await update($, vendors, () => data)
   } catch (err) {
     await update($, notice, () => ({ text: `读取厂商列表失败：${errText(err)}`, ok: false }))
@@ -1404,12 +1447,12 @@ async function switchMode($: Engine, mode: RelayMode) {
   if ((await read($, switching)) !== null) return
   await update($, switching, () => mode)
   try {
-    // 切到或切出 off 时会启停 Codex 插件，claude CLI 可能需要几十秒
-    const { exitCode, stderr } = await runRelay($, ['mode', mode], 120_000)
+    // 切换只改模式文件，钩子下一条消息起按新模式执行
+    const { exitCode, stderr } = await runRelay($, ['mode', mode], 30_000)
     if (exitCode !== 0) {
       $.ui.toast(`切换失败：${cleanErr(stderr).slice(0, 80)}`)
     } else {
-      $.ui.toast(`ai-relay 已切换为「${MODE_TEXT[mode]}」，插件启停在新会话完全生效`)
+      $.ui.toast(`ai-relay 已切换为「${MODE_TEXT[mode]}」，从下一条消息起生效`)
     }
   } catch (err) {
     $.ui.toast(`切换失败：${errText(err).slice(0, 80)}`)
@@ -1479,16 +1522,18 @@ async function testVendor($: Engine, v: Vendor) {
 
 function blankForm(data: VendorData, presetKey: string): AddForm {
   const p = data.presets[presetKey]
+  const isEndpoint = presetKey === 'endpoint'
   return {
     preset: presetKey,
-    name: presetKey === 'custom' ? '' : presetKey,
+    name: presetKey === 'custom' || isEndpoint ? '' : presetKey,
     label: p?.label ?? '',
     bin: p?.bin ?? '',
-    models: '',
-    promptArgs: p ? p.cli.prompt.join(' ') : '-p {prompt}',
-    modelArgs: p ? p.cli.model.join(' ') : '--model {model}',
-    readArgs: p ? p.cli.read.join(' ') : '',
-    writeArgs: p ? p.cli.write.join(' ') : '',
+    baseUrl: (p as unknown as { baseUrl?: string })?.baseUrl ?? '',
+    models: Array.isArray(p?.models) ? p.models.join(', ') : '',
+    promptArgs: p?.cli?.prompt ? p.cli.prompt.join(' ') : '-p {prompt}',
+    modelArgs: p?.cli?.model ? p.cli.model.join(' ') : '--model {model}',
+    readArgs: p?.cli?.read ? p.cli.read.join(' ') : '',
+    writeArgs: p?.cli?.write ? p.cli.write.join(' ') : '',
     roles: p?.roles ?? ['read'],
   }
 }
@@ -1496,10 +1541,54 @@ function blankForm(data: VendorData, presetKey: string): AddForm {
 async function submitForm($: Engine) {
   const f = await read($, form)
   if (!f) return
-  const spec: Record<string, unknown> = { preset: f.preset, name: f.name, label: f.label, bin: f.bin, models: f.models, roles: f.roles }
-  if (f.preset === 'custom') Object.assign(spec, { promptArgs: f.promptArgs, modelArgs: f.modelArgs, readArgs: f.readArgs, writeArgs: f.writeArgs })
+  let spec: Record<string, unknown>
+  if (f.preset === 'endpoint') {
+    const models = f.models
+      ? f.models.split(/[\n,]+/).map(s => s.trim()).filter(Boolean)
+      : []
+    spec = {
+      preset: 'endpoint',
+      name: f.name,
+      label: f.label || f.name,
+      baseUrl: f.baseUrl ?? '',
+      models,
+    }
+  } else {
+    spec = { preset: f.preset, name: f.name, label: f.label, bin: f.bin, models: f.models, roles: f.roles }
+    if (f.preset === 'custom') Object.assign(spec, { promptArgs: f.promptArgs, modelArgs: f.modelArgs, readArgs: f.readArgs, writeArgs: f.writeArgs })
+  }
   const ok = await vendorAction($, 'add', ['provider', 'add', '--json-spec', JSON.stringify(spec)], firstLines)
   if (ok) await update($, form, () => null)
+}
+
+// 启用或停用自定义接口厂商的某个模型白名单
+async function toggleVendorModel($: Engine, vendorName: string, modelId: string, add: boolean) {
+  const actionKey = `model:${vendorName}:${modelId}`
+  await update($, busy, () => actionKey)
+  try {
+    const args = ['provider', 'models', vendorName, add ? '--add' : '--remove', modelId]
+    const { exitCode, stdout, stderr } = await runRelay($, args)
+    if (exitCode !== 0) {
+      await update($, notice, () => ({ text: stderr.trim() || `exit ${exitCode}`, ok: false }))
+    } else {
+      const msg = stdout.trim() || `${vendorName} 模型 ${modelId} 已${add ? '启用' : '停用'}`
+      await update($, notice, () => ({ text: msg, ok: true }))
+      await refreshVendors($)
+      await refresh($)
+    }
+  } catch (err) {
+    await update($, notice, () => ({ text: errText(err), ok: false }))
+  } finally {
+    await update($, busy, () => null)
+  }
+}
+
+// 判断厂商模型是否支持看图能力：modelCaps[model].vision 优先，否则取 caps.vision
+function modelHasVision(v: Vendor, modelId: string): boolean {
+  if (v.modelCaps?.[modelId]?.vision !== undefined) {
+    return Boolean(v.modelCaps[modelId].vision)
+  }
+  return Boolean(v.caps?.vision)
 }
 
 // 打开面板并切到对话页。已经开着就只切页，不把面板关掉
@@ -1709,14 +1798,14 @@ export function desktopSessionGroupMap(links: readonly (readonly string[])[]): M
 export function roundListTitle(r: Round) {
   if (r.text === '') return '（系统触发的继续）'
   if (isSystemRoundText(r.text)) return '后台任务回报'
-  return r.text.replace(/\s+/g, ' ')
+  return maskSecrets(r.text).replace(/\s+/g, ' ')
 }
 
 // 详情里的「你的消息」：被留下的系统轮次同样不展示原始标签；用户原文保持换行
 export function roundDetailText(r: Round) {
   if (r.text === '') return '（系统触发的继续）'
   if (isSystemRoundText(r.text)) return '后台任务回报'
-  return r.text
+  return maskSecrets(r.text)
 }
 
 export { computeRoundTokens, fmtTokens, fmtUsage, readRelayEnabled, setRelayEnabled }
@@ -1965,7 +2054,11 @@ export const register: Register = on => {
     if (currentSessionId && (await read($, rounds)).length === 0) {
       try {
         const saved: unknown = JSON.parse(await $.fs.read(`${roundsDir()}/${currentSessionId}.json`))
-        if (Array.isArray(saved) && saved.length) await update($, rounds, () => (saved as Round[]).slice(0, MAX_ROUNDS))
+        if (Array.isArray(saved) && saved.length) {
+          await update($, rounds, () =>
+            (saved as Round[]).slice(0, MAX_ROUNDS).map(r => ({ ...r, text: maskSecrets(r.text) })),
+          )
+        }
       } catch {
         // 没有文件或读取失败：从空开始
       }
@@ -2033,7 +2126,7 @@ export const register: Register = on => {
       sessionId: currentSessionId,
       project,
       env,
-      text: e.text,
+      text: maskSecrets(e.text),
       mainModel,
       startedAt: await $.clock.now(),
       finishedAt: null,
@@ -2299,7 +2392,11 @@ export const register: Register = on => {
               }
               if (key === 'vendors') {
                 await refreshVendors($)
-                void loadModels($, false)
+                const mv = await read($, modelCatalog)
+                const now = await $.clock.now().catch(() => Date.now())
+                if (mv.status === 'idle' || (mv.status === 'ready' && isModelsStale(mv.catalog, now))) {
+                  void loadModels($, false)
+                }
               }
             }}
           />
@@ -2382,7 +2479,10 @@ export const register: Register = on => {
       }
 
       const poolCard = (p: PoolView) => {
-        const status = p.enabled ? LEVEL_LABEL[p.level] : { icon: '⏸', text: '已停用', tone: 'none' as Tone }
+        const isMetered = p.billing === 'metered'
+        const status = p.enabled
+          ? (isMetered ? { icon: '●', text: '按量计费', tone: 'good' as Tone } : LEVEL_LABEL[p.level])
+          : { icon: '⏸', text: '已停用', tone: 'none' as Tone }
         return (
           <Box key={`pool-${p.name}`} flexDirection="column">
             <Box flexDirection="row" alignItems="center" justifyContent="space-between">
@@ -2398,7 +2498,14 @@ export const register: Register = on => {
               </Box>
               {badge(status.icon, status.text, status.tone)}
             </Box>
-            {p.enabled && p.windows.map(w => meterRow(w, p.name))}
+            {p.enabled && isMetered && (
+              <Box flexDirection="row" alignItems="center" columnGap={1}>
+                <Text size="caption" dimColor>
+                  按量计费
+                </Text>
+              </Box>
+            )}
+            {p.enabled && !isMetered && p.windows.map(w => meterRow(w, p.name))}
             {p.enabled && p.stale && (
               <Text size="caption" color="warning">
                 数据已过期，等待刷新
@@ -2831,10 +2938,10 @@ export const register: Register = on => {
     }
 
     // ---------- 厂商页 ----------
+    const scriptPath = currentRelayScriptPath || (await relayScript($).catch(() => 'relay.mjs'))
     // 模型清单在后台取，不挡住厂商卡片
     const modelsView = await read($, modelCatalog)
     const savingNow = await read($, savingModels)
-    if (modelsView.status === 'idle') void loadModels($, false)
     const data = await read($, vendors)
     if (data === null) return page(noticeBar, <Text dimColor>正在读取厂商…</Text>)
     const f = await read($, form)
@@ -2842,8 +2949,15 @@ export const register: Register = on => {
     const roleText = (keys: string[]) => keys.map(k => data.roles.find(r => r.key === k)?.text ?? k).join(' · ') || '不参与自动派活'
     const busyLabel = (key: string, text: string) => (busyKey === key ? `${text}…` : text)
 
+    // 直接停在厂商页（没点过标签，比如重启后）时也要加载模型清单
+    if (modelsView.status === 'idle') void loadModels($, false)
     // 默认模型：标题一行（刷新、更新时间），每个额度池一行下拉和一句说明
     const modelsAgo = fmtAgo(modelsView.catalog?.updatedAt ?? '', now)
+    const totalNewModels = Object.values(modelsView.catalog?.providers ?? {}).reduce(
+      (sum, p) => sum + (p.models?.filter(m => m.isNew).length ?? 0),
+      0,
+    )
+    const newModelsSuffix = totalNewModels > 0 ? ` · ${totalNewModels} 个新模型` : ''
     const modelSection = (v: Vendor) => {
       const pools = v.modelPools ?? []
       const entry = modelsView.catalog?.providers?.[v.name]
@@ -2905,6 +3019,91 @@ export const register: Register = on => {
       )
     }
 
+    const modelListBlock = (v: Vendor) => {
+      const entry = modelsView.catalog?.providers?.[v.name]
+      const items: { id: string; label: string; isNew?: boolean; unpooled?: boolean }[] = []
+      const seen = new Set<string>()
+      if (entry?.models && entry.models.length > 0) {
+        for (const m of entry.models) {
+          if (!seen.has(m.id)) {
+            seen.add(m.id)
+            items.push({ id: m.id, label: m.label || m.id, isNew: m.isNew, unpooled: m.unpooled })
+          }
+        }
+      }
+      if (Array.isArray(v.models)) {
+        for (const id of v.models) {
+          if (!seen.has(id)) {
+            seen.add(id)
+            const matched = entry?.models?.find(m => m.id === id)
+            items.push({ id, label: matched?.label || id, isNew: matched?.isNew, unpooled: matched?.unpooled })
+          }
+        }
+      }
+      if (items.length === 0) return null
+      const isCustomEndpoint = Boolean(v.endpoint)
+      const whitelist = new Set(v.models ?? [])
+      return (
+        <Box key={`model-list-${v.name}`} flexDirection="column" rowGap={0} marginTop={1}>
+          <Text size="caption" dimColor>
+            {isCustomEndpoint ? '模型白名单' : '可用模型'}
+          </Text>
+          {items.map(item => {
+            const canVision = modelHasVision(v, item.id)
+            const isWhitelisted = whitelist.has(item.id)
+            const busyNow = busyKey === `model:${v.name}:${item.id}`
+            return (
+              <Box key={`model-item-${v.name}-${item.id}`} flexDirection="row" alignItems="center" justifyContent="space-between" columnGap={1}>
+                <Box flexDirection="row" columnGap={1} alignItems="center" flexShrink={1} minWidth={0}>
+                  <Text size="footnote" wrap="truncate-end">
+                    {item.label}
+                  </Text>
+                  {item.isNew && (
+                    <Text size="caption" color="accent">
+                      新
+                    </Text>
+                  )}
+                  {canVision && (
+                    <Text size="caption" color="success">
+                      能看图
+                    </Text>
+                  )}
+                  {item.unpooled && (
+                    <Text size="caption" dimColor>
+                      未归入额度池
+                    </Text>
+                  )}
+                  {isCustomEndpoint && !isWhitelisted && (
+                    <Text size="caption" dimColor>
+                      未启用
+                    </Text>
+                  )}
+                </Box>
+                {isCustomEndpoint && (
+                  <Box flexDirection="row" columnGap={1}>
+                    {isWhitelisted ? (
+                      <Button
+                        key={`disable-model-${v.name}-${item.id}`}
+                        label={busyNow ? '停用…' : '停用'}
+                        dimColor
+                        onPress={() => toggleVendorModel($, v.name, item.id, false)}
+                      />
+                    ) : (
+                      <Button
+                        key={`enable-model-${v.name}-${item.id}`}
+                        label={busyNow ? '启用…' : '启用'}
+                        onPress={() => toggleVendorModel($, v.name, item.id, true)}
+                      />
+                    )}
+                  </Box>
+                )}
+              </Box>
+            )
+          })}
+        </Box>
+      )
+    }
+
     const vendorCard = (v: Vendor) => {
       const status =
         v.via === 'self'
@@ -2912,8 +3111,15 @@ export const register: Register = on => {
           : v.enabled
             ? { icon: '●', text: '已启用', tone: 'good' as Tone }
             : { icon: '○', text: '已停用', tone: 'none' as Tone }
-      const viaBase = v.via === 'codex-plugin' ? 'Codex 官方插件' : v.via === 'self' ? '当前会话' : `官方 CLI · ${v.bin || v.name}`
-      const showBin = v.via !== 'self' && v.bin !== ''
+      const isEndpoint = Boolean(v.endpoint)
+      const viaBase = isEndpoint
+        ? '自定义接口'
+        : v.via === 'codex-plugin'
+          ? 'Codex 官方插件'
+          : v.via === 'self'
+            ? '当前会话'
+            : `官方 CLI · ${v.bin || v.name}`
+      const showBin = v.via !== 'self' && v.bin !== '' && !isEndpoint
       const viaText = showBin ? `${viaBase} · ${v.binFound ? '已安装' : '未安装'}` : viaBase
       const accessText = v.fullAccess.supported
         ? v.fullAccess.enabled
@@ -2931,9 +3137,14 @@ export const register: Register = on => {
           {badge(status.icon, status.text, status.tone)}
         </Box>,
         field('调用方式', viaText, showBin && !v.binFound ? { color: 'warning' } : undefined),
+        isEndpoint && field('接口地址', v.endpoint!.baseUrl),
+        (isEndpoint || v.billing === 'metered') && field('计费方式', '按量计费'),
+        isEndpoint && field('密钥', v.hasKey ? '已设置' : '未设置', !v.hasKey ? { color: 'warning' } : undefined),
+        isEndpoint && !v.hasKey && field('设置命令', `node ${scriptPath} provider key ${v.name}`),
         field('擅长', goodAt),
         field('最高权限', accessText, v.fullAccess.supported ? undefined : { dimColor: true }),
         (v.modelPools?.length ?? 0) > 0 && modelSection(v),
+        modelListBlock(v),
         v.note !== '' && field('备注', v.note, { color: 'warning' }),
         pendingRemove === v.name ? (
           <Box flexDirection="row" columnGap={1} alignItems="center" marginTop={1}>
@@ -2973,7 +3184,7 @@ export const register: Register = on => {
           key={`form-${key}`}
           label={text}
           placeholder={placeholder}
-          value={f ? String(f[key]) : ''}
+          value={f ? String(f[key] ?? '') : ''}
           submitLabel="确定"
           onInput={(v: string) => setField(key, v)}
           onSubmit={(v: string) => setField(key, v)}
@@ -2998,7 +3209,7 @@ export const register: Register = on => {
             {preset.note}
           </Text>
         )}
-        {f.preset !== 'custom' && (
+        {f.preset !== 'custom' && f.preset !== 'endpoint' && (
           <Text size="caption" dimColor>
             标识 {f.name} · 命令 {f.bin}
             {preset?.install ? ` · 安装：${preset.install}` : ''}
@@ -3006,33 +3217,37 @@ export const register: Register = on => {
         )}
         <Box flexDirection="column" rowGap={1}>
           {f.preset === 'custom' && formInput('name', '标识', '小写英文，如 kimi')}
-          {formInput('label', '显示名', '如 Kimi 会员')}
+          {f.preset === 'endpoint' && formInput('name', '名称', '如 maas')}
+          {f.preset !== 'endpoint' && formInput('label', '显示名', '如 Kimi 会员')}
+          {f.preset === 'endpoint' && formInput('baseUrl', '接口地址', '如 https://model-api.maas.com.cn')}
           {f.preset === 'custom' && formInput('bin', '命令', '如 kimi')}
-          {formInput('models', '模型', '留空用默认；多个用逗号分隔')}
+          {formInput('models', '模型', f.preset === 'endpoint' ? '多个用逗号或换行分隔' : '留空用默认；多个用逗号分隔')}
           {f.preset === 'custom' && formInput('promptArgs', '提示参数', '必须含 {prompt}，如 -p {prompt}')}
           {f.preset === 'custom' && formInput('modelArgs', '模型参数', '如 --model {model}')}
           {f.preset === 'custom' && formInput('readArgs', '只读参数', '如 --approval-mode plan')}
           {f.preset === 'custom' && formInput('writeArgs', '可写参数', '如 --approval-mode auto-edit')}
         </Box>
-        <Box flexDirection="column" rowGap={1}>
-          <Text size="caption" dimColor>
-            参与哪些任务（新厂商排在路由末尾）
-          </Text>
-          <Box flexDirection="row" flexWrap="wrap" columnGap={1} rowGap={1}>
-            {data.roles.map(r => (
-              <Button
-                key={`role-${r.key}`}
-                label={f.roles.includes(r.key) ? `✓ ${r.text}` : r.text}
-                variant={f.roles.includes(r.key) ? 'primary' : 'secondary'}
-                onPress={() =>
-                  update($, form, cur =>
-                    cur ? { ...cur, roles: cur.roles.includes(r.key) ? cur.roles.filter(x => x !== r.key) : [...cur.roles, r.key] } : cur,
-                  )
-                }
-              />
-            ))}
+        {f.preset !== 'endpoint' && (
+          <Box flexDirection="column" rowGap={1}>
+            <Text size="caption" dimColor>
+              参与哪些任务（新厂商排在路由末尾）
+            </Text>
+            <Box flexDirection="row" flexWrap="wrap" columnGap={1} rowGap={1}>
+              {data.roles.map(r => (
+                <Button
+                  key={`role-${r.key}`}
+                  label={f.roles.includes(r.key) ? `✓ ${r.text}` : r.text}
+                  variant={f.roles.includes(r.key) ? 'primary' : 'secondary'}
+                  onPress={() =>
+                    update($, form, cur =>
+                      cur ? { ...cur, roles: cur.roles.includes(r.key) ? cur.roles.filter(x => x !== r.key) : [...cur.roles, r.key] } : cur,
+                    )
+                  }
+                />
+              ))}
+            </Box>
           </Box>
-        </Box>
+        )}
         <Box flexDirection="row" columnGap={1}>
           <Button key="form-save" label={busyLabel('add', '保存')} variant="primary" onPress={() => submitForm($)} />
           <Button key="form-cancel" label="取消" dimColor onPress={() => update($, form, () => null)} />
@@ -3052,7 +3267,7 @@ export const register: Register = on => {
         <Box flexDirection="row" columnGap={1} alignItems="center">
           {modelsAgo !== '' && (
             <Text size="caption" dimColor>
-              {`模型列表${modelsAgo}`}
+              {`模型列表${modelsAgo}${newModelsSuffix}`}
             </Text>
           )}
           <Button

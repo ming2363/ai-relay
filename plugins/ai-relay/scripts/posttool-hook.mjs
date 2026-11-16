@@ -1,8 +1,8 @@
 // PostToolUse 钩子：
 //   Codex 子代理结束后补全外派记录（完成 / 失败），并提醒主模型验收后记录结论
-//   自动模式下统计主模型亲手改动的行数（含 Bash 写入），写得多时提醒考虑外派（只是提醒，不是限制）
-//   自动模式下统计主模型读文件次数，额度紧张且读得多时提醒外派
-//   Bash 里的 relay self / relay run 记下这一轮的分工
+//   自动模式下统计主模型亲手改动的行数（含 Bash 写入）。自己做超过上限要重新定分工；已派可写任务只提醒一次
+//   自动模式下统计主模型读文件次数（含 Bash 里的 cat / grep 等），超过上限任何档位都提醒一次
+//   Bash 里的 relay self / 带 --write 的 relay run 记下这一轮的分工
 import fs from "node:fs";
 import { helpRequestOf } from "./brief.mjs";
 import path from "node:path";
@@ -10,8 +10,8 @@ import {
   RELAY_SCRIPT, JOBS_DIR, ensureStateDir, appendHistory, getMode, loadConfig,
   readSelfEdits, writeSelfEdits, editedLines, readHistory, gitSnapshot,
   diffSnapshots, checkOutOfScope, readQuotaRows, claudeThrottle,
-  isScratchPath, readBashSnap, clearBashSnap, resolveRepos, lineSnapshot, snapshotDelta,
-  selfEditLimitMessage, bashWroteReminder, isRelayRunCommand,
+  isScratchPath, readBashSnap, clearBashSnap, resolveRepos, lineSnapshot, handwrittenDelta,
+  selfEditLimitMessage, selfReadLimitMessage, bashWroteReminder, isRelayRunWriteCommand, bashReadCount,
 } from "./lib.mjs";
 
 const EDIT_TOOLS = new Set(["Edit", "MultiEdit", "Write", "NotebookEdit"]);
@@ -54,19 +54,44 @@ function relaySelfReason(text) {
   return "";
 }
 
+// Read/Grep/Glob 和 Bash 读文件共用。没超限或已经提醒过就不再查额度。
+function remindReads(stat, cfg) {
+  const limit = cfg?.selfReadMax ?? 8;
+  if (!stat || stat.readWarned || !(stat.reads > limit)) return "";
+  let level = 0;
+  if (cfg) {
+    try {
+      level = claudeThrottle(cfg, readQuotaRows(cfg)).level || 0;
+    } catch {}
+  }
+  return selfReadLimitMessage(stat, limit, level);
+}
+
 async function handlePostBash(input) {
   if (input.agent_id || getMode() !== "auto" || !input.session_id) return;
   const sessionId = String(input.session_id);
   const command = String(input.tool_input?.command || "");
   const stat = readSelfEdits(sessionId);
   const isRelay = command.includes("relay.mjs");
+  let cfg = null;
+  try {
+    cfg = loadConfig();
+  } catch {}
+  const limit = cfg?.selfEditMaxLines || 40;
+  // 刚用 relay self 定了自己做：同一次调用里不因为早已超限而立刻把分工清掉
+  let justSelf = false;
   if (isRelay && !stat.decision) {
     const reason = relaySelfReason(bashOutputText(input.tool_response));
     if (reason) {
+      if (stat.limitReset && stat.selfReason) {
+        stat.selfReason = `${stat.selfReason}；超 ${limit} 行后：${reason}`;
+      } else {
+        stat.selfReason = reason;
+      }
       stat.decision = "self";
-      stat.selfReason = reason;
       stat.bashPending = false;
-    } else if (isRelayRunCommand(command)) {
+      justSelf = true;
+    } else if (isRelayRunWriteCommand(command)) {
       stat.decision = "dispatch";
       stat.bashPending = false;
     }
@@ -79,7 +104,7 @@ async function handlePostBash(input) {
       // 只对比前快照里的仓库，并以当时的 HEAD 为基准：中途新纳入的仓库原有改动不算，命令里的提交也不算改动
       const heads = before.heads && typeof before.heads === "object" ? before.heads : null;
       const repos = heads ? Object.keys(heads) : resolveRepos(sessionId, stat, cwd, command);
-      delta = snapshotDelta(before, await lineSnapshot(cwd, repos, heads || undefined));
+      delta = await handwrittenDelta(before, await lineSnapshot(cwd, repos, heads || undefined));
     } catch {
       delta = 0;
     }
@@ -89,15 +114,15 @@ async function handlePostBash(input) {
     stat.lines += delta;
     if (!stat.decision) stat.bashPending = true;
   }
-  let limit = 40;
-  try {
-    limit = loadConfig().selfEditMaxLines || 40;
-  } catch {}
-  const warn = selfEditLimitMessage(stat, limit);
+  stat.reads += bashReadCount(command);
+  const warn = justSelf ? "" : selfEditLimitMessage(stat, limit);
+  const readsWarn = remindReads(stat, cfg);
   writeSelfEdits(sessionId, stat);
   const parts = [];
-  if (delta > 0 && !stat.decision) parts.push(bashWroteReminder(delta));
+  // 超限重置后的提醒用超限那段，不再叠一句「还没定分工」
+  if (delta > 0 && !stat.decision && !stat.limitReset) parts.push(bashWroteReminder(delta));
   if (warn) parts.push(warn);
+  if (readsWarn) parts.push(readsWarn);
   if (parts.length) context(parts.join("\n"));
 }
 
@@ -113,18 +138,9 @@ function main() {
     const cfg = loadConfig();
     const stat = readSelfEdits(input.session_id);
     stat.reads += 1;
-    const limit = cfg.selfReadMax ?? 8;
-    // 没超限或已经提醒过就不再查额度
-    if (stat.reads > limit && !stat.readWarned) {
-      const level = claudeThrottle(cfg, readQuotaRows(cfg)).level;
-      if (level >= 1) {
-        stat.readWarned = true;
-        context(
-          `[ai-relay 节流] 这一轮你已读了 ${stat.reads} 次文件，Claude 额度紧张。剩下的阅读、排查请派给 read / debug 角色（relay pick read），你只看它们的结论。`,
-        );
-      }
-    }
+    const warn = remindReads(stat, cfg);
     writeSelfEdits(input.session_id, stat);
+    if (warn) context(warn);
     return;
   }
 

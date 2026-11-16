@@ -59,7 +59,8 @@
       "sandbox": "workspace",
       "caps": {
         "web": false,
-        "exec": true
+        "exec": true,
+        "vision": false
       }
     },
     "agy": {
@@ -141,7 +142,8 @@
       },
       "caps": {
         "web": true,
-        "exec": false
+        "exec": false,
+        "vision": true
       }
     },
     "grok": {
@@ -186,7 +188,8 @@
       },
       "caps": {
         "web": true,
-        "exec": false
+        "exec": false,
+        "vision": true
       }
     }
   },
