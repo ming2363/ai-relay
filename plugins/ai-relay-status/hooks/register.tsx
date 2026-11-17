@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface as Engine, FsEntry, Register, RenderChildren, SelectOption } from 'claude-code'
 
-import type { AddForm, JobView, ModelPool, ModelsCatalog, ModelsView, PoolView, ProviderCatalog, RelayMode, Round, RoundAgent, RoundTokenRow, Snapshot, TokenUsage, Vendor, VendorData, WindowView } from '../types'
+import type { AddForm, JobView, LastCycle, ModelFixedRole, ModelPool, ModelsCatalog, ModelsView, PoolView, ProviderCatalog, RelayMode, Round, RoundAgent, RoundTokenRow, Snapshot, TokenUsage, Vendor, VendorData, WindowView, WorkStats, WorkStatsView } from '../types'
 
 // 家目录在会话启动时用 $.env.get('HOME') 读取，不写死，别人安装也能用
 let HOME = ''
@@ -46,6 +46,12 @@ const MODEL_CATALOG_INIT: ModelsView = { catalog: null, status: 'idle', error: n
 const modelCatalog = atom({ plugin: 'ai-relay-status', key: 'modelCatalog' } as const, MODEL_CATALOG_INIT, { shape: 'model-catalog-1' })
 /** 正在保存的「厂商:额度池」。Select 没有禁用，保存中卸下下拉框，避免重复提交 */
 const savingModels = atom({ plugin: 'ai-relay-status', key: 'savingModels' } as const, [] as string[])
+// 厂商页展开查看详情的厂商标识，默认全部折叠
+const openVendors = atom({ plugin: 'ai-relay-status', key: 'openVendors' } as const, [] as string[])
+// 厂商页展开了路由明细的「厂商:额度池」
+const openRouteDetails = atom({ plugin: 'ai-relay-status', key: 'openRouteDetails' } as const, [] as string[])
+const WORK_STATS_INIT: WorkStatsView = { data: null, status: 'idle' }
+const workStats = atom({ plugin: 'ai-relay-status', key: 'workStats' } as const, WORK_STATS_INIT, { shape: 'work-stats-1' })
 // 提示条的时长节拍。只让提示条订阅，避免每 5 秒把整个面板重绘一遍
 const bandTick = atom({ plugin: 'ai-relay-status', key: 'bandTick' } as const, 0)
 // 插件总开关：记录在 ~/.claude/settings.json 的 enabledPlugins 中
@@ -70,6 +76,8 @@ let desktopProjectsReadAt = 0
 let bandPollBusy = false
 // 上次成功发起 relay jobs 的时刻。提示条用它做 60 秒兜底，不依赖当时是否已经看见进行中的任务
 let bandPollAt = 0
+// 防止同一次切页或重绘并发重复拉取工作量统计
+let statsLoading = false
 
 const MODES: RelayMode[] = ['off', 'manual', 'auto']
 const MODE_TEXT: Record<RelayMode, string> = { off: '纯 Claude', manual: '手动', auto: '自动' }
@@ -143,6 +151,7 @@ type RelayPool = {
   stale?: boolean
   billing?: string
   windows: { key: string; remaining: number | null; resetAt?: number | null; source?: string | null }[]
+  lastCycles?: { window?: string; leftover?: number; endedAt?: number; reliable?: boolean }[]
 }
 
 const pad2 = (n: number) => String(n).padStart(2, '0')
@@ -209,6 +218,25 @@ function toView(p: RelayPool): PoolView {
   if (key === 'claude/claude-subscription' && !windows.some(w => w.key === '5h')) {
     windows.push({ key: '5h', remaining: null, resetAt: null, source: null })
   }
+  const lastCycles: LastCycle[] = Array.isArray(p.lastCycles)
+    ? p.lastCycles
+        .filter(
+          (c): c is { window: string; leftover: number; endedAt?: number; reliable?: boolean } =>
+            Boolean(c) &&
+            typeof c === 'object' &&
+            typeof c.window === 'string' &&
+            c.window !== '' &&
+            typeof c.leftover === 'number' &&
+            Number.isFinite(c.leftover),
+        )
+        .map(c => ({
+          window: c.window,
+          leftover: c.leftover,
+          endedAt: typeof c.endedAt === 'number' ? c.endedAt : 0,
+          reliable: c.reliable === true,
+        }))
+        .sort((a, b) => order(a.window) - order(b.window))
+    : []
   return {
     // 新增厂商的额度池与厂商同名，直接显示厂商标识
     name: meta?.name ?? (p.pool === p.name ? p.name : key),
@@ -219,6 +247,7 @@ function toView(p: RelayPool): PoolView {
     stale: Boolean(p.stale),
     source: p.source ?? '无',
     billing: p.billing,
+    ...(lastCycles.length > 0 ? { lastCycles } : {}),
   }
 }
 
@@ -1129,13 +1158,76 @@ function roleName(roles: { key: string; text: string }[], key: string) {
   return roles.find(r => r.key === key)?.text || MODEL_ROLE_TEXT[key] || key
 }
 
-/** 额度池下面那行：用于哪些角色，以及写死了模型的角色 */
+/** 额度池下面那行：仅列参与的角色；单独指定明细收起在按钮里 */
 function poolUsage(roles: { key: string; text: string }[], pool: ModelPool) {
-  const follow = pool.followRoles ?? []
-  const fixed = pool.fixedRoles ?? []
-  const used = follow.length ? `用于：${follow.map(k => roleName(roles, k)).join('、')}` : '暂无角色使用'
-  if (!fixed.length) return used
-  return `${used}；单独指定：${fixed.map(f => `${roleName(roles, f.role)} → ${f.model}`).join('、')}`
+  const allKeys: string[] = []
+  for (const k of pool.followRoles ?? []) {
+    if (!allKeys.includes(k)) allKeys.push(k)
+  }
+  for (const f of pool.fixedRoles ?? []) {
+    if (!allKeys.includes(f.role)) allKeys.push(f.role)
+  }
+  return allKeys.length ? `参与：${allKeys.map(k => roleName(roles, k)).join('、')}` : '暂无角色使用'
+}
+
+/** 额度池单独指定的角色与模型明细 */
+function poolFixedUsage(roles: { key: string; text: string }[], fixed: ModelFixedRole[]) {
+  return `单独指定：${fixed.map(f => `${roleName(roles, f.role)} → ${f.model}`).join('、')}`
+}
+
+function poolSummaryModel(pool: ModelPool, entry: ProviderCatalog | undefined): string {
+  const id = pool.current || (pool.allowCliDefault ? entry?.cliDefault : null)
+  if (id) {
+    const matched = (entry?.models ?? []).find(m => m.id === id)
+    return matched?.label || id
+  }
+  return pool.allowCliDefault ? '跟随 CLI 默认' : '未设置'
+}
+
+/** 厂商卡片折叠态标题行右侧的简短摘要 */
+function vendorSummary(v: Vendor, entry: ProviderCatalog | undefined): string {
+  if (!v.enabled) return ''
+  const parts: string[] = []
+  const pools = v.modelPools ?? []
+  if (pools.length > 0) {
+    parts.push(`默认 ${pools.map(p => poolSummaryModel(p, entry)).join(' · ')}`)
+  }
+  if (Boolean(v.endpoint) || v.billing === 'metered') {
+    parts.push('按量计费')
+  }
+  return parts.join(' · ')
+}
+
+function parseWorkStats(stdout: string): WorkStats | null {
+  const raw = JSON.parse(stdout) as unknown
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const obj = raw as Record<string, unknown>
+  if (typeof obj.workerLines !== 'number' || !Number.isFinite(obj.workerLines)) return null
+  if (typeof obj.selfLines !== 'number' || !Number.isFinite(obj.selfLines)) return null
+  const roundsRaw = obj.rounds
+  if (!roundsRaw || typeof roundsRaw !== 'object' || Array.isArray(roundsRaw)) return null
+  const r = roundsRaw as Record<string, unknown>
+  if (typeof r.edited !== 'number' || !Number.isFinite(r.edited)) return null
+  if (typeof r.withWriteDispatch !== 'number' || !Number.isFinite(r.withWriteDispatch)) return null
+  const byWorker: Record<string, number> = {}
+  if (obj.byWorker && typeof obj.byWorker === 'object' && !Array.isArray(obj.byWorker)) {
+    for (const [k, v] of Object.entries(obj.byWorker as Record<string, unknown>)) {
+      if (typeof v === 'number' && Number.isFinite(v)) byWorker[k] = v
+    }
+  }
+  const workerShare = typeof obj.workerShare === 'number' && Number.isFinite(obj.workerShare) ? obj.workerShare : null
+  return {
+    workerLines: obj.workerLines,
+    byWorker,
+    selfLines: obj.selfLines,
+    rounds: { edited: r.edited, withWriteDispatch: r.withWriteDispatch },
+    workerShare,
+  }
+}
+
+function formatWorkStats(s: WorkStats): string {
+  const share = typeof s.workerShare === 'number' ? `（占比 ${Math.round(s.workerShare * 100)}%）` : ''
+  return `员工 ${s.workerLines} 行${share} · 主管 ${s.selfLines} 行；有外派的轮次 ${s.rounds.withWriteDispatch} / 改过代码的轮次 ${s.rounds.edited}`
 }
 
 function catalogLabel(id: string, label?: string) {
@@ -1399,6 +1491,32 @@ async function loadModels($: Engine, refresh = false) {
   }
 }
 
+// 进入厂商页时取近 7 天工作量统计。失败时清掉数据不展示，不报错
+async function loadStats($: Engine) {
+  if (statsLoading) return
+  statsLoading = true
+  try {
+    const cur = await read($, workStats)
+    if (cur.status === 'loading') return
+    await update($, workStats, (s): WorkStatsView => ({ ...s, status: 'loading' }))
+    const { exitCode, stdout } = await runRelay($, ['stats', '--json', '--days', '7'])
+    if (exitCode !== 0) {
+      await update($, workStats, (): WorkStatsView => ({ data: null, status: 'error' }))
+      return
+    }
+    const parsed = parseWorkStats(stdout)
+    if (!parsed) {
+      await update($, workStats, (): WorkStatsView => ({ data: null, status: 'error' }))
+      return
+    }
+    await update($, workStats, (): WorkStatsView => ({ data: parsed, status: 'ready' }))
+  } catch {
+    await update($, workStats, (): WorkStatsView => ({ data: null, status: 'error' }))
+  } finally {
+    statsLoading = false
+  }
+}
+
 async function applyPoolCurrent($: Engine, name: string, pool: string, current: string | null) {
   await update($, vendors, data => {
     if (!data) return data
@@ -1579,6 +1697,32 @@ async function toggleVendorModel($: Engine, vendorName: string, modelId: string,
   } catch (err) {
     await update($, notice, () => ({ text: errText(err), ok: false }))
   } finally {
+    await update($, busy, () => null)
+  }
+}
+
+// 为多池厂商的未归池模型指定额度池归属规则
+async function assignModelPool($: Engine, vendorName: string, modelId: string, poolId: string) {
+  if (!poolId || poolId === NO_MODEL) return
+  const actionKey = `pool-rule:${vendorName}:${modelId}`
+  if (savingLock.has(actionKey)) return
+  savingLock.add(actionKey)
+  await update($, busy, () => actionKey)
+  try {
+    const args = ['provider', 'pool-rule', vendorName, modelId, poolId]
+    const { exitCode, stdout, stderr } = await runRelay($, args)
+    if (exitCode !== 0) {
+      await update($, notice, () => ({ text: cleanErr(stderr) || cleanErr(stdout) || `失败（退出码 ${exitCode}）`, ok: false }))
+    } else {
+      const msg = stdout.trim() || `${vendorName} 模型 ${modelId} 已归入额度池 ${poolId}`
+      await update($, notice, () => ({ text: msg, ok: true }))
+      await loadModels($, false)
+      await refreshVendors($)
+    }
+  } catch (err) {
+    await update($, notice, () => ({ text: errText(err), ok: false }))
+  } finally {
+    savingLock.delete(actionKey)
     await update($, busy, () => null)
   }
 }
@@ -2048,6 +2192,7 @@ export const register: Register = on => {
     desktopProjectsReadAt = 0
     bandPollBusy = false
     bandPollAt = 0
+    statsLoading = false
     currentProject = { name: dirName(currentCwd) || 'unknown', path: currentCwd }
     await migrateStoredRounds($)
     // 会话重新打开时内存是空的：先从自己那份文件读回历史，免得下一次保存用空列表把它覆盖
@@ -2391,7 +2536,7 @@ export const register: Register = on => {
                 await loadAllRounds($)
               }
               if (key === 'vendors') {
-                await refreshVendors($)
+                await Promise.all([refreshVendors($), loadStats($)])
                 const mv = await read($, modelCatalog)
                 const now = await $.clock.now().catch(() => Date.now())
                 if (mv.status === 'idle' || (mv.status === 'ready' && isModelsStale(mv.catalog, now))) {
@@ -2506,6 +2651,17 @@ export const register: Register = on => {
               </Box>
             )}
             {p.enabled && !isMetered && p.windows.map(w => meterRow(w, p.name))}
+            {p.enabled &&
+              (p.lastCycles ?? [])
+                .filter(c => c.reliable)
+                .map((c, idx) => {
+                  const winLabel = c.window === '5h' ? '5 小时' : c.window === 'weekly' ? '本周' : c.window
+                  return (
+                    <Text key={`last-cycle-${p.name}-${c.window}-${idx}`} size="caption" dimColor>
+                      {`上个${winLabel}周期剩 ${Math.round(c.leftover * 100)}% 未用`}
+                    </Text>
+                  )
+                })}
             {p.enabled && p.stale && (
               <Text size="caption" color="warning">
                 数据已过期，等待刷新
@@ -2939,18 +3095,23 @@ export const register: Register = on => {
 
     // ---------- 厂商页 ----------
     const scriptPath = currentRelayScriptPath || (await relayScript($).catch(() => 'relay.mjs'))
-    // 模型清单在后台取，不挡住厂商卡片
+    // 模型清单和近 7 天统计在后台取，不挡住厂商卡片
     const modelsView = await read($, modelCatalog)
+    const statsView = await read($, workStats)
     const savingNow = await read($, savingModels)
+    const openVendorIds = new Set(await read($, openVendors))
+    const openRouteIds = new Set(await read($, openRouteDetails))
     const data = await read($, vendors)
     if (data === null) return page(noticeBar, <Text dimColor>正在读取厂商…</Text>)
     const f = await read($, form)
     const pendingRemove = await read($, confirmRemove)
     const roleText = (keys: string[]) => keys.map(k => data.roles.find(r => r.key === k)?.text ?? k).join(' · ') || '不参与自动派活'
     const busyLabel = (key: string, text: string) => (busyKey === key ? `${text}…` : text)
+    const toggleKey = (ids: string[], id: string) => (ids.includes(id) ? ids.filter(x => x !== id) : [...ids, id])
 
-    // 直接停在厂商页（没点过标签，比如重启后）时也要加载模型清单
+    // 直接停在厂商页（没点过标签，比如重启后）时也要加载模型清单与工作量统计
     if (modelsView.status === 'idle') void loadModels($, false)
+    if (statsView.status === 'idle') void loadStats($)
     // 默认模型：标题一行（刷新、更新时间），每个额度池一行下拉和一句说明
     const modelsAgo = fmtAgo(modelsView.catalog?.updatedAt ?? '', now)
     const totalNewModels = Object.values(modelsView.catalog?.providers ?? {}).reduce(
@@ -2973,6 +3134,9 @@ export const register: Register = on => {
             const rowTitle = pools.length === 1 ? undefined : pool.label
             const options = poolOptions(pool, entry)
             const rowSaving = savingNow.includes(`${v.name}:${pool.pool}`)
+            const fixed = pool.fixedRoles ?? []
+            const routeKey = `${v.name}:${pool.pool}`
+            const routeOpen = openRouteIds.has(routeKey)
             return (
               <Box key={`model-row-${v.name}-${pool.pool}`} flexDirection="column">
                 {waiting ? (
@@ -3004,9 +3168,24 @@ export const register: Register = on => {
                     <Text size="footnote">{`默认模型：${poolCurrentLabel(pool, entry)}`}</Text>
                   </Box>
                 )}
-                <Text size="caption" dimColor wrap="wrap">
-                  {poolUsage(data.roles ?? [], pool)}
-                </Text>
+                <Box flexDirection="row" alignItems="center" columnGap={1} flexWrap="wrap">
+                  <Text size="caption" dimColor wrap="wrap">
+                    {poolUsage(data.roles ?? [], pool)}
+                  </Text>
+                  {fixed.length > 0 && (
+                    <Button
+                      key={`route-detail-${v.name}-${pool.pool}`}
+                      label={routeOpen ? '收起路由明细' : '路由明细'}
+                      dimColor
+                      onPress={() => update($, openRouteDetails, ids => toggleKey(ids, routeKey))}
+                    />
+                  )}
+                </Box>
+                {fixed.length > 0 && routeOpen && (
+                  <Text size="caption" dimColor wrap="wrap">
+                    {poolFixedUsage(data.roles ?? [], fixed)}
+                  </Text>
+                )}
               </Box>
             )
           })}
@@ -3015,6 +3194,43 @@ export const register: Register = on => {
               {problem}
             </Text>
           )}
+        </Box>
+      )
+    }
+
+    const unpooledSection = (v: Vendor) => {
+      const pools = v.modelPools ?? []
+      if (pools.length <= 1) return null
+      const entry = modelsView.catalog?.providers?.[v.name]
+      const unpooled = (entry?.models ?? []).filter(m => m.unpooled === true)
+      if (unpooled.length === 0) return null
+      const poolSelectOptions: SelectOption[] = [
+        { value: NO_MODEL, label: '选择额度池' },
+        ...pools.map(p => ({ value: p.pool, label: p.label })),
+      ]
+      return (
+        <Box key={`unpooled-block-${v.name}`} flexDirection="column" rowGap={0} marginTop={1}>
+          <Text size="caption" dimColor>
+            未归入额度池
+          </Text>
+          {unpooled.map(m => {
+            const actionKey = `pool-rule:${v.name}:${m.id}`
+            const busyNow = busyKey === actionKey
+            const modelTitle = catalogLabel(m.id, m.label)
+            return Select && !busyNow ? (
+              <Select
+                key={`pool-rule-${v.name}-${m.id}`}
+                label={modelTitle}
+                options={poolSelectOptions}
+                value={NO_MODEL}
+                onSelect={(picked: string) => void assignModelPool($, v.name, m.id, picked)}
+              />
+            ) : (
+              <Text key={`unpooled-text-${v.name}-${m.id}`} size="footnote" dimColor={busyNow}>
+                {busyNow ? `${modelTitle}（保存中…）` : modelTitle}
+              </Text>
+            )
+          })}
         </Box>
       )
     }
@@ -3048,16 +3264,22 @@ export const register: Register = on => {
           <Text size="caption" dimColor>
             {isCustomEndpoint ? '模型白名单' : '可用模型'}
           </Text>
-          {items.map(item => {
-            const canVision = modelHasVision(v, item.id)
-            const isWhitelisted = whitelist.has(item.id)
-            const busyNow = busyKey === `model:${v.name}:${item.id}`
-            return (
-              <Box key={`model-item-${v.name}-${item.id}`} flexDirection="row" alignItems="center" justifyContent="space-between" columnGap={1}>
-                <Box flexDirection="row" columnGap={1} alignItems="center" flexShrink={1} minWidth={0}>
-                  <Text size="footnote" wrap="truncate-end">
-                    {item.label}
-                  </Text>
+          <Box flexDirection="row" flexWrap="wrap" columnGap={1} rowGap={1}>
+            {items.map(item => {
+              const canVision = modelHasVision(v, item.id)
+              const isWhitelisted = whitelist.has(item.id)
+              const busyNow = busyKey === `model:${v.name}:${item.id}`
+              return (
+                <Box
+                  key={`model-item-${v.name}-${item.id}`}
+                  borderStyle="round"
+                  borderDimColor
+                  paddingX={1}
+                  flexDirection="row"
+                  alignItems="center"
+                  columnGap={1}
+                >
+                  <Text size="footnote">{item.label}</Text>
                   {item.isNew && (
                     <Text size="caption" color="accent">
                       新
@@ -3078,10 +3300,8 @@ export const register: Register = on => {
                       未启用
                     </Text>
                   )}
-                </Box>
-                {isCustomEndpoint && (
-                  <Box flexDirection="row" columnGap={1}>
-                    {isWhitelisted ? (
+                  {isCustomEndpoint &&
+                    (isWhitelisted ? (
                       <Button
                         key={`disable-model-${v.name}-${item.id}`}
                         label={busyNow ? '停用…' : '停用'}
@@ -3094,12 +3314,11 @@ export const register: Register = on => {
                         label={busyNow ? '启用…' : '启用'}
                         onPress={() => toggleVendorModel($, v.name, item.id, true)}
                       />
-                    )}
-                  </Box>
-                )}
-              </Box>
-            )
-          })}
+                    ))}
+                </Box>
+              )
+            })}
+          </Box>
         </Box>
       )
     }
@@ -3128,52 +3347,83 @@ export const register: Register = on => {
         : v.fullAccess.note
       const goodAt = v.via === 'self' ? '拆解 · 派发 · 核验 · 汇报' : roleText(v.roles)
       const hasActions = v.canDisable || v.fullAccess.supported || v.canTest || v.canRemove
+      const entry = modelsView.catalog?.providers?.[v.name]
+      const hasDetails =
+        v.via !== 'self' ||
+        isEndpoint ||
+        v.billing === 'metered' ||
+        (v.modelPools?.length ?? 0) > 0 ||
+        (v.models?.length ?? 0) > 0 ||
+        (entry?.models?.length ?? 0) > 0 ||
+        v.note !== '' ||
+        hasActions
+      const isOpen = hasDetails && openVendorIds.has(v.name)
+      const summary = vendorSummary(v, entry)
       return card(
         `vendor-${v.name}`,
         <Box flexDirection="row" alignItems="center" justifyContent="space-between" columnGap={1} minWidth={0}>
-          <Text weight="semibold" dimColor={!v.enabled}>
-            {v.label}
-          </Text>
-          {badge(status.icon, status.text, status.tone)}
-        </Box>,
-        field('调用方式', viaText, showBin && !v.binFound ? { color: 'warning' } : undefined),
-        isEndpoint && field('接口地址', v.endpoint!.baseUrl),
-        (isEndpoint || v.billing === 'metered') && field('计费方式', '按量计费'),
-        isEndpoint && field('密钥', v.hasKey ? '已设置' : '未设置', !v.hasKey ? { color: 'warning' } : undefined),
-        isEndpoint && !v.hasKey && field('设置命令', `node ${scriptPath} provider key ${v.name}`),
-        field('擅长', goodAt),
-        field('最高权限', accessText, v.fullAccess.supported ? undefined : { dimColor: true }),
-        (v.modelPools?.length ?? 0) > 0 && modelSection(v),
-        modelListBlock(v),
-        v.note !== '' && field('备注', v.note, { color: 'warning' }),
-        pendingRemove === v.name ? (
-          <Box flexDirection="row" columnGap={1} alignItems="center" marginTop={1}>
-            <Text size="caption" color="error">
-              确定删除 {v.label}？
+          <Box flexDirection="row" columnGap={1} alignItems="center" flexShrink={1} minWidth={0}>
+            <Text weight="semibold" dimColor={!v.enabled} wrap="truncate-end">
+              {v.label}
             </Text>
-            <Button key={`confirm-remove-${v.name}`} label={busyLabel(`remove:${v.name}`, '删除')} variant="primary" onPress={() => removeVendor($, v)} />
-            <Button key={`cancel-remove-${v.name}`} label="取消" dimColor onPress={() => update($, confirmRemove, () => null)} />
+            {badge(status.icon, status.text, status.tone)}
+            {!isOpen && summary !== '' && (
+              <Text size="caption" dimColor wrap="truncate-end">
+                {summary}
+              </Text>
+            )}
           </Box>
-        ) : (
-          hasActions && (
-            <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1} marginTop={1}>
-              <Box flexDirection="row" columnGap={1}>
-                {v.canDisable && (
-                  <Button key={`toggle-${v.name}`} label={busyLabel(`toggle:${v.name}`, v.enabled ? '停用' : '启用')} onPress={() => toggleVendor($, v)} />
-                )}
-                {v.fullAccess.supported && (
-                  <Button
-                    key={`access-${v.name}`}
-                    label={busyLabel(`access:${v.name}`, v.fullAccess.enabled ? '关闭最高权限' : '开启最高权限')}
-                    onPress={() => setVendorAccess($, v, !v.fullAccess.enabled)}
-                  />
-                )}
-                {v.canTest && <Button key={`test-${v.name}`} label={busyLabel(`test:${v.name}`, '试运行')} dimColor onPress={() => testVendor($, v)} />}
-              </Box>
-              {v.canRemove && <Button key={`remove-${v.name}`} label="删除" dimColor onPress={() => update($, confirmRemove, () => v.name)} />}
+          {hasDetails && (
+            <Box flexShrink={0}>
+              <Button
+                key={`vendor-toggle-${v.name}`}
+                label={isOpen ? '收起' : '详情'}
+                dimColor
+                onPress={() => update($, openVendors, ids => toggleKey(ids, v.name))}
+              />
             </Box>
-          )
-        ),
+          )}
+        </Box>,
+        isOpen && field('调用方式', viaText, showBin && !v.binFound ? { color: 'warning' } : undefined),
+        isOpen && isEndpoint && field('接口地址', v.endpoint!.baseUrl),
+        isOpen && (isEndpoint || v.billing === 'metered') && field('计费方式', '按量计费'),
+        isOpen && isEndpoint && field('密钥', v.hasKey ? '已设置' : '未设置', !v.hasKey ? { color: 'warning' } : undefined),
+        isOpen && isEndpoint && !v.hasKey && field('设置命令', `node ${scriptPath} provider key ${v.name}`),
+        isOpen && field('擅长', goodAt),
+        isOpen && field('最高权限', accessText, v.fullAccess.supported ? undefined : { dimColor: true }),
+        isOpen && (v.modelPools?.length ?? 0) > 0 && modelSection(v),
+        isOpen && unpooledSection(v),
+        isOpen && modelListBlock(v),
+        isOpen && v.note !== '' && field('备注', v.note, { color: 'warning' }),
+        isOpen &&
+          (pendingRemove === v.name ? (
+            <Box flexDirection="row" columnGap={1} alignItems="center" marginTop={1}>
+              <Text size="caption" color="error">
+                确定删除 {v.label}？
+              </Text>
+              <Button key={`confirm-remove-${v.name}`} label={busyLabel(`remove:${v.name}`, '删除')} variant="primary" onPress={() => removeVendor($, v)} />
+              <Button key={`cancel-remove-${v.name}`} label="取消" dimColor onPress={() => update($, confirmRemove, () => null)} />
+            </Box>
+          ) : (
+            hasActions && (
+              <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1} marginTop={1}>
+                <Box flexDirection="row" columnGap={1}>
+                  {v.canDisable && (
+                    <Button key={`toggle-${v.name}`} label={busyLabel(`toggle:${v.name}`, v.enabled ? '停用' : '启用')} onPress={() => toggleVendor($, v)} />
+                  )}
+                  {v.fullAccess.supported && (
+                    <Button
+                      key={`access-${v.name}`}
+                      label={busyLabel(`access:${v.name}`, v.fullAccess.enabled ? '关闭最高权限' : '开启最高权限')}
+                      onPress={() => setVendorAccess($, v, !v.fullAccess.enabled)}
+                    />
+                  )}
+                  {v.canTest && <Button key={`test-${v.name}`} label={busyLabel(`test:${v.name}`, '试运行')} dimColor onPress={() => testVendor($, v)} />}
+                </Box>
+                {v.canRemove && <Button key={`remove-${v.name}`} label="删除" dimColor onPress={() => update($, confirmRemove, () => v.name)} />}
+              </Box>
+            )
+          )),
       )
     }
 
@@ -3257,6 +3507,24 @@ export const register: Register = on => {
 
     const enabledCount = data.providers.filter(p => p.enabled).length
     const accessCount = data.providers.filter(p => p.fullAccess.enabled).length
+    const activeProviders = data.providers.filter(p => p.enabled)
+    const disabledProviders = data.providers.filter(p => !p.enabled)
+    const statsData = statsView.data
+    const hasWorkStats =
+      statsData !== null &&
+      (statsData.workerLines > 0 ||
+        statsData.selfLines > 0 ||
+        statsData.rounds.edited > 0 ||
+        statsData.rounds.withWriteDispatch > 0)
+    const workStatsCard =
+      hasWorkStats &&
+      card(
+        'work-stats',
+        section('近 7 天工作量'),
+        <Text size="footnote" wrap="wrap">
+          {formatWorkStats(statsData)}
+        </Text>,
+      )
     return page(
       noticeBar,
       // 统计和模型清单刷新放在页首同一行：刷新会更新全部厂商，按钮只放一个
@@ -3281,9 +3549,18 @@ export const register: Register = on => {
           />
         </Box>
       </Box>,
-      <Box flexDirection="column" rowGap={1}>
-        {data.providers.map(vendorCard)}
-      </Box>,
+      workStatsCard,
+      activeProviders.length > 0 && (
+        <Box flexDirection="column" rowGap={1}>
+          {activeProviders.map(vendorCard)}
+        </Box>
+      ),
+      disabledProviders.length > 0 && (
+        <Box flexDirection="column" rowGap={1}>
+          {section('已停用')}
+          {disabledProviders.map(vendorCard)}
+        </Box>
+      ),
       addCard ||
         (Input ? (
           <Box flexDirection="row">

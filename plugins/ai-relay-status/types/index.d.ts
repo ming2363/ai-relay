@@ -13,6 +13,18 @@ export type WindowView = {
   source: string | null
 }
 
+/** 上个已结束额度周期的剩余情况 */
+export type LastCycle = {
+  /** 窗口标识，如 5h 或 weekly */
+  window: string
+  /** 周期结束前最后一次采样到的剩余比例 0–1 */
+  leftover: number
+  /** 周期结束时间（毫秒时间戳） */
+  endedAt: number
+  /** 采样离重置是否在 12 小时内 */
+  reliable: boolean
+}
+
 /** 单个额度池在额度页上的展示数据 */
 export type PoolView = {
   /** 模型名，如 Claude、Gemini 3.8 Flash */
@@ -31,6 +43,8 @@ export type PoolView = {
   source: string
   /** 计费类型：metered 按量计费 */
   billing?: string
+  /** 上个已结束周期记录 */
+  lastCycles?: LastCycle[]
 }
 
 /** 最近一次读取到的 ai-relay 状态 */
@@ -258,6 +272,27 @@ export type ModelsView = {
   error: string | null
 }
 
+/** 近 7 天员工与主管工作量统计 */
+export type WorkStats = {
+  /** 员工写入总行数 */
+  workerLines: number
+  /** 按「厂商/模型」分组的员工写入行数 */
+  byWorker: Record<string, number>
+  /** 主管亲手写入总行数 */
+  selfLines: number
+  /** 轮次统计 */
+  rounds: { edited: number; withWriteDispatch: number }
+  /** 员工行数占比 0–1，总行数为 0 时为 null */
+  workerShare: number | null
+}
+
+/** 面板上的工作量统计状态 */
+export type WorkStatsView = {
+  data: WorkStats | null
+  /** idle 未读，loading 读取中，ready 已读到，error 失败 */
+  status: 'idle' | 'loading' | 'ready' | 'error'
+}
+
 /** 新增厂商可选的模板 */
 export type Preset = {
   title: string
@@ -332,6 +367,12 @@ declare module 'claude-code' {
       modelCatalog: Shaped<ModelsView>
       /** 正在保存默认模型的「厂商:额度池」，保存中不再提交 */
       savingModels: string[]
+      /** 厂商页展开查看详情的厂商标识 */
+      openVendors: string[]
+      /** 厂商页展开了路由明细的「厂商:额度池」 */
+      openRouteDetails: string[]
+      /** 近 7 天工作量统计 */
+      workStats: Shaped<WorkStatsView>
       /** 输入框上方提示条的时长节拍。只有提示条读取，加一就只重绘提示条 */
       bandTick: number
       /** ai-relay 插件总开关是否开启 */

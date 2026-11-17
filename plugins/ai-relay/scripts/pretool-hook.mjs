@@ -9,9 +9,9 @@ import {
   loadPrompt, fmtPool, isEnabled, appendHistory, lastPick, runningWriters, scopesOverlap,
   normScope, withWriteLock, gitSnapshot, workspaceRoot, isInside, writePendingDispatch,
   readSelfEdits, writeSelfEdits, isScratchPath, blockReason, resolveRepos, lineSnapshot, writeBashSnap,
-  isRelayRunCommand, capsOf,
+  isRelayRunCommand, capsOf, runningWriterIds,
 } from "./lib.mjs";
-import { BRIEF_TEMPLATE, checkBrief, roleOfBrief, levelOfBrief, buildDispatchPrompt, readSharedContext, scopeOfBrief, needsWithImages, codexFlagsOf } from "./brief.mjs";
+import { BRIEF_TEMPLATE, checkBrief, roleOfBrief, levelOfBrief, buildDispatchPrompt, readSharedContext, scopeOfBrief, needsWithImages, codexFlagsOf, hasStepSpec } from "./brief.mjs";
 import { modelTier, tierAllowed, levelEffort, LEVEL_TEXT, TIER_TEXT } from "./score.mjs";
 import { loadModelsCache } from "./models.mjs";
 
@@ -58,7 +58,12 @@ function handleBash(input) {
     const cwd = typeof input.cwd === "string" && input.cwd ? input.cwd : process.cwd();
     const repos = resolveRepos(sessionId, stat, cwd, command);
     // 返回 Promise：进程等快照写完再退出；失败就不计这次 Bash 的行数
-    return lineSnapshot(cwd, repos).then((snap) => writeBashSnap(sessionId, snap)).catch(() => {});
+    return lineSnapshot(cwd, repos).then((snap) => {
+      // 把当时运行中的可写任务 id 记进前快照，后快照再取「前快照 ∪ 现在」，
+      // 任务恰好在这次 Bash 期间结束也不会漏掉
+      snap.runningWriterIds = runningWriterIds(repos);
+      writeBashSnap(sessionId, snap);
+    }).catch(() => {});
   } catch {}
 }
 
@@ -135,7 +140,7 @@ function main() {
   if (flags.conflict.length) {
     return deny(`[ai-relay] 派给 Codex 的 prompt 里 ${flags.conflict.map((k) => `--${k}`).join("、")} 写了不同的值，已退回。只写一次，放在第一行`);
   }
-  const fitsFor = () => (prov?.pools?.codex || []).filter((m) => m !== "default" && tierAllowed(level, modelTier(cfg, "codex", m)));
+  const fitsFor = () => (prov?.pools?.codex || []).filter((m) => m !== "default" && tierAllowed(level, modelTier(cfg, "codex", m), false, hasStepSpec(brief)));
   const pick = lastPick(role);
   const pickModel = !flags.model && pick?.provider === "codex" && pick.level === level && pick.model && pick.model !== "default" ? pick.model : null;
   const usedModel = flags.model || pickModel || codexDefaultModel();
@@ -144,7 +149,7 @@ function main() {
     return deny(`[ai-relay] 读不到 Codex 的默认模型，没法判断档位够不够${LEVEL_TEXT[level]}任务，已退回。在 prompt 第一行写 --model <模型>${fits.length ? `，可选：${fits.join("、")}` : ""}`);
   }
   const tier = usedModel ? modelTier(cfg, "codex", usedModel) : "mid";
-  if (!tierAllowed(level, tier)) {
+  if (!tierAllowed(level, tier, false, hasStepSpec(brief))) {
     const fits = fitsFor();
     return deny(`[ai-relay] Codex 的 ${usedModel} 是${TIER_TEXT[tier]}模型，接不了${LEVEL_TEXT[level]}任务，已退回。在 prompt 第一行写 --model <模型>${fits.length ? `，可选：${fits.join("、")}` : ""}`);
   }

@@ -41,17 +41,28 @@ const ok = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isSt
 const fail = (stderr: string) => ({ value: { exitCode: 1, stdout: '', stderr, isStdoutTruncated: false, isStderrTruncated: false } })
 
 // relay status --json 的最小样例：手动模式，Codex 偏低，Argon 耗尽，Grok 已停用
-function statusJson(mode: string, grokEnabled: boolean, claudeWins?: unknown[], extraPools: Record<string, unknown>[] = []) {
+function statusJson(
+  mode: string,
+  grokEnabled: boolean,
+  claudeWins?: unknown[],
+  extraPools: Record<string, unknown>[] = [],
+  poolLastCycles: Record<string, unknown[]> = {},
+) {
+  const withCycles = (p: Record<string, unknown>) => {
+    const key = `${p.name}/${p.pool}`
+    const cycles = poolLastCycles[key]
+    return cycles ? { ...p, lastCycles: cycles } : p
+  }
   return JSON.stringify({
     mode,
     quotaAvailable: true,
     pools: [
       // 故意乱序，验证额度页按固定顺序排列
-      { name: 'agy', pool: 'gemini-argon', level: 'blocked', enabled: true, limitingResetAt: 1793807912000, windows: [{ key: 'weekly', remaining: 0 }] },
-      { name: 'grok', pool: 'supergrok-weekly', level: 'ok', enabled: grokEnabled, source: 'AIQuota5h', windows: [{ key: 'weekly', remaining: 0.89 }] },
-      { name: 'claude', pool: 'claude-subscription', level: 'ok', enabled: true, windows: claudeWins ?? [{ key: 'weekly', remaining: 0.55 }, { key: '5h', remaining: 0.77 }] },
-      { name: 'codex', pool: 'codex', level: 'low', enabled: true, windows: [{ key: '5h', remaining: 0.78 }, { key: 'weekly', remaining: 0.28 }] },
-      ...extraPools,
+      withCycles({ name: 'agy', pool: 'gemini-argon', level: 'blocked', enabled: true, limitingResetAt: 1793807912000, windows: [{ key: 'weekly', remaining: 0 }] }),
+      withCycles({ name: 'grok', pool: 'supergrok-weekly', level: 'ok', enabled: grokEnabled, source: 'AIQuota5h', windows: [{ key: 'weekly', remaining: 0.89 }] }),
+      withCycles({ name: 'claude', pool: 'claude-subscription', level: 'ok', enabled: true, windows: claudeWins ?? [{ key: 'weekly', remaining: 0.55 }, { key: '5h', remaining: 0.77 }] }),
+      withCycles({ name: 'codex', pool: 'codex', level: 'low', enabled: true, windows: [{ key: '5h', remaining: 0.78 }, { key: 'weekly', remaining: 0.28 }] }),
+      ...extraPools.map(withCycles),
     ],
   })
 }
@@ -61,7 +72,7 @@ function providersJson(
   extra: string[] = [],
   access: Record<string, boolean> = {},
   pools: Record<string, readonly Record<string, unknown>[]> = {},
-  more: { name: string; label: string; roles?: string[] }[] = [],
+  more: { name: string; label: string; roles?: string[]; enabled?: boolean }[] = [],
   roleList?: { key: string; text: string }[],
   extraVendors: Record<string, unknown>[] = [],
 ) {
@@ -83,7 +94,7 @@ function providersJson(
       v('codex', 'Codex · ChatGPT Plus', 'codex-plugin', true, ['implement']),
       v('grok', 'SuperGrok', 'relay', grokEnabled, ['review', 'read']),
       ...extra.map(n => v(n, `${n} 会员`, 'relay', true, ['read'])),
-      ...more.map(n => v(n.name, n.label, 'relay', true, n.roles ?? ['read'])),
+      ...more.map(n => v(n.name, n.label, 'relay', n.enabled ?? true, n.roles ?? ['read'])),
       ...extraVendors,
     ],
     roles: roleList ?? [{ key: 'implement', text: '实现' }, { key: 'review', text: '审查' }, { key: 'read', text: '阅读' }],
@@ -101,13 +112,16 @@ function fakeRelay(on: TestOn) {
     mode: 'manual', grok: true, added: [] as string[], calls: [] as string[][], jobs: '[]',
     claudeWins: undefined as unknown[] | undefined, access: { grok: true } as Record<string, boolean>,
     modelPools: {} as Record<string, Record<string, unknown>[]>,
-    moreProviders: [] as { name: string; label: string; roles?: string[] }[],
+    moreProviders: [] as { name: string; label: string; roles?: string[]; enabled?: boolean }[],
     extraVendors: [] as Record<string, unknown>[],
     extraPools: [] as Record<string, unknown>[],
+    poolLastCycles: {} as Record<string, unknown[]>,
     roleList: undefined as { key: string; text: string }[] | undefined,
     models: null as unknown,
     // 非 null 时 models 子命令原样返回这段 stdout（用来测解析失败）
     modelsRaw: null as string | null,
+    stats: null as unknown,
+    statsFail: '',
     modelSaveFail: '',
     pluginFail: '',
     pluginCalls: [] as string[][],
@@ -129,9 +143,14 @@ function fakeRelay(on: TestOn) {
     const argv = [...e.argv].slice(2)
     state.calls.push(argv)
     const [cmd, sub, arg] = argv
-    if (cmd === 'status') return ok(statusJson(state.mode, state.grok, state.claudeWins, state.extraPools))
+    if (cmd === 'status') return ok(statusJson(state.mode, state.grok, state.claudeWins, state.extraPools, state.poolLastCycles))
     if (cmd === 'quota') return ok('')
     if (cmd === 'jobs') return ok(state.jobs)
+    if (cmd === 'stats') {
+      if (state.statsFail) return fail(state.statsFail)
+      if (state.stats === null) return fail('stats unavailable')
+      return ok(JSON.stringify(state.stats))
+    }
     if (cmd === 'providers') return ok(providersJson(state.grok, state.added, state.access, state.modelPools, state.moreProviders, state.roleList, state.extraVendors))
     if (cmd === 'models') {
       if (state.modelsRaw !== null) return ok(state.modelsRaw)
@@ -176,6 +195,22 @@ function fakeRelay(on: TestOn) {
       const flag = argv[3] ?? ''
       const modelId = argv[4] ?? ''
       return ok(`${name} 模型 ${modelId} 已${flag === '--add' ? '启用' : '停用'}`)
+    }
+    if (cmd === 'provider' && sub === 'pool-rule') {
+      const name = arg ?? ''
+      const modelId = argv[3] ?? ''
+      const poolId = argv[4] ?? ''
+      const providers = (state.models as { providers?: Record<string, { models?: { id: string; pool: string | null; unpooled?: boolean }[] }> } | null)?.providers
+      const entry = providers?.[name]
+      if (entry?.models) {
+        for (const m of entry.models) {
+          if (m.id === modelId) {
+            m.pool = poolId
+            m.unpooled = false
+          }
+        }
+      }
+      return ok(`${name} 归池规则：${modelId} → ${poolId}`)
     }
     return fail('unknown')
   })
@@ -441,13 +476,17 @@ test('厂商页：停用 Grok、两步删除、按模板新增', async ($, on) =
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await ui.press({ key: 'tab-vendors' })
-  // 主控不能停用、Codex 不能删除
+  // 主控不能停用且无详情按钮、Codex 展开后不能删除
+  expect(await ui.find({ type: 'Button', key: 'vendor-toggle-claude' })).toBeUndefined()
   expect(await ui.find({ type: 'Button', key: 'toggle-claude' })).toBeUndefined()
+  await ui.press({ key: 'vendor-toggle-codex' })
   expect(await ui.find({ type: 'Button', key: 'remove-codex' })).toBeUndefined()
   expect(await ui.find({ type: 'Text', text: '★ 主模型' })).toBeDefined()
+  await ui.press({ key: 'vendor-toggle-kimi' })
   expect(await ui.find({ type: 'Text', text: '官方 CLI · kimi · 未安装' })).toBeDefined()
   expect((await ui.find({ type: 'Text', text: '官方 CLI · kimi · 未安装' }))?.props.color).toBe('warning')
 
+  await ui.press({ key: 'vendor-toggle-grok' })
   await ui.press({ key: 'toggle-grok' })
   expect(relay.calls.some(a => a.join(' ') === 'provider disable grok')).toBe(true)
   expect((await ui.find({ type: 'Button', key: 'toggle-grok' }))?.props.label).toBe('启用')
@@ -993,6 +1032,8 @@ test('厂商页：支持最高权限的厂商可单独开关，不支持的只�
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await ui.press({ key: 'tab-vendors' })
+  await ui.press({ key: 'vendor-toggle-grok' })
+  await ui.press({ key: 'vendor-toggle-codex' })
 
   const accessLabels = (await ui.findAll({ type: 'Text', text: '最高权限' })).map(asDrawn).filter((el): el is DrawnNode => Boolean(el))
   expect(accessLabels.length).toBeGreaterThan(0)
@@ -1008,9 +1049,10 @@ test('厂商页：支持最高权限的厂商可单独开关，不支持的只�
   expect((await ui.find({ type: 'Button', key: 'access-grok' }))?.props.label).toBe('开启最高权限')
   expect(await ui.find({ type: 'Text', text: '已关闭 · 只能改文件' })).toBeDefined()
 
+  expect(await ui.find({ type: 'Button', key: 'vendor-toggle-claude' })).toBeUndefined()
   expect(await ui.find({ type: 'Button', key: 'access-claude' })).toBeUndefined()
   expect(await ui.find({ type: 'Button', key: 'access-codex' })).toBeUndefined()
-  expect(await ui.find({ type: 'Text', text: '主模型的权限在输入框的模式菜单里设置' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '主模型的权限在输入框的模式菜单里设置' })).toBeUndefined()
   expect(await ui.find({ type: 'Text', text: '由 Codex 插件固定为只能写当前项目的沙箱' })).toBeDefined()
 
   // 厂商停用后，最高权限这一行和开关仍在
@@ -1218,6 +1260,7 @@ test('厂商页：汇总正确，Claude 没有操作按钮，Grok 的删除在�
   expect(await ui.find({ type: 'Button', key: 'access-claude' })).toBeUndefined()
   expect(await ui.find({ type: 'Button', key: 'test-claude' })).toBeUndefined()
   expect(await ui.find({ type: 'Button', key: 'remove-claude' })).toBeUndefined()
+  await ui.press({ key: 'vendor-toggle-grok' })
   expect((await ui.find({ type: 'Button', key: 'toggle-grok' }))?.props.label).toBe('停用')
   expect((await ui.find({ type: 'Button', key: 'access-grok' }))?.props.label).toBe('关闭最高权限')
   expect((await ui.find({ type: 'Button', key: 'test-grok' }))?.props.label).toBe('试运行')
@@ -1412,6 +1455,10 @@ test('厂商页：默认模型按额度池列出选项和用于说明', async ($
   expect(await ui.find({ type: 'Button', key: 'models-refresh' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: '模型列表更新于 5 分钟前' })).toBeDefined()
 
+  await ui.press({ key: 'vendor-toggle-grok' })
+  await ui.press({ key: 'vendor-toggle-agy' })
+  await ui.press({ key: 'vendor-toggle-codex' })
+
   const grok = await ui.find({ type: 'Select', key: 'model-grok-supergrok-weekly' })
   // 单池厂商：区块标题已是「默认模型」，下拉不再重复标题
   expect(grok?.props.label).toBeUndefined()
@@ -1421,7 +1468,7 @@ test('厂商页：默认模型按额度池列出选项和用于说明', async ($
     'grok-4.7',
     'Grok 4.7 Build Fast · grok-4.7-build-fast',
   ])
-  expect(await ui.find({ type: 'Text', text: '用于：审查、深度推理' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '参与：审查、深度推理' })).toBeDefined()
 
   const agyRows: [string, string][] = [
     ['gemini-argon', 'Gemini Argon'],
@@ -1436,8 +1483,11 @@ test('厂商页：默认模型按额度池列出选项和用于说明', async ($
     'Gemini 4 Argon (High) · gemini-4-argon-high',
     'Gemini 4 Argon (Medium) · gemini-4-argon-medium',
   ])
-  expect(await ui.find({ type: 'Text', text: '用于：排查、审查、深度推理；单独指定：阅读 → gemini-4-argon-medium' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: '用于：实现' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '参与：排查、审查、深度推理、阅读' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '单独指定：阅读 → gemini-4-argon-medium' })).toBeUndefined()
+  await ui.press({ key: 'route-detail-agy-gemini-argon' })
+  expect(await ui.find({ type: 'Text', text: '单独指定：阅读 → gemini-4-argon-medium' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '参与：实现' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: '暂无角色使用' })).toBeDefined()
 
   const codex = await ui.find({ type: 'Select', key: 'model-codex-codex' })
@@ -1467,6 +1517,7 @@ test('厂商页：默认模型保存成功用 relay 的那一行，失败恢复�
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await ui.press({ key: 'tab-vendors' })
+  await ui.press({ key: 'vendor-toggle-grok' })
 
   await ui.select({ key: 'model-grok-supergrok-weekly', value: 'grok-4.7' })
   expect(relay.calls.some(a => a.join(' ') === 'provider model grok supergrok-weekly grok-4.7')).toBe(true)
@@ -1500,6 +1551,8 @@ test('厂商页：模型列表失败时不弄垮页面', async ($, on) => {
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await ui.press({ key: 'tab-vendors' })
+  await ui.press({ key: 'vendor-toggle-grok' })
+  await ui.press({ key: 'vendor-toggle-codex' })
   expect(await ui.find({ type: 'Text', text: '模型列表获取失败：grok 命令超时，显示的是上次的结果' })).toBeDefined()
   expect(optionLabels(await ui.find({ type: 'Select', key: 'model-grok-supergrok-weekly' }))).toContain('跟随 CLI 默认（grok-4.7-build-fast）')
   expect(optionLabels(await ui.find({ type: 'Select', key: 'model-grok-supergrok-weekly' }))).toContain('grok-4.7')
@@ -1521,6 +1574,7 @@ test('厂商页：模型列表解析失败仍显示厂商和当前值', async ($
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await ui.press({ key: 'tab-vendors' })
   expect(await ui.find({ type: 'Text', text: /^SuperGrok$/ })).toBeDefined()
+  await ui.press({ key: 'vendor-toggle-grok' })
   expect(await ui.find({ type: 'Text', text: /模型列表获取失败：解析失败/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /显示的是上次的结果/ })).toBeUndefined()
   expect(optionLabels(await ui.find({ type: 'Select', key: 'model-grok-supergrok-weekly' }))).toEqual(['grok-4.7（清单里已没有）'])
@@ -1553,6 +1607,8 @@ test('厂商页：手机端默认模型只显示文字', async ($, on) => {
   await $.session.start({ cwd: '/', surface: 'mobile', isInteractive: true })
   const ui = await $.ui.mount({ ...PANE, surface: 'mobile' })
   await ui.press({ key: 'tab-vendors' })
+  await ui.press({ key: 'vendor-toggle-grok' })
+  await ui.press({ key: 'vendor-toggle-agy' })
   expect(await ui.find({ type: 'Select', key: 'model-grok-supergrok-weekly' })).toBeUndefined()
   expect(await ui.find({ type: 'Text', text: '默认模型：跟随 CLI 默认（grok-4.7-build-fast）' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: '默认模型：Gemini 4 Argon (High) · gemini-4-argon-high' })).toBeDefined()
@@ -3445,6 +3501,10 @@ test('厂商卡片与额度页：endpoint 厂商显示接口地址、按量计�
   expect(await ui.find({ type: 'Text', text: '● 按量计费' })).toBeDefined()
 
   await ui.press({ key: 'tab-vendors' })
+  // 折叠态即显示按量计费摘要
+  expect(await ui.find({ type: 'Text', text: '按量计费' })).toBeDefined()
+  await ui.press({ key: 'vendor-toggle-maas-nokey' })
+  await ui.press({ key: 'vendor-toggle-maas-haskey' })
   // 厂商 1（未配密钥）：显示接口地址、"按量计费"、"未设置"，以及终端运行命令
   expect(await ui.find({ type: 'Text', text: 'https://model-api.maas.com.cn' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: '未设置' })).toBeDefined()
@@ -3489,6 +3549,7 @@ test('看图能力：modelCaps 优先于 caps，vision 为 true 标"能看图"�
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await ui.press({ key: 'tab-vendors' })
+  await ui.press({ key: 'vendor-toggle-vision-vendor' })
 
   // qwen3.8-max 在 modelCaps 中为 true，标"能看图"
   expect(await ui.find({ type: 'Text', text: '能看图' })).toBeDefined()
@@ -3544,6 +3605,7 @@ test('白名单管理：未启用模型标"未启用"且可点启用，已启用
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await ui.press({ key: 'tab-vendors' })
+  await ui.press({ key: 'vendor-toggle-maas' })
 
   // deepseek-v4-pro-0813 不在白名单，标"未启用"并有启用按钮
   expect(await ui.find({ type: 'Text', text: '未启用' })).toBeDefined()
@@ -3655,6 +3717,8 @@ test('新模型与未归池标记：isNew 显示"新"标记与下拉"（新）"�
   // 1. 验收标准 4：有 2 个新模型的厂商，标题旁显示"2 个新模型"
   expect(await ui.find({ type: 'Text', text: '模型列表更新于 5 分钟前 · 2 个新模型' })).toBeDefined()
 
+  await ui.press({ key: 'vendor-toggle-grok' })
+
   // 2. 验收标准 2：默认模型下拉选项
   const select = await ui.find({ type: 'Select', key: 'model-grok-supergrok-weekly' })
   expect(select).toBeDefined()
@@ -3742,6 +3806,253 @@ test('额度页：切换模式成功后的 toast 含"从下一条消息起生效
   expect(modeToast).toBeDefined()
   expect(modeToast).toContain('从下一条消息起生效')
   expect(modeToast).not.toContain('新会话')
+
+  await ui.unmount()
+})
+
+test('厂商页：厂商卡默认折叠只显示摘要，点详情展开、再点收起，主模型无详情按钮，模型列表横向换行', async ($, on) => {
+  baseStubs(on, new Set<string>(), () => NOW)
+  const relay = fakeRelay(on)
+  const updatedAt = new Date(NOW - 5 * 60_000).toISOString()
+  relay.moreProviders = [{ name: 'agy', label: 'Antigravity', roles: ['read', 'implement'] }]
+  relay.modelPools = {
+    grok: [{ pool: 'supergrok-weekly', label: 'Grok', current: 'grok-4.7', allowCliDefault: true, followRoles: ['review'], fixedRoles: [] }],
+    agy: [
+      { pool: 'gemini-argon', label: 'Gemini Argon', current: 'gemini-4-argon-high', allowCliDefault: false, followRoles: ['debug'], fixedRoles: [] },
+      { pool: 'claude-gpt', label: 'Claude / GPT', current: 'claude-sonnet', allowCliDefault: false, followRoles: ['implement'], fixedRoles: [] },
+    ],
+  }
+  relay.extraVendors = [
+    {
+      name: 'maas',
+      label: '按量厂商',
+      via: 'relay',
+      enabled: true,
+      canDisable: true,
+      canRemove: true,
+      canTest: false,
+      bin: '',
+      binFound: false,
+      roles: ['implement'],
+      note: '',
+      fullAccess: { supported: false, enabled: false, note: '' },
+      modelPools: [],
+      billing: 'metered',
+      endpoint: { baseUrl: 'https://api.example.com' },
+      hasKey: true,
+      models: ['qwen3.8-max'],
+    },
+  ]
+  relay.models = {
+    updatedAt,
+    providers: {
+      grok: {
+        ok: true,
+        error: null,
+        fetchedAt: updatedAt,
+        cliDefault: 'grok-4.7-build-fast',
+        models: [
+          { id: 'grok-4.7', label: 'Grok 4.7', pool: 'supergrok-weekly' },
+          { id: 'grok-4.6', label: 'Grok 4.6', pool: 'supergrok-weekly' },
+        ],
+      },
+      agy: {
+        ok: true,
+        error: null,
+        fetchedAt: updatedAt,
+        cliDefault: null,
+        models: [
+          { id: 'gemini-4-argon-high', label: 'Gemini 4 Argon (High)', pool: 'gemini-argon' },
+          { id: 'claude-sonnet', label: 'Claude Sonnet', pool: 'claude-gpt' },
+        ],
+      },
+    },
+  }
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab-vendors' })
+
+  // 默认折叠：显示各家摘要，不显示"调用方式"，主模型 Claude 没有详情按钮
+  expect(await ui.find({ type: 'Button', key: 'vendor-toggle-claude' })).toBeUndefined()
+  expect((await ui.find({ type: 'Button', key: 'vendor-toggle-grok' }))?.props.label).toBe('详情')
+  expect(await ui.find({ type: 'Text', text: '默认 Grok 4.7' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '默认 Gemini 4 Argon (High) · Claude Sonnet' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '按量计费' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '调用方式' })).toBeUndefined()
+
+  // 点"详情"后展开显示调用方式及横向换行模型标签
+  await ui.press({ key: 'vendor-toggle-grok' })
+  expect((await ui.find({ type: 'Button', key: 'vendor-toggle-grok' }))?.props.label).toBe('收起')
+  expect(await ui.find({ type: 'Text', text: '调用方式' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '官方 CLI · grok · 已安装' })).toBeDefined()
+
+  let wrapFound = false
+  const findWrapParent = (node: unknown) => {
+    const el = asDrawn(node)
+    if (!el) return
+    const hasModelItem = (el.children ?? []).some(c => {
+      const child = asDrawn(c)
+      return child && nodeKey(child) === 'model-item-grok-grok-4.7'
+    })
+    if (el.type === 'Box' && el.props?.flexDirection === 'row' && el.props?.flexWrap === 'wrap' && hasModelItem) {
+      wrapFound = true
+    }
+    for (const child of el.children ?? []) findWrapParent(child)
+  }
+  findWrapParent(await ui.drawn())
+  expect(wrapFound).toBe(true)
+
+  // 再点"收起"恢复折叠
+  await ui.press({ key: 'vendor-toggle-grok' })
+  expect((await ui.find({ type: 'Button', key: 'vendor-toggle-grok' }))?.props.label).toBe('详情')
+  expect(await ui.find({ type: 'Text', text: '调用方式' })).toBeUndefined()
+
+  await ui.unmount()
+})
+
+test('厂商页：已停用厂商排在"已停用"标题之后且默认折叠置灰', async ($, on) => {
+  baseStubs(on, new Set<string>(), () => NOW)
+  const relay = fakeRelay(on)
+  relay.grok = false
+  relay.moreProviders = [{ name: 'agy', label: 'Antigravity', enabled: true }]
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab-vendors' })
+
+  const texts = visibleTexts(await ui.drawn())
+  const codexIdx = texts.indexOf('Codex · ChatGPT Plus')
+  const agyIdx = texts.indexOf('Antigravity')
+  const disabledSectionIdx = texts.indexOf('已停用')
+  const grokIdx = texts.indexOf('SuperGrok')
+  expect(codexIdx).toBeGreaterThan(-1)
+  expect(agyIdx).toBeGreaterThan(codexIdx)
+  expect(disabledSectionIdx).toBeGreaterThan(agyIdx)
+  expect(grokIdx).toBeGreaterThan(disabledSectionIdx)
+
+  const grokTitle = await ui.find({ type: 'Text', text: 'SuperGrok' })
+  expect(grokTitle?.props.dimColor).toBe(true)
+  expect(await ui.find({ type: 'Text', text: '调用方式' })).toBeUndefined()
+  expect((await ui.find({ type: 'Button', key: 'vendor-toggle-grok' }))?.props.label).toBe('详情')
+
+  await ui.unmount()
+})
+
+test('厂商页：多池厂商未归池模型下拉选择后调用 provider pool-rule 并刷新清单与厂商数据', async ($, on) => {
+  baseStubs(on, new Set<string>(), () => NOW)
+  const relay = fakeRelay(on)
+  const updatedAt = new Date(NOW - 5 * 60_000).toISOString()
+  relay.moreProviders = [{ name: 'agy', label: 'Antigravity', roles: ['implement', 'read'] }]
+  relay.modelPools = {
+    agy: [
+      { pool: 'gemini-argon', label: 'Gemini Argon', current: 'gemini-4-argon-high', allowCliDefault: false, followRoles: ['implement'], fixedRoles: [] },
+      { pool: 'claude-gpt', label: 'Claude / GPT', current: 'claude-sonnet', allowCliDefault: false, followRoles: ['read'], fixedRoles: [] },
+    ],
+  }
+  relay.models = {
+    updatedAt,
+    providers: {
+      agy: {
+        ok: true,
+        error: null,
+        fetchedAt: updatedAt,
+        cliDefault: null,
+        models: [
+          { id: 'gemini-4-argon-high', label: 'Gemini 4 Argon (High)', pool: 'gemini-argon' },
+          { id: 'claude-sonnet', label: 'Claude Sonnet', pool: 'claude-gpt' },
+          { id: 'gemini-4-hydrogen-pro', label: 'Gemini 4 Hydrogen Pro', pool: null, unpooled: true },
+        ],
+      },
+    },
+  }
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab-vendors' })
+  await ui.press({ key: 'vendor-toggle-agy' })
+
+  const poolSelect = await ui.find({ type: 'Select', key: 'pool-rule-agy-gemini-4-hydrogen-pro' })
+  expect(poolSelect).toBeDefined()
+  expect(optionLabels(poolSelect)).toEqual(['选择额度池', 'Gemini Argon', 'Claude / GPT'])
+
+  await ui.select({ key: 'pool-rule-agy-gemini-4-hydrogen-pro', value: 'gemini-argon' })
+  expect(relay.calls.some(a => a.join(' ') === 'provider pool-rule agy gemini-4-hydrogen-pro gemini-argon')).toBe(true)
+  // 成功后刷新模型清单和厂商数据
+  expect(relay.calls.filter(a => a[0] === 'models' && a.includes('--json')).length).toBeGreaterThanOrEqual(2)
+  expect(relay.calls.filter(a => a[0] === 'providers' && a.includes('--json')).length).toBeGreaterThanOrEqual(2)
+  // 归池后不再在未归池区显示，并进入 Gemini Argon 默认模型选项
+  expect(await ui.find({ type: 'Select', key: 'pool-rule-agy-gemini-4-hydrogen-pro' })).toBeUndefined()
+  const argonSelect = await ui.find({ type: 'Select', key: 'model-agy-gemini-argon' })
+  expect(optionLabels(argonSelect)).toContain('Gemini 4 Hydrogen Pro · gemini-4-hydrogen-pro')
+
+  await ui.unmount()
+})
+
+test('厂商页：近 7 天工作量卡片按 stats 返回数据显示，失败或无数据时不显示', async ($, on) => {
+  baseStubs(on, new Set<string>(), () => NOW)
+  const relay = fakeRelay(on)
+  relay.stats = {
+    workerLines: 120,
+    byWorker: { 'agy/gemini-4-argon-high': 80, 'maas/qwen3.8-max': 40 },
+    selfLines: 30,
+    rounds: { edited: 5, withWriteDispatch: 4 },
+    workerShare: 0.8,
+  }
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab-vendors' })
+
+  expect(relay.calls.some(a => a.join(' ') === 'stats --json --days 7')).toBe(true)
+  expect(await ui.find({ type: 'Text', text: '近 7 天工作量' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '员工 120 行（占比 80%） · 主管 30 行；有外派的轮次 4 / 改过代码的轮次 5' })).toBeDefined()
+
+  // stats 命令失败时不显示，且不报错误提示
+  relay.statsFail = 'stats command failed'
+  await ui.press({ key: 'tab-quota' })
+  await ui.press({ key: 'tab-vendors' })
+  expect(await ui.find({ type: 'Text', text: '近 7 天工作量' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /stats command failed/ })).toBeUndefined()
+
+  // 无数据（全 0）时不显示
+  relay.statsFail = ''
+  relay.stats = {
+    workerLines: 0,
+    byWorker: {},
+    selfLines: 0,
+    rounds: { edited: 0, withWriteDispatch: 0 },
+    workerShare: null,
+  }
+  await ui.press({ key: 'tab-quota' })
+  await ui.press({ key: 'tab-vendors' })
+  expect(await ui.find({ type: 'Text', text: '近 7 天工作量' })).toBeUndefined()
+
+  await ui.unmount()
+})
+
+test('额度页：lastCycles 仅显示 reliable 为 true 的上个周期剩余，窗口名映射正确', async ($, on) => {
+  baseStubs(on, new Set<string>(), () => NOW)
+  const relay = fakeRelay(on)
+  relay.poolLastCycles = {
+    'claude/claude-subscription': [
+      { window: '5h', leftover: 0.35, endedAt: NOW - 3600_000, reliable: true },
+      { window: 'weekly', leftover: 0.42, endedAt: NOW - 7200_000, reliable: false },
+    ],
+    'codex/codex': [
+      { window: 'weekly', leftover: 0.28, endedAt: NOW - 3600_000, reliable: true },
+      { window: 'custom-3d', leftover: 0.1, endedAt: NOW - 3600_000, reliable: true },
+    ],
+  }
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const h5 = await ui.find({ type: 'Text', text: '上个5 小时周期剩 35% 未用' })
+  expect(h5).toBeDefined()
+  expect(h5?.props.dimColor).toBe(true)
+  expect(await ui.find({ type: 'Text', text: '上个本周周期剩 28% 未用' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '上个custom-3d周期剩 10% 未用' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '上个本周周期剩 42% 未用' })).toBeUndefined()
 
   await ui.unmount()
 })

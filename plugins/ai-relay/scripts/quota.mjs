@@ -340,6 +340,37 @@ export function cachedRows(stateDir) {
   return Object.values(cache.sources).flatMap((s) => s.rows || []);
 }
 
+// 识别命令行输出中的额度耗尽提示
+const EXHAUSTED_PATTERNS = [
+  /reached your .{0,40}(usage )?limit/i,
+  /usage limit/i,
+  /rate limit exceeded/i,
+  /quota exceeded/i,
+  /exceeded your current quota/i,
+  /insufficient_quota/i,
+  /额度已用完/i,
+  /额度不足/i,
+];
+
+export function detectQuotaExhausted(text) {
+  if (!text || typeof text !== "string") return false;
+  return EXHAUSTED_PATTERNS.some((re) => re.test(text));
+}
+
+// 员工命令行报额度耗尽时，把对应额度池在缓存中记为用完（默认 24 小时）
+export function markPoolExhausted(stateDir, provider, pool, now = Date.now(), hours = 24) {
+  const cache = loadCache(stateDir);
+  if (!cache.sources || typeof cache.sources !== "object") {
+    cache.sources = {};
+  }
+  cache.sources["cli-limit:" + provider + ":" + pool] = {
+    at: now,
+    rows: [row(provider, pool, "cli-limit", 0, now + hours * 3600000, now)],
+  };
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(cachePath(stateDir), JSON.stringify(cache, null, 2));
+}
+
 // ---------- Grok：直接查 grok.com 的计费接口（官方 CLI 没有给程序用的额度命令） ----------
 // 用 Grok CLI 登录后存在 ~/.grok/auth.json 的令牌鉴权；令牌只在内存里使用，不写日志、不进命令行参数、不进报错信息。
 // 令牌过期时不自己刷新（避免和 grok CLI、用户的刷新脚本抢写 auth.json），直接报错，额度沿用旧缓存或 AIQuota5h。

@@ -40,6 +40,12 @@ export const BRIEF_TEMPLATE = `角色：<implement|debug|review|read|deep|quick|
 ## 约束
 <不许做的事、必须遵守的规范、不能碰的文件>
 
+## 步骤
+<可选。中等任务写成步骤级规格（至少 2 步、每步点到文件）时，轻档模型也能接>
+
+## 验证命令
+<可选。可写任务结束后 relay 会在任务目录里依次执行（最多 3 条，每条默认 10 分钟超时），结果附在任务结果里>
+
 ## 验收标准
 <逐条可核对的标准，主模型会按这里逐条验收>
 
@@ -194,6 +200,92 @@ export function needsOfBrief(text) {
   if (/执行命令|跑测试|运行测试|构建/.test(body)) needs.push("exec");
   if (/看图|图片|截图|图像|多模态/.test(body)) needs.push("vision");
   return needs;
+}
+
+// 从「步骤」小节解析步骤规格：标题规则与 needsOfBrief 一致（可带 #、括注、冒号）
+// 按编号行（1. / 1、/ 1) 等）或 - / * 列表项切分，每项去掉序号；没有序号的普通行也算一步
+// 模板占位符（<…> 开头）和空行跳过。没有这一段返回空数组
+export function stepsOfBrief(text) {
+  const lines = String(text || "").split(/\r?\n/);
+  let inSection = false;
+  const body = [];
+  const titleWithHash = /^[ \t]*#{1,6}[ \t]*步骤(?:\s*[（(][^）\n]*[）)])?[ \t]*[:：]?[ \t]*(.*)$/;
+  const titleNoHash = /^[ \t]*步骤[ \t]*[:：][ \t]*(.*)$/;
+
+  for (const rawLine of lines) {
+    if (!inSection) {
+      const m = rawLine.match(titleWithHash) || rawLine.match(titleNoHash);
+      if (m) {
+        inSection = true;
+        if (m[1] && m[1].trim()) body.push(m[1]);
+      }
+      continue;
+    }
+    if (/^[ \t]*#/.test(rawLine) || /^[ \t]*(?:目标|背景|相关文件|写入范围|需要的能力|约束|验收标准|交付格式)[:：]/.test(rawLine)) {
+      break;
+    }
+    body.push(rawLine);
+  }
+  if (!inSection) return [];
+  const steps = [];
+  for (const raw of body) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line.startsWith("<")) continue; // 模板占位符不算步骤
+    // 去掉列表符和编号：- 、* 、1. 、2、 、3) 等
+    const item = line.replace(/^(?:[-*•·]|(?:\d+|\(\d+\))[.、．)）])\s*/, "").trim();
+    if (!item || item.startsWith("<")) continue;
+    steps.push(item);
+  }
+  return steps;
+}
+
+// 从「验证命令」小节解析命令：标题规则与 stepsOfBrief 一致（可带 #、括注、冒号）
+// 每个非空行一条命令，去掉行首的 -、编号和包裹的反引号，跳过 < 开头的占位行，最多取 3 条。没有这一段返回空数组
+export function verifyOfBrief(text) {
+  const lines = String(text || "").split(/\r?\n/);
+  let inSection = false;
+  const body = [];
+  const titleWithHash = /^[ \t]*#{1,6}[ \t]*验证命令(?:\s*[（(][^）\n]*[）)])?[ \t]*[:：]?[ \t]*(.*)$/;
+  const titleNoHash = /^[ \t]*验证命令[ \t]*[:：][ \t]*(.*)$/;
+
+  for (const rawLine of lines) {
+    if (!inSection) {
+      const m = rawLine.match(titleWithHash) || rawLine.match(titleNoHash);
+      if (m) {
+        inSection = true;
+        if (m[1] && m[1].trim()) body.push(m[1]);
+      }
+      continue;
+    }
+    if (/^[ \t]*#/.test(rawLine) || /^[ \t]*(?:目标|背景|相关文件|写入范围|需要的能力|约束|步骤|验收标准|交付格式)[:：]/.test(rawLine)) {
+      break;
+    }
+    body.push(rawLine);
+  }
+  if (!inSection) return [];
+  const cmds = [];
+  for (const raw of body) {
+    const src = raw.trim();
+    const line = src.replace(/^(?:[-*•·]|(?:\d+|\(\d+\))[.、．)）])\s*/, "").trim();
+    if (!line || line.startsWith("<")) continue;
+    // 去掉包裹整个命令的反引号（如 `node --test`），行内反引号保留
+    const cmd = /^`([^`]*)`$/.test(line) ? line.slice(1, -1) : line;
+    if (!cmd || cmd.startsWith("<")) continue;
+    cmds.push(cmd);
+    if (cmds.length >= 3) break;
+  }
+  return cmds;
+}
+
+// 步骤里的文件路径：含 / 且带扩展名的连续非空白串，或以常见源码目录开头的路径
+const STEP_PATH_RE = /(?:^|[\s`"'（(\[<，,、：:;；])((?:\.{1,2}\/|~\/)?[\w@.-]+(?:\/[\w@.-]+)*\/[\w@.-]+\.[A-Za-z0-9]{1,10}|(?:src|lib|libs|scripts|plugins|docs|tests|test|app|cmd|pkg|bin|config|web|pages|components)\/[^\s`"'）)\]>，,。；：]+)/;
+
+// 合格的步骤规格：至少 2 步，且每一步都点到具体文件路径
+export function hasStepSpec(text) {
+  const steps = stepsOfBrief(text);
+  if (steps.length < 2) return false;
+  return steps.every((s) => STEP_PATH_RE.test(s));
 }
 
 // 返回派单全文里出现的图片文件路径（以 .png .jpg .jpeg .gif .webp .bmp 结尾、不含空白的连续字符串，大小写不敏感）

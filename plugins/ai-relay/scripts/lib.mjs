@@ -409,7 +409,8 @@ export function poolStatus(cfg, rows, quotaProvider, pool, now = Date.now()) {
     let remaining = typeof w.remaining_fraction === "number" ? w.remaining_fraction : null;
     if (w.allowance === "exhausted" && !resetPassed) remaining = 0;
     // 已过重置点但面板还没刷新，按已重置处理
-    if (resetPassed) remaining = 1;
+    // 命令行报额度用完的临时窗口（cli-limit）过期后不再参与计算；其他窗口已过重置点按已重置处理
+    if (resetPassed) remaining = w.window_key === "cli-limit" ? null : 1;
     return { key: w.window_key, remaining, resetAt: w.reset_at || null, resetPassed, stale: now - w.updated_at > staleMs, source: w.src || null };
   });
   const known = windows.filter((w) => w.remaining !== null);
@@ -1747,9 +1748,89 @@ async function nonCommitDiscount(root, oldHead, newHead) {
   return discount;
 }
 
+// 同一路径在 macOS 上可能被写成 /var/... 或 /private/var/...，统一解析后比较，避免任务 cwd
+// 和 git show-toplevel 给出的仓库根因链接写法不同而匹配不上。
+function canonPath(p) {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
+
+// 一次 Bash 期间要排除的员工写入：把前后快照所涉每个仓库里运行中的可写任务找出来。
+// 前快照记下的 id（当时在跑）∪ 现在运行中的都要算，任务在 Bash 期间结束也不能漏。
+// 任务 cwd 用"是否在仓库根内"判断归属，比 runningWriters 的精确 cwd 匹配更宽松，
+// 这样 cwd 落在仓库子目录里的任务、或 /var 与 /private/var 写法不同的任务也不会漏掉。
+function activeWritersByRoot(roots, beforeIds, now) {
+  const rootList = [...roots];
+  const byRoot = new Map();
+  for (const root of rootList) byRoot.set(root, []);
+  const all = allJobRecords();
+  const byId = new Map();
+  for (const r of all) byId.set(r.id, r);
+
+  const ids = new Set();
+  const maxMs = 240 * 60_000;
+  const isActive = (r) => {
+    if (r.status !== "running" || !r.write) return false;
+    const startMs = Date.parse(r.startedAt);
+    if (Number.isNaN(startMs)) return false;
+    const elapsed = now - startMs;
+    if (elapsed < -60_000 || elapsed > maxMs) return false;
+    if (r.pid) {
+      try {
+        process.kill(r.pid, 0);
+      } catch (e) {
+        if (e.code === "ESRCH") return false;
+      }
+    }
+    return true;
+  };
+  for (const r of all) if (isActive(r)) ids.add(r.id);
+  for (const id of (Array.isArray(beforeIds) ? beforeIds : [])) ids.add(id);
+
+  for (const id of ids) {
+    const r = byId.get(id);
+    if (!r || !r.write) continue;
+    const root = rootList.find((rt) => isInside(canonPath(r.cwd || ""), canonPath(rt)));
+    if (!root) continue;
+    byRoot.get(root).push(r);
+  }
+  return byRoot;
+}
+
+// 拍前快照时把当时运行中的可写任务 id 记下来（按仓库根匹配归属）。
+export function runningWriterIds(roots, now = Date.now()) {
+  const byRoot = activeWritersByRoot(roots, [], now);
+  const ids = new Set();
+  for (const list of byRoot.values()) for (const w of list) ids.add(w.id);
+  return [...ids];
+}
+
+// 有 scope 的任务：把 scope 内文件（按任务 cwd 解析成绝对路径，目录按前缀匹配）从快照里去掉；
+// 没有 scope 的任务：整个仓库计 0。
+function stripWriterFiles(files, root, writers) {
+  for (const w of writers) {
+    const scopeList = Array.isArray(w.scope) && w.scope.length ? w.scope : null;
+    if (!scopeList) {
+      stripRepoFiles(files, root);
+      return;
+    }
+    const cwd = w.cwd || root;
+    for (const s of scopeList) {
+      const abs = canonPath(path.resolve(cwd, String(s)));
+      for (const key of Object.keys(files)) {
+        const k = canonPath(key);
+        if (k === abs || k.startsWith(abs + path.sep)) delete files[key];
+      }
+    }
+  }
+}
+
 // 一次 Bash 真正算手写的行数。git 失败时返回 0，避免把整段历史算进来，也不打断对话。
 // refs/stash 变了的仓库整次计 0（stash / pop / apply 之后 drop）。
-export async function handwrittenDelta(before, after) {
+export async function handwrittenDelta(before, after, now = Date.now()) {
   try {
     const bFiles = { ...snapFiles(before) };
     const aFiles = { ...snapFiles(after) };
@@ -1760,7 +1841,14 @@ export async function handwrittenDelta(before, after) {
       ...Object.keys(before?.heads || {}),
       ...Object.keys(after?.currents || {}),
     ]);
+    // 运行中的可写外派任务：范围内的文件不算主管手写；没写范围的任务让整个仓库计 0
+    const writersByRoot = activeWritersByRoot(roots, before?.runningWriterIds, now);
     for (const root of roots) {
+      const writers = writersByRoot.get(root) || [];
+      if (writers.length) {
+        stripWriterFiles(bFiles, root, writers);
+        stripWriterFiles(aFiles, root, writers);
+      }
       const oldStash = before?.stashes?.[root] || "";
       const newStash = after?.stashes?.[root] || "";
       if (oldStash !== newStash) {

@@ -62,11 +62,13 @@ export function levelEffort(level) {
   return LEVEL_RULES[level]?.effort || null;
 }
 
-// 这个档位的模型能不能接这个难度的活；downgrade 为真时门槛降一档
-export function tierAllowed(level, tier, downgrade = false) {
+// 这个档位的模型能不能接这个难度的活；downgrade 为真时门槛降一档；
+// steps 为真且难度为中等时，视同带步骤规格，门槛同样降一档（轻档可接）
+export function tierAllowed(level, tier, downgrade = false, steps = false) {
   const rule = LEVEL_RULES[level];
   if (!rule) return true;
-  return TIER_RANK[tier] >= Math.max(0, TIER_RANK[rule.minTier] - (downgrade ? 1 : 0));
+  const relax = downgrade || (steps && level === "medium") ? 1 : 0;
+  return TIER_RANK[tier] >= Math.max(0, TIER_RANK[rule.minTier] - relax);
 }
 
 // 「简单 / 中等 / 困难」或 easy / medium / hard，认不出返回 null
@@ -333,8 +335,9 @@ export function capsSkipWhy(caps, needs) {
 }
 
 // level：任务难度（easy / medium / hard），不传按旧规则只看角色路由；downgrade 为真时档位门槛降一档，权重仍按原难度；
+// steps 为真且难度为中等时同样降一档（派单带合格的「## 步骤」规格，轻档可接），其他难度忽略；
 // exactModel：调用方点名了具体模型，不按难度换 low/medium/high
-export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now(), write, target, workspace, needs, level, downgrade, exactModel } = {}) {
+export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now(), write, target, workspace, needs, level, downgrade, steps, exactModel } = {}) {
   const route = cfg?.routes?.[role];
   if (!route) {
     const available = Object.keys(cfg?.routes || {}).join(", ");
@@ -345,7 +348,8 @@ export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now
   const skipped = [];
   const rule = level ? LEVEL_RULES[level] : null;
   if (level && !rule) throw new Error(`未知难度 ${level}，可选：简单 / 中等 / 困难`);
-  const minRank = rule ? Math.max(0, TIER_RANK[rule.minTier] - (downgrade ? 1 : 0)) : 0;
+  const hasSteps = level === "medium" && !!steps;
+  const minRank = rule ? Math.max(0, TIER_RANK[rule.minTier] - (downgrade || hasSteps ? 1 : 0)) : 0;
   const weights = rule?.weights ? { ...cfg?.scoreWeights, ...rule.weights } : cfg?.scoreWeights;
 
   for (let i = 0; i < route.length; i++) {
@@ -444,7 +448,11 @@ export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now
     if (rule?.weights?.cost) parts.cost = TIER_COST[tier];
     const score = calcWeightedScore(parts, weights);
     let reason = formatReason(parts, score, st, now, running);
-    if (rule) reason = `难度${LEVEL_TEXT[level]}${downgrade ? "（已降级）" : ""}：${rule.note}，它是${TIER_TEXT[tier]}；${reason}`;
+    if (rule) {
+      // 中等任务带合格的步骤规格：因规格放宽而能接的轻档，理由里写明（不写降级原因）
+      const stepNote = hasSteps && !downgrade && TIER_RANK[tier] < TIER_RANK[rule.minTier] ? "，带步骤规格，轻档可接" : "";
+      reason = `难度${LEVEL_TEXT[level]}${downgrade ? "（已降级）" : ""}：${rule.note}，它是${TIER_TEXT[tier]}${stepNote}；${reason}`;
+    }
 
     const rawPace = paceOf(st, now);
     const pace = rawPace === null ? null : round(rawPace, 3);

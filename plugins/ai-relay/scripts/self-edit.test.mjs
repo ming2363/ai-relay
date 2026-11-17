@@ -921,3 +921,79 @@ test("bashReadCount 不把 heredoc 写文件算成读文件", () => {
   assert.equal(bashReadCount("python3 - <<'PY'\nhead = 1\ntail = 2\nPY"), 0);
   assert.equal(bashReadCount("cat a.txt && sed -n '1,5p' b.txt"), 2);
 });
+
+// 在隔离 home 里写一条运行中的可写任务记录，供 Bash 行数统计排除用。
+function writeRunningJob(home, over = {}) {
+  const job = {
+    id: "20261117000000-grok-writer",
+    provider: "grok",
+    pool: "supergrok-weekly",
+    model: "default",
+    role: "implement",
+    reason: "测试用",
+    write: true,
+    cwd: "",
+    task: "测试任务",
+    scope: null,
+    status: "running",
+    startedAt: new Date().toISOString(),
+    ...over,
+  };
+  fs.mkdirSync(path.join(home, "jobs"), { recursive: true });
+  fs.writeFileSync(path.join(home, "jobs", `${job.id}.json`), JSON.stringify(job, null, 2));
+  return job;
+}
+
+test("运行中的可写任务 scope 内的文件不算主管手写，范围外照常计", () => {
+  withHome((home) => withRepo((repo) => {
+    setMode(home, "auto");
+    fs.mkdirSync(path.join(repo, "src"), { recursive: true });
+    writeRunningJob(home, { cwd: repo, scope: ["src"] });
+    const stat = bashRound(home, "s-worker-scope", repo, "python3 - <<'PY'\nPY", () => {
+      fs.writeFileSync(path.join(repo, "src", "a.js"), "1\n2\n3\n4\n5\n6\n");
+      fs.writeFileSync(path.join(repo, "b.js"), "1\n2\n3\n");
+    });
+    assert.equal(stat.lines, 3, `scope 内员工写的行被算进主管：lines=${stat.lines}`);
+  }));
+});
+
+test("运行中的可写任务没有 scope 时，该仓库这次 Bash 计 0", () => {
+  withHome((home) => withRepo((repo) => {
+    setMode(home, "auto");
+    writeRunningJob(home, { cwd: repo, scope: null });
+    const stat = bashRound(home, "s-worker-whole", repo, "python3 - <<'PY'\nPY", () => {
+      fs.writeFileSync(path.join(repo, "tracked.txt"), "1\n2\n3\n4\n5\n");
+    });
+    assert.equal(stat.lines, 0, `没有 scope 的员工被算成主管手写：lines=${stat.lines}`);
+  }));
+});
+
+test("任务在 Bash 期间结束（前快照在跑、后快照已结束）仍然排除", () => {
+  withHome((home) => withRepo((repo) => {
+    setMode(home, "auto");
+    fs.mkdirSync(path.join(repo, "src"), { recursive: true });
+    const job = writeRunningJob(home, { cwd: repo, scope: ["src"] });
+    // 前快照由 pretool 自己拍，会把当时 running 的任务 id 记进去；act 里把任务改成 done 模拟 Bash 期间结束
+    const stat = bashRound(home, "s-worker-ended", repo, "python3 - <<'PY'\nPY", () => {
+      fs.writeFileSync(path.join(repo, "src", "a.js"), "1\n2\n3\n4\n5\n");
+      const p = path.join(home, "jobs", `${job.id}.json`);
+      const j = JSON.parse(fs.readFileSync(p, "utf8"));
+      j.status = "done";
+      j.finishedAt = new Date().toISOString();
+      fs.writeFileSync(p, JSON.stringify(j, null, 2));
+    });
+    assert.equal(stat.lines, 0, `Bash 期间结束的任务漏排除：lines=${stat.lines}`);
+  }));
+});
+
+test("没有运行中任务时计数不变", () => {
+  withHome((home) => withRepo((repo) => {
+    setMode(home, "auto");
+    fs.mkdirSync(path.join(repo, "src"), { recursive: true });
+    const stat = bashRound(home, "s-no-worker", repo, "python3 - <<'PY'\nPY", () => {
+      fs.writeFileSync(path.join(repo, "src", "a.js"), "1\n2\n3\n4\n");
+      fs.writeFileSync(path.join(repo, "b.js"), "1\n2\n");
+    });
+    assert.equal(stat.lines, 6, `没有任务时计数变了：lines=${stat.lines}`);
+  }));
+});

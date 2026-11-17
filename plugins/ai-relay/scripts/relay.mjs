@@ -13,8 +13,9 @@ import {
   runningWriters, scopesOverlap, normScope, isPathInScope, withWriteLock, gitSnapshot, claimPendingDispatch,
   parseGitStatusPath, parseGitStatusPaths, diffSnapshots, checkOutOfScope, workspaceRoot,
   getWorkspaceActivityMtime, recordMeteredUsage, meteredUsedToday, meteredCapReached,
+  lineSnapshot, snapshotDelta,
 } from "./lib.mjs";
-import { refreshCache, refreshGrok, loadCache } from "./quota.mjs";
+import { refreshCache, refreshGrok, loadCache, detectQuotaExhausted, markPoolExhausted } from "./quota.mjs";
 import { scoreRoute, parseLevel, modelTier, tierAllowed, levelEffort, LEVEL_TEXT, TIER_TEXT } from "./score.mjs";
 import {
   getModels, loadModelsCache, findModelPool, setProviderDefaultModel, buildModelPools,
@@ -22,17 +23,18 @@ import {
 import { usageForJob, usageFromOutputJson, parseClaudeOutput, backfill, attachLiveUsage, getSessionActivityMtime } from "./usage.mjs";
 import {
   BRIEF_TEMPLATE, checkBrief, roleOfBrief, levelOfBrief, buildDispatchPrompt, readSharedContext, writeSharedContext, clearSharedContext,
-  attachJobs, gitDiff, projectContext, scopeOfBrief, needsWithImages, helpRequestOf,
+  attachJobs, gitDiff, projectContext, scopeOfBrief, needsWithImages, helpRequestOf, hasStepSpec, verifyOfBrief,
 } from "./brief.mjs";
 
 // 按打分选模型：擅长度 × 额度（含快到期加成）× 历史可靠度（含验收结论）× 速度
 // write / target / workspace 原样传给打分，缺了就不做沙箱检查
 // needs 是这次要的能力（web / exec），缺的厂商由打分跳过
 // level 是任务难度，决定候选模型的最低档位和打分侧重；downgrade 为真时门槛降一档；exactModel 时不按难度换 low/medium/high
+// steps 为真且难度中等时（派单带合格的「## 步骤」规格），门槛同样降一档，轻档可接
 // 按量计费厂商当天用量到上限后，自动选人把它从首选和备选移到跳过（点名厂商不拦）。
-function route(cfg, rows, role, only, { write, target, workspace, needs, level, downgrade, exactModel } = {}) {
-  if (only) return scoreRoute(cfg, rows, role, { only, history: allJobRecords(), write, target, workspace, needs, level, downgrade, exactModel });
-  const r = scoreRoute(cfg, rows, role, { history: allJobRecords(), write, target, workspace, needs, level, downgrade, exactModel });
+function route(cfg, rows, role, only, { write, target, workspace, needs, level, downgrade, steps, exactModel } = {}) {
+  if (only) return scoreRoute(cfg, rows, role, { only, history: allJobRecords(), write, target, workspace, needs, level, downgrade, steps, exactModel });
+  const r = scoreRoute(cfg, rows, role, { history: allJobRecords(), write, target, workspace, needs, level, downgrade, steps, exactModel });
   const capped = new Set();
   const keep = [];
   for (const cand of [r.choice, ...r.alternatives]) {
@@ -72,9 +74,22 @@ export function noModelText(role, level, skipped) {
   return [...lines, tail].join("\n");
 }
 
-// 档位不够时的退回说明
-function tierRefusal(level, provName, model, tier) {
-  return `${provName} / ${model} 是${TIER_TEXT[tier]}模型，接不了${LEVEL_TEXT[level]}任务。换更强的模型；没有可用的就由主管自己做，或确认降一档也能做好时加 --downgrade "<原因>"`;
+// 档位不够时的退回说明；steps 为真（派单带合格的步骤规格）时补充说明轻档可接
+function tierRefusal(level, provName, model, tier, steps = false) {
+  const stepNote = steps && level === "medium" ? "这张派单带了合格的「## 步骤」规格，轻档也可以接，检查步骤小节后重试" : "";
+  return `${provName} / ${model} 是${TIER_TEXT[tier]}模型，接不了${LEVEL_TEXT[level]}任务。换更强的模型；没有可用的就由主管自己做，或确认降一档也能做好时加 --downgrade "<原因>"${stepNote ? `。${stepNote}` : ""}`;
+}
+
+// 中等任务没有候选时的提示：用 steps 再打一次分，列出届时可接的轻档候选，
+// 并说明把任务写成「## 步骤」规格后可以派给它们
+function stepsHintText(cfg, rows, role, extra, only) {
+  const r = route(cfg, rows, role, only, { ...extra, steps: true });
+  const lights = [r.choice, ...r.alternatives].filter((c) => c && c.tier === "light");
+  const lines = ["", "轻档候选（现在因档位不够被跳过）："];
+  for (const c of lights) lines.push(`  ${c.provider} / ${c.model}  [${quotaText(cfg, c.provider, c.status)}]  ${c.reason}`);
+  if (!lights.length) lines.push("  （没有：轻档也都没额度或已停用）");
+  lines.push("把任务写成「## 步骤」规格（至少 2 步，每步点到具体文件）后可以派给它们：中等任务带合格的步骤规格时轻档可接，relay pick 加 --steps 可预览。");
+  return lines.join("\n");
 }
 
 const OUTPUT_CAP = 20000;
@@ -223,11 +238,15 @@ function cmdPick(opts) {
   }
   extra.level = level;
   extra.downgrade = !!opts.downgrade;
+  // --steps：预览"派单带合格的「## 步骤」规格"时的候选（只对中等任务生效，打分内部忽略其他难度）
+  extra.steps = !!opts.steps;
   const r = route(cfg, readQuotaRows(cfg), role, opts.provider, extra);
   if (r.choice) recordPick(role, r);
   if (opts.json) return console.log(JSON.stringify(r, null, 2));
   if (!r.choice) {
     console.log(noModelText(role, level, r.skipped));
+    // 中等任务一个候选都没有：按"带步骤规格"再打一次分，把届时能接的轻档列出来，提示主管补写「## 步骤」
+    if (level === "medium" && !opts.steps) console.log(stepsHintText(cfg, readQuotaRows(cfg), role, extra, opts.provider));
     process.exit(3);
   }
   const c = r.choice;
@@ -441,6 +460,15 @@ export async function executeJob(job, testOpts = {}) {
   }
 
   const before = gitSnapshot(job.cwd);
+  // 可写任务的任务开始、结束各拍一次行数快照，结束时求差记录改动行数（失败时不记）
+  let linesBefore = null;
+  if (job.write) {
+    try {
+      linesBefore = await lineSnapshot(job.cwd);
+    } catch {
+      linesBefore = null;
+    }
+  }
   const spawnOpts = {
     cwd: job.cwd,
     stdio: ["ignore", "pipe", "pipe"],
@@ -601,6 +629,46 @@ export async function executeJob(job, testOpts = {}) {
   job.permissionDenied = /permission required|auto-denied|cannot (ask|prompt) for/i.test(output);
   // 权限被拒后中断、没有产出：即使退出码为 0 也算失败
   if (job.status === "done" && job.permissionDenied && !stdoutStr.trim()) job.status = "failed";
+  // 可写任务任务结束再拍一次行数快照，求差记改动行数（失败时不记）
+  if (job.write && linesBefore) {
+    try {
+      const linesAfter = await lineSnapshot(job.cwd, Object.keys(linesBefore.heads || {}), linesBefore.heads);
+      if (linesAfter && job.status === "done") {
+        job.changedLines = snapshotDelta(linesBefore, linesAfter);
+      }
+    } catch {}
+  }
+  // 可写、成功结束且派单带验证命令时：在任务目录里依次执行，记录退出码、耗时和输出的最后 40 行
+  const verifyCmds = job.write && job.status === "done" ? verifyOfBrief(job.task) : [];
+  if (verifyCmds.length && !testOpts.skipVerify) {
+    const verifyTimeoutMs = Number(cfg.verifyTimeoutMin ?? 10) * 60_000;
+    const results = [];
+    for (const cmd of verifyCmds) {
+      const startedMs = Date.now();
+      const res = spawnSync("sh", ["-c", cmd], { cwd: job.cwd, encoding: "utf8", timeout: verifyTimeoutMs });
+      const rawTail = `${res.stdout || ""}${res.stderr ? `\n${res.stderr}` : ""}`.trim();
+      const tail = maskSecretValue(rawTail.split("\n").slice(-40).join("\n"), taskSecret);
+      const entry = { cmd, exitCode: res.status, ms: Date.now() - startedMs, tail };
+      if (res.error?.code === "ETIMEDOUT") {
+        entry.exitCode = null;
+        entry.timedOut = true;
+      } else if (res.error) {
+        entry.exitCode = null;
+      }
+      results.push(entry);
+    }
+    job.verify = { ok: results.every((r) => r.exitCode === 0), results };
+    if (!job.verify.ok) job.verifyFailed = true;
+  }
+  // 员工命令行报额度用完（额度接口可能还显示充足）：只在任务没成功时看标准错误和输出末尾，
+  // 避免正常产出里碰巧写到 usage limit 之类的字样被误判。命中就把这个额度池临时记为用完 24 小时
+  if (job.status !== "done" && detectQuotaExhausted(`${stderrStr}\n${stdoutStr.slice(-2000)}`)) {
+    job.quotaExhausted = true;
+    try {
+      const qp = cfg.providers?.[job.provider]?.quota?.provider || job.provider;
+      if (job.pool) markPoolExhausted(testOpts.stateDir || STATE_DIR, qp, job.pool);
+    } catch {}
+  }
   // 写日志和结果前打掉本任务密钥的原值。标准错误留在日志里，结果只取 JSON 的 result。
   const maskedLog = maskSecretValue(output, taskSecret);
   if (typeof job.result === "string") job.result = maskSecretValue(job.result, taskSecret);
@@ -614,13 +682,14 @@ export async function executeJob(job, testOpts = {}) {
 export function printJob(job) {
   const modelText = job.model && job.model !== "default" ? " / " + job.model : "";
   const exitText = job.exitCode !== undefined && job.exitCode !== null ? `（退出码 ${job.exitCode}）` : "";
+  const linesText = job.changedLines !== undefined && job.changedLines !== null ? ` · 改动 ${job.changedLines} 行` : "";
   let statusText = job.status;
   if (job.status === "timeout") {
     const reasonText = formatTimeoutReason(job);
     statusText = `timeout${reasonText ? `（${reasonText}）` : ""}`;
   }
   const head = [
-    `任务 ${job.id} · ${job.provider}${modelText} · ${job.role || "未注明角色"}${job.level ? ` · 难度${LEVEL_TEXT[job.level] || job.level}` : ""} · ${job.write ? "可写" : "只读"} · 状态 ${statusText}${exitText}`,
+    `任务 ${job.id} · ${job.provider}${modelText} · ${job.role || "未注明角色"}${job.level ? ` · 难度${LEVEL_TEXT[job.level] || job.level}` : ""} · ${job.write ? "可写" : "只读"}${linesText} · 状态 ${statusText}${exitText}`,
     `目录：${job.cwd}`,
   ];
   if (job.reworkOf) head.push(`返工第 ${job.reworkRound || 1} 次，原任务 ${job.reworkOf}`);
@@ -653,6 +722,15 @@ export function printJob(job) {
   if (out) {
     const shown = out.length > OUTPUT_CAP ? "…（前文已省略，完整日志见下方路径）\n" + out.slice(-OUTPUT_CAP) : out;
     console.log("\n----- 输出 -----\n" + shown.trim());
+  }
+  if (job.verify?.results?.length) {
+    console.log(`\n自动验证：${job.verify.ok ? "通过" : "未通过"}`);
+    for (const r of job.verify.results) {
+      const codeText = r.timedOut ? "超时" : `退出码 ${r.exitCode}`;
+      console.log(`  ${r.cmd}\n    ${codeText}，${r.ms} ms`);
+      if (!job.verify.ok && r.tail) console.log(r.tail.split("\n").map((l) => `    ${l}`).join("\n"));
+    }
+    if (!job.verify.ok) console.log(`可用 relay rework <id> -- <修改意见> 退回。`);
   }
   console.log(`\n完整日志：${jobPath(job.id, "log", job._jobsDir)}`);
   if (job.status !== "running" && !job.verdict) console.log(`验收后记录结论：node "${RELAY_SCRIPT}" verdict ${job.id} pass|partial|fail -- <一句话说明>`);
@@ -698,6 +776,8 @@ async function cmdRun(opts) {
   const downgrade = opts.downgrade ? String(opts.downgrade) : "";
   // --needs 优先；否则从派单「需要的能力」读。空数组表示不按能力筛选
   const needs = opts.needs ? parseNeedsFlag(opts.needs) : needsWithImages(task);
+  // 派单正文带合格的「## 步骤」规格时，中等任务可以交给轻档（打分和档位检查都放宽一档）
+  const steps = hasStepSpec(task);
 
   let provName = opts._[1];
   const rows = readQuotaRows(cfg);
@@ -709,7 +789,7 @@ async function cmdRun(opts) {
     // 可写任务按目标目录判断沙箱：Codex 写不到项目外的目录时自动跳过
     const target = path.resolve(opts.cwd || process.cwd());
     const workspace = workspaceRoot(process.env.CLAUDE_PROJECT_DIR || process.cwd());
-    const r = route(cfg, rows, role, undefined, { needs, write: !!opts.write, target, workspace, level, downgrade: !!downgrade, exactModel: !!opts.model });
+    const r = route(cfg, rows, role, undefined, { needs, write: !!opts.write, target, workspace, level, downgrade: !!downgrade, steps, exactModel: !!opts.model });
     // 首选是 Codex 时不悄悄改派：Codex 要走 Agent 工具（官方插件），交给主管去派
     if (!opts.model && !opts.skipCodex && r.choice?.via === "codex-plugin") {
       recordPick(role, r);
@@ -762,7 +842,7 @@ async function cmdRun(opts) {
 
   if (!reason) {
     // 主模型点名了厂商：仍记下这个厂商在该角色下的打分，便于事后对照
-    const r = route(cfg, rows, role, provName, { needs, level, downgrade: !!downgrade, exactModel: !!model });
+    const r = route(cfg, rows, role, provName, { needs, level, downgrade: !!downgrade, steps, exactModel: !!model });
     const same = [r.choice, ...r.alternatives].find((x) => x && (!model || x.model === model || x.routeModel === model));
     if (!model && r.choice) ({ model, pool } = r.choice);
     else if (same && !pool) ({ model, pool } = same);
@@ -792,8 +872,8 @@ async function cmdRun(opts) {
   }
   // 点名的厂商和模型也要过难度门槛：档位不够就退回，不悄悄派
   const tier = modelTier(cfg, provName, model);
-  if (!tierAllowed(level, tier, !!downgrade)) {
-    console.error(`ai-relay：${tierRefusal(level, provName, model, tier)}`);
+  if (!tierAllowed(level, tier, !!downgrade, steps)) {
+    console.error(`ai-relay：${tierRefusal(level, provName, model, tier, steps)}`);
     process.exit(3);
   }
   if (!reason.includes("难度")) reason = `难度${LEVEL_TEXT[level]}，它是${TIER_TEXT[tier]}；${reason}`;
@@ -1701,10 +1781,11 @@ function help() {
   console.log(`用法：node relay.mjs <命令>
   status [--json]                 查看模式、各家额度、各类任务首选
   mode [off|manual|auto]          查看或切换模式（off 会同时禁用 Codex 插件）
-  pick <角色> --level 简单|中等|困难 [--write --target 目录] [--needs web,exec] [--downgrade 原因]
+  pick <角色> --level 简单|中等|困难 [--write --target 目录] [--needs web,exec] [--downgrade 原因] [--steps]
                                   按难度和打分挑选模型并给出理由：简单优先便宜、额度多的轻档，中等要中档以上，困难只派强档
                                   要写的目录在当前项目外时传 --target，写不到的厂商（如 Codex）会被跳过
                                   --needs 只在具备这些能力的厂商里选（web 联网，exec 执行命令，逗号分隔）
+                                  --steps 预览"派单带合格的「## 步骤」规格"时的候选：中等任务的档位门槛降一档，轻档可接（其他难度无效）
   models [--refresh] [--json]     拉取或查看各厂商官方 CLI 的可用模型清单（缓存 24 小时）
   providers [--json]              列出厂商：启用状态、命令是否已安装、参与哪些角色、额度池默认模型
   provider enable|disable <名称>   启用 / 停用某厂商（停用后路由与外派都跳过它）
