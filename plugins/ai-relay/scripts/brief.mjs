@@ -267,7 +267,10 @@ export function verifyOfBrief(text) {
   const cmds = [];
   for (const raw of body) {
     const src = raw.trim();
-    const line = src.replace(/^(?:[-*•·]|(?:\d+|\(\d+\))[.、．)）])\s*/, "").trim();
+    // 代码块围栏（```bash / ```）不是命令，跳过；块里的命令照常收
+    if (/^(```|~~~)/.test(src)) continue;
+    // 去掉列表符号和终端提示符（$ npm test）
+    const line = src.replace(/^(?:[-*•·]|(?:\d+|\(\d+\))[.、．)）])\s*/, "").replace(/^\$\s+/, "").trim();
     if (!line || line.startsWith("<")) continue;
     // 去掉包裹整个命令的反引号（如 `node --test`），行内反引号保留
     const cmd = /^`([^`]*)`$/.test(line) ? line.slice(1, -1) : line;

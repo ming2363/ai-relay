@@ -285,6 +285,55 @@ function migrateCodexRoutes(cfg, def) {
   return changed;
 }
 
+// 一次性升级只做一遍：做过的记进 cfg.migrated，之后用户删掉补上的东西也不会被加回来
+function migrateOnce(cfg, name, fn) {
+  if (!Array.isArray(cfg.migrated)) cfg.migrated = [];
+  if (cfg.migrated.includes(name)) return false;
+  fn();
+  cfg.migrated.push(name);
+  return true;
+}
+
+// 思考一律最高（0.24）：默认配置里给命令行加的固定参数（如 Grok 的 --reasoning-effort xhigh）补到旧配置；
+// 用 claude 命令行的自定义接口补上思考预算 MAX_THINKING_TOKENS
+function migrateMaxThinking(cfg, def) {
+  return migrateOnce(cfg, "max-thinking", () => {
+    for (const [name, dp] of Object.entries(def.providers || {})) {
+      const p = cfg.providers?.[name];
+      if (p?.cli && Array.isArray(dp.cli?.alwaysArgs) && p.cli.alwaysArgs === undefined) p.cli.alwaysArgs = [...dp.cli.alwaysArgs];
+    }
+    for (const p of Object.values(cfg.providers || {})) {
+      if (p?.endpoint && p.cli?.bin === "claude" && p.env && typeof p.env === "object" && p.env.MAX_THINKING_TOKENS === undefined) {
+        p.env.MAX_THINKING_TOKENS = "32000";
+      }
+    }
+  });
+}
+
+// Gemini Hydrogen（0.24）：归池规则、gemini 池模型、默认模型、快问路由。用户改过的默认模型和路由不动
+const OLD_GEMINI_DEFAULT = "gemini-3.8-flash-high";
+const OLD_QUICK_ENTRY = "agy:gemini:gemini-3.8-flash-medium";
+function migrateHydrogen(cfg, def) {
+  const dp = def.providers?.agy;
+  const p = cfg.providers?.agy;
+  if (!dp || !p?.pools?.gemini) return false;
+  return migrateOnce(cfg, "gemini-hydrogen", () => {
+    const hyd = (dp.pools?.gemini || []).filter((m) => /hydrogen/i.test(m));
+    p.pools.gemini = [...hyd.filter((m) => !p.pools.gemini.includes(m)), ...p.pools.gemini];
+    const rule = (dp.poolRules || []).find((r) => Array.isArray(r) && r[0] === "hydrogen");
+    if (rule && Array.isArray(p.poolRules) && !p.poolRules.some((r) => Array.isArray(r) && /hydrogen/i.test(String(r[0])))) {
+      const at = p.poolRules.findIndex((r) => Array.isArray(r) && r[0] === "flash");
+      p.poolRules.splice(at < 0 ? p.poolRules.length : at, 0, [...rule]);
+    }
+    const fresh = dp.defaultModels?.gemini;
+    if (fresh && p.defaultModels && (p.defaultModels.gemini === undefined || p.defaultModels.gemini === OLD_GEMINI_DEFAULT)) p.defaultModels.gemini = fresh;
+    if (p.poolLabels?.gemini === "Gemini Flash" && dp.poolLabels?.gemini) p.poolLabels.gemini = dp.poolLabels.gemini;
+    if (Array.isArray(cfg.routes?.quick)) {
+      cfg.routes.quick = cfg.routes.quick.map((e) => (e === OLD_QUICK_ENTRY ? "agy:gemini:default" : e));
+    }
+  });
+}
+
 export function migrateModelFields(cfg, def) {
   if (!def) {
     try {
@@ -294,6 +343,8 @@ export function migrateModelFields(cfg, def) {
     }
   }
   let changed = migrateCodexRoutes(cfg, def);
+  if (migrateMaxThinking(cfg, def)) changed = true;
+  if (migrateHydrogen(cfg, def)) changed = true;
   const freshDefaults = new Set();
   for (const [name, dp] of Object.entries(def.providers || {})) {
     const p = cfg.providers?.[name];
@@ -804,6 +855,12 @@ export function allJobRecords(limit = Infinity) {
           // 发起这次外派的 Claude 会话；旧任务没有，jobs --json 就不带这个字段
           ...(typeof j.sessionId === "string" && j.sessionId.trim() ? { sessionId: j.sessionId.trim() } : {}),
           ...(j.usage ? { usage: j.usage } : {}),
+          // 可写任务结束时记下的改动行数，工作量统计用
+          ...(Number.isFinite(j.changedLines) ? { changedLines: j.changedLines } : {}),
+          // 自动初审：原任务记初审任务 id 或没做的原因，初审任务记它审的是哪个
+          ...(j.autoReviewId ? { autoReviewId: j.autoReviewId } : {}),
+          ...(j.autoReviewSkipped ? { autoReviewSkipped: j.autoReviewSkipped } : {}),
+          ...(j.autoReviewOf ? { autoReviewOf: j.autoReviewOf } : {}),
         };
       } catch {
         return null;
@@ -814,6 +871,9 @@ export function allJobRecords(limit = Infinity) {
     changedFiles: Array.isArray(h.changedFiles) ? h.changedFiles.length : (h.changedFiles || 0),
     finishedAt: null, role: null, reason: "", verdict: null, verdictNote: "",
     ...h,
+    // Codex 运行中的行数前快照、原派单全文只给钩子和初审用，不往外带
+    linesBefore: undefined,
+    brief: undefined,
     scope: h.scope ?? null,
     outOfScope: h.outOfScope ?? null,
     helpRequest: h.helpRequest || "",
@@ -1154,6 +1214,12 @@ function bashSnapFile(sessionId) {
 
 // 不算项目代码：临时目录、会话 memory、计划草稿。不拦截，也不计行数。
 const SCRATCH_PATH_RE = /^(\/private)?\/tmp\/|^\/var\/folders\//;
+
+// 文档文件（Markdown、纯文本）：主管写方案、交接、说明是本职，不算亲手写项目代码
+const DOC_EXT_RE = /\.(md|markdown|mdx|txt|rst)$/i;
+export function isDocPath(filePath) {
+  return DOC_EXT_RE.test(String(filePath || ""));
+}
 
 export function isScratchPath(filePath) {
   const raw = String(filePath || "");

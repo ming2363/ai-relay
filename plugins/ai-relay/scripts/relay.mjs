@@ -16,10 +16,11 @@ import {
   lineSnapshot, snapshotDelta,
 } from "./lib.mjs";
 import { refreshCache, refreshGrok, loadCache, detectQuotaExhausted, markPoolExhausted } from "./quota.mjs";
-import { scoreRoute, parseLevel, modelTier, tierAllowed, levelEffort, LEVEL_TEXT, TIER_TEXT } from "./score.mjs";
+import { scoreRoute, parseLevel, modelTier, tierAllowed, CODEX_EFFORT, LEVEL_TEXT, TIER_TEXT } from "./score.mjs";
 import {
   getModels, loadModelsCache, findModelPool, setProviderDefaultModel, buildModelPools,
 } from "./models.mjs";
+import { sampleQuotaHistory, lastCycles, workStats } from "./stats.mjs";
 import { usageForJob, usageFromOutputJson, parseClaudeOutput, backfill, attachLiveUsage, getSessionActivityMtime } from "./usage.mjs";
 import {
   BRIEF_TEMPLATE, checkBrief, roleOfBrief, levelOfBrief, buildDispatchPrompt, readSharedContext, writeSharedContext, clearSharedContext,
@@ -29,12 +30,12 @@ import {
 // 按打分选模型：擅长度 × 额度（含快到期加成）× 历史可靠度（含验收结论）× 速度
 // write / target / workspace 原样传给打分，缺了就不做沙箱检查
 // needs 是这次要的能力（web / exec），缺的厂商由打分跳过
-// level 是任务难度，决定候选模型的最低档位和打分侧重；downgrade 为真时门槛降一档；exactModel 时不按难度换 low/medium/high
+// level 是任务难度，决定候选模型的最低档位和打分侧重；downgrade 为真时门槛降一档；默认换成额度池里最高的思考档，exactModel（点名了模型）时不换
 // steps 为真且难度中等时（派单带合格的「## 步骤」规格），门槛同样降一档，轻档可接
 // 按量计费厂商当天用量到上限后，自动选人把它从首选和备选移到跳过（点名厂商不拦）。
-function route(cfg, rows, role, only, { write, target, workspace, needs, level, downgrade, steps, exactModel } = {}) {
+function route(cfg, rows, role, only, { write, target, workspace, needs, level, downgrade, steps, exactModel, excludeProviders } = {}) {
   if (only) return scoreRoute(cfg, rows, role, { only, history: allJobRecords(), write, target, workspace, needs, level, downgrade, steps, exactModel });
-  const r = scoreRoute(cfg, rows, role, { history: allJobRecords(), write, target, workspace, needs, level, downgrade, steps, exactModel });
+  const r = scoreRoute(cfg, rows, role, { history: allJobRecords(), write, target, workspace, needs, level, downgrade, steps, exactModel, excludeProviders });
   const capped = new Set();
   const keep = [];
   for (const cand of [r.choice, ...r.alternatives]) {
@@ -97,7 +98,7 @@ const CODEX_PLUGIN_ID = "codex@openai-codex";
 
 function parseArgs(argv) {
   const opts = { _: [] };
-  const valueFlags = new Set(["--role", "--model", "--cwd", "--prompt-file", "--timeout", "--provider", "--json-spec", "--preset", "--claude-json", "--limit", "--with", "--scope", "--target", "--needs", "--idle-timeout", "--max-runtime", "--verdict", "--level", "--downgrade", "--add", "--remove"]);
+  const valueFlags = new Set(["--role", "--model", "--cwd", "--prompt-file", "--timeout", "--provider", "--json-spec", "--preset", "--claude-json", "--limit", "--with", "--scope", "--target", "--needs", "--idle-timeout", "--max-runtime", "--verdict", "--level", "--downgrade", "--add", "--remove", "--days"]);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--") {
@@ -156,7 +157,21 @@ function cmdStatus(opts) {
     }
   }
   const picks = Object.keys(cfg.routes || {}).map((role) => route(cfg, rows, role));
+  // 每次看状态顺手采样额度：检测到窗口重置就把上个周期结束时还剩多少记下来（面板每分钟会调一次）
+  let cycles = {};
+  try {
+    sampleQuotaHistory(STATE_DIR, rows || []);
+    cycles = lastCycles(STATE_DIR);
+  } catch {}
   if (opts.json) {
+    for (const p of pools) {
+      const prov = cfg.providers[p.name];
+      const qp = prov?.quota?.provider || p.name;
+      const list = Object.entries(cycles)
+        .filter(([k]) => k.startsWith(`${qp}|${p.pool}|`))
+        .map(([, c]) => c);
+      if (list.length) p.lastCycles = list;
+    }
     const sources = Object.fromEntries(Object.entries(loadCache(STATE_DIR).sources).map(([k, v]) => [k, { fetchedAt: v.fetchedAt, error: v.error }]));
     const thresholds = { min: cfg.minRemaining ?? 0.15, low: cfg.lowRemaining ?? 0.3 };
     console.log(JSON.stringify({ mode, quotaAvailable: !!rows, pools, picks, sources, thresholds }, null, 2));
@@ -253,7 +268,7 @@ function cmdPick(opts) {
   console.log(`${role}（难度${LEVEL_TEXT[level]}）→ ${c.provider} / ${c.pool} / ${c.model}（${TIER_TEXT[c.tier]}）  [${quotaText(cfg, c.provider, c.status)}]`);
   console.log(`  理由：${c.reason}`);
   if (c.via === "codex-plugin") {
-    const flags = [c.model && c.model !== "default" ? `--model ${c.model}` : "", `--effort ${levelEffort(level)}`].filter(Boolean).join(" ");
+    const flags = [c.model && c.model !== "default" ? `--model ${c.model}` : "", `--effort ${CODEX_EFFORT}`].filter(Boolean).join(" ");
     console.log(`→ 用 Codex 官方插件执行：Agent 工具 subagent_type=codex:codex-rescue，prompt 第一行写「${flags}」，下面按派单模板写（relay brief 查看，含「难度：${LEVEL_TEXT[level]}」）。第一行不写时，钩子会按这次 pick 的结果补上`);
   } else {
     // 降级选出来的，派的时候也要带上同样的 --downgrade，否则会被档位检查退回
@@ -293,6 +308,8 @@ export function assembleArgs(cfg, job) {
   const fill = (arr) => (arr || []).map((s) => (s in vars ? vars[s] : s));
   const args = [];
   if (actualModel && actualModel !== "default") args.push(...fill(cli.model));
+  // 每次都带的固定参数（如 Grok 的 --reasoning-effort xhigh：思考一律最高）
+  args.push(...fill(cli.alwaysArgs));
   if (cli.fullAccessWriteOnly) {
     if (job.write && fullAccessOn(cfg, prov)) args.push(...fill(cli.fullAccess));
     else args.push(...fill(job.write ? cli.write : cli.read));
@@ -426,6 +443,117 @@ export function formatTimeoutReason(job) {
 }
 
 // 真正执行 CLI（前台或后台 worker 共用）
+// ---------- 大改动自动初审 ----------
+// 可写任务成功结束、改动行数到阈值（默认 150）、本身不是审查、自动模式、配置没关时，
+// 后台派一个只读审查给另一家厂商，难度中等。主管仍要复核实现和初审两边、各记一次结论。
+
+const REVIEW_DIFF_MAX = 60 * 1024;
+
+// 只取这次任务改到的文件的 diff：已跟踪的对 HEAD 比，新建的整份列出。太长时截断并写明
+export function changesDiff(cwd, changedFiles) {
+  const tracked = new Set();
+  const untracked = new Set();
+  for (const line of Array.isArray(changedFiles) ? changedFiles : []) {
+    const paths = parseGitStatusPaths(line);
+    for (const p of paths) (String(line).startsWith("??") ? untracked : tracked).add(p);
+  }
+  const run = (args) => {
+    const r = spawnSync("git", ["-C", cwd, "-c", "core.quotePath=false", ...args], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+    return r.stdout || "";
+  };
+  let out = tracked.size ? run(["diff", "HEAD", "--", ...tracked]) : "";
+  for (const p of untracked) out += run(["diff", "--no-index", "--", "/dev/null", p]);
+  out = out.trim();
+  if (!out) return null;
+  if (out.length > REVIEW_DIFF_MAX) {
+    out = `${out.slice(0, REVIEW_DIFF_MAX)}\n\n（diff 太长，后面略。完整改动自己读这些文件：${[...tracked, ...untracked].join("、")}）`;
+  }
+  return out;
+}
+
+// 不做初审时返回 null（条件不满足，不必说明）或 { skipped: 原因 }（满足条件但做不了，要告诉主管）
+export function autoReviewPlan(cfg, job, { mode = getMode(), rows } = {}) {
+  if (!job?.write || job.status !== "done") return null;
+  if (cfg.autoReview === false) return null;
+  if (job.role === "review" || job.autoReviewOf) return null;
+  const min = Number(cfg.autoReviewMinLines ?? 150);
+  if (!Number.isFinite(job.changedLines) || job.changedLines < min) return null;
+  if (mode !== "auto") return { skipped: `${mode === "off" ? "纯 Claude" : "手动"}模式不自动初审` };
+  const r = route(cfg, rows === undefined ? readQuotaRows(cfg) : rows, "review", undefined, { level: "medium", excludeProviders: [job.provider] });
+  // 只有 relay 能直接起的员工；Codex 要走 Agent 工具，relay 起不了
+  const c = [r.choice, ...r.alternatives].find((x) => x && x.via === "relay" && x.provider !== job.provider);
+  if (!c) return { skipped: "没有可用的审查员工（实现者以外的厂商都不可用或额度不足），未做初审" };
+  return { candidate: c };
+}
+
+// 按计划建初审任务并后台启动。orig 要带 task（原派单）、output（原任务交回的结果）
+export function startAutoReview(cfg, orig, { spawnWorker = true, mode, rows } = {}) {
+  const plan = autoReviewPlan(cfg, orig, { mode, rows });
+  if (!plan || plan.skipped) return plan;
+  const c = plan.candidate;
+  const prov = cfg.providers[c.provider];
+  const files = [...new Set((orig.changedFiles || []).flatMap((l) => parseGitStatusPaths(l)))];
+  const fence = "````";
+  const task = `角色：review
+难度：中等
+
+## 目标
+初审任务 ${orig.id}（${orig.provider}${orig.model && orig.model !== "default" ? " / " + orig.model : ""}）刚交付的改动，找出会让结果不对的问题：逻辑错误、漏改、和原派单要求不符、明显的回归。不挑代码风格。
+
+## 背景
+这是 ai-relay 在可写任务改动较大（${orig.changedLines} 行）时自动发起的只读初审，主管会逐条核对你的意见。原派单全文、它交回的结果、这次改动的 diff 都附在后面。
+
+## 相关文件
+${files.length ? files.map((f) => `- ${f}`).join("\n") : "- 见后附 diff"}
+
+## 验收标准
+- 每个问题写清 文件:行号、问题是什么、为什么是错的、建议怎么改；
+- 对照原派单的验收标准逐条给出：满足 / 不满足 / 无法判断，并说明依据；
+- 没发现问题就明确写"未发现问题"，不要凑数。
+
+## 交付格式
+结论（有没有必须修的问题）/ 问题清单 / 验收标准逐条核对`;
+  const origOutput = String(orig.result || orig.output || "").trim();
+  const attachments = [
+    `### 原派单（任务 ${orig.id}）\n${fence}\n${String(orig.brief || orig.task || "（没有记录）").trim()}\n${fence}`,
+    `### 原任务交回的结果\n${fence}\n${origOutput.length > 8000 ? origOutput.slice(-8000) : origOutput || "（没有输出）"}\n${fence}`,
+  ].join("\n\n");
+  const st = c.status || poolStatus(cfg, readQuotaRows(cfg), prov.quota?.provider || c.provider, c.pool);
+  const id = `${new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14)}-${c.provider}-${Math.random().toString(36).slice(2, 6)}`;
+  const job = {
+    id, provider: c.provider, pool: c.pool, model: c.model, role: "review", level: "medium",
+    reason: `自动初审任务 ${orig.id}（改动 ${orig.changedLines} 行，排除实现者 ${orig.provider}）；${c.reason}`,
+    write: false, cwd: orig.cwd, task, scope: null,
+    withJobs: [orig.id],
+    autoReviewOf: orig.id,
+    ...(orig.sessionId ? { sessionId: orig.sessionId } : {}),
+    wrappedPrompt: buildDispatchPrompt({
+      task, cwd: orig.cwd, write: false, role: "review",
+      shared: readSharedContext(STATE_DIR, orig.cwd),
+      attachments,
+      diff: changesDiff(orig.cwd, orig.changedFiles),
+      caps: capsOf(cfg, prov, c.model),
+    }),
+    status: "running", startedAt: new Date().toISOString(), quotaAtStart: quotaText(cfg, c.provider, st),
+  };
+  if (orig._jobsDir) job._jobsDir = orig._jobsDir;
+  saveJob(job);
+  if (spawnWorker) {
+    const child = spawn(process.execPath, [RELAY_SCRIPT, "_worker", id], { detached: true, stdio: "ignore", cwd: orig.cwd });
+    job.pid = child.pid;
+    saveJob(job);
+    child.unref();
+  }
+  return { id, provider: c.provider, model: c.model };
+}
+
+// Codex 任务结束后由 posttool 钩子调用：relay _autoreview <任务id>，输出 JSON
+function cmdAutoReview(opts) {
+  const orig = loadAnyJob(opts._[1]);
+  const res = startAutoReview(loadConfig(), orig) || {};
+  console.log(JSON.stringify(res));
+}
+
 export async function executeJob(job, testOpts = {}) {
   const cfg = testOpts.cfg || loadConfig();
   const idleTimeoutMin = Number(job.idleTimeoutMin ?? cfg.idleTimeoutMin ?? 20);
@@ -675,6 +803,18 @@ export async function executeJob(job, testOpts = {}) {
   if (typeof job.error === "string") job.error = maskSecretValue(job.error, taskSecret);
   fs.writeFileSync(jobPath(job.id, "log", job._jobsDir), maskedLog);
   job.helpRequest = helpRequestOf(typeof job.result === "string" ? job.result : maskedLog);
+  // 改动大的可写任务：后台起另一家厂商的只读初审，不等它结束
+  try {
+    const ar = startAutoReview(cfg, { ...job, output: maskedLog }, {
+      spawnWorker: testOpts.autoReviewSpawn !== false,
+      ...(testOpts.mode ? { mode: testOpts.mode } : {}),
+      ...(testOpts.rows !== undefined ? { rows: testOpts.rows } : {}),
+    });
+    if (ar?.id) job.autoReviewId = ar.id;
+    else if (ar?.skipped) job.autoReviewSkipped = ar.skipped;
+  } catch (e) {
+    job.autoReviewSkipped = `初审没能启动：${String(e.message || e).slice(0, 200)}`;
+  }
   saveJob(job);
   return job;
 }
@@ -732,6 +872,12 @@ export function printJob(job) {
     }
     if (!job.verify.ok) console.log(`可用 relay rework <id> -- <修改意见> 退回。`);
   }
+  if (job.autoReviewId) {
+    console.log(`\n自动初审：改动较大，已在后台派另一家厂商只读审查，任务 ${job.autoReviewId}。初审意见只是证据：实现和初审两边都要你复核、各记一次结论。等它：node "${RELAY_SCRIPT}" wait ${job.autoReviewId}`);
+  } else if (job.autoReviewSkipped) {
+    console.log(`\n自动初审：${job.autoReviewSkipped}`);
+  }
+  if (job.autoReviewOf) console.log(`（这是任务 ${job.autoReviewOf} 的自动初审）`);
   console.log(`\n完整日志：${jobPath(job.id, "log", job._jobsDir)}`);
   if (job.status !== "running" && !job.verdict) console.log(`验收后记录结论：node "${RELAY_SCRIPT}" verdict ${job.id} pass|partial|fail -- <一句话说明>`);
   if (job.verdict) console.log(`验收结论：${job.verdict}${job.verdictNote ? "（" + job.verdictNote + "）" : ""}`);
@@ -793,13 +939,13 @@ async function cmdRun(opts) {
     // 首选是 Codex 时不悄悄改派：Codex 要走 Agent 工具（官方插件），交给主管去派
     if (!opts.model && !opts.skipCodex && r.choice?.via === "codex-plugin") {
       recordPick(role, r);
-      const modelHint = `（Agent prompt 第一行写「${[r.choice.model && r.choice.model !== "default" ? `--model ${r.choice.model}` : "", `--effort ${levelEffort(level)}`].filter(Boolean).join(" ")}」）`;
+      const modelHint = `（Agent prompt 第一行写「${[r.choice.model && r.choice.model !== "default" ? `--model ${r.choice.model}` : "", `--effort ${CODEX_EFFORT}`].filter(Boolean).join(" ")}」）`;
       console.error(`首选是 Codex（${r.choice.reason}）。请用 Agent 工具 subagent_type=codex:codex-rescue 把这张派单交给它${modelHint}；确有理由不用 Codex 时，加 --skip-codex 改派第二名。`);
       process.exit(3);
     }
     // 只考虑能由 ai-relay 直接调用的候选
-    // 点名的模型可以是按难度换档后的名字（如 flash-low），同一家族、且在该额度池里就算匹配
-    const family = (m) => String(m || "").replace(/-(low|medium|high)$/, "");
+    // 点名的模型可以是同一家族的另一思考档（如 flash-low），同一家族、且在该额度池里就算匹配
+    const family = (m) => String(m || "").replace(/-(xhigh|low|medium|high)$/, "");
     const inPool = (x) => (cfg.providers[x.provider]?.pools?.[x.pool] || []).includes(opts.model);
     const c = [r.choice, ...r.alternatives].find((x) => x && x.via === "relay" && (!opts.model || x.model === opts.model || x.routeModel === opts.model || (family(x.model) === family(opts.model) && inPool(x))));
     if (!c) {
@@ -808,7 +954,7 @@ async function cmdRun(opts) {
         process.exit(3);
       }
       const first = r.choice;
-      const modelHint = `（Agent prompt 第一行写「${[first?.model && first.model !== "default" ? `--model ${first.model}` : "", `--effort ${levelEffort(level)}`].filter(Boolean).join(" ")}」）`;
+      const modelHint = `（Agent prompt 第一行写「${[first?.model && first.model !== "default" ? `--model ${first.model}` : "", `--effort ${CODEX_EFFORT}`].filter(Boolean).join(" ")}」）`;
       console.error(first?.via === "codex-plugin"
         ? `首选是 Codex：请用 Agent 工具 subagent_type=codex:codex-rescue 执行${modelHint}`
         : noModelText(role, level, r.skipped));
@@ -834,7 +980,7 @@ async function cmdRun(opts) {
   if (prov.via === "codex-plugin") {
     const codexPool = providerPools(prov)[0];
     const codexModel = resolveModel(cfg, provName, codexPool, model || "default");
-    const modelHint = `（Agent prompt 第一行写「${[codexModel && codexModel !== "default" ? `--model ${codexModel}` : "", `--effort ${levelEffort(level)}`].filter(Boolean).join(" ")}」）`;
+    const modelHint = `（Agent prompt 第一行写「${[codexModel && codexModel !== "default" ? `--model ${codexModel}` : "", `--effort ${CODEX_EFFORT}`].filter(Boolean).join(" ")}」）`;
     console.error(`Codex 走官方插件：请用 Agent 工具 subagent_type=codex:codex-rescue（或 /codex:rescue）${modelHint}，审查用 /codex:review`);
     process.exit(3);
   }
@@ -1040,6 +1186,30 @@ function cmdJobs(opts) {
     const verdict = j.verdict ? { pass: "验收通过", partial: "部分通过", fail: "验收不通过" }[j.verdict] : "未验收";
     console.log(`${when}  ${(st[j.status] || j.status).padEnd(4)}  ${verdict}  ${j.provider}${model}  ${j.role || "-"}  ${j.write ? "可写" : "只读"}  ${String(j.task || "").replace(/\s+/g, " ").slice(0, 50)}`);
   }
+}
+
+// 近 N 天员工与主管的工作量：员工按可写外派的改动行数，主管按各轮亲手写的行数
+function cmdStats(opts) {
+  const days = opts.days === undefined ? 7 : Number(opts.days);
+  if (!Number.isFinite(days) || days <= 0) throw new Error("--days 要是正数");
+  const jobs = allJobRecords();
+  const rounds = [];
+  const dir = path.join(STATE_DIR, "rounds");
+  let files = [];
+  try { files = fs.readdirSync(dir).filter((f) => f.endsWith(".json")); } catch {}
+  for (const f of files) {
+    try {
+      const list = JSON.parse(fs.readFileSync(path.join(dir, f), "utf8"));
+      if (Array.isArray(list)) rounds.push(...list);
+    } catch {}
+  }
+  const s = workStats({ jobs, rounds, days });
+  if (opts.json) return console.log(JSON.stringify(s, null, 2));
+  const share = s.workerShare === null ? "" : `（占比 ${Math.round(s.workerShare * 100)}%）`;
+  console.log(`近 ${days} 天：员工 ${s.workerLines} 行${share}，主管 ${s.selfLines} 行`);
+  console.log(`改过代码的轮次 ${s.rounds.edited}，其中有可写外派的 ${s.rounds.withWriteDispatch}`);
+  const byWorker = Object.entries(s.byWorker).sort((a, b) => b[1] - a[1]);
+  for (const [k, n] of byWorker) console.log(`  ${k}  ${n} 行`);
 }
 
 // 刷新自带额度缓存；--claude-json 由状态插件传入当前会话的 Claude 额度
@@ -1290,6 +1460,7 @@ const ENDPOINT_ROUTE_FIT = {
 const MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
 function endpointModelTier(modelId) {
+  // 自定义接口模型一律封顶中档：pro/-max 旗舰命名也不升强档，困难任务不派给它们（实测吃力）
   return /flash|lite/i.test(modelId) ? "light" : "mid";
 }
 
@@ -1572,7 +1743,7 @@ function cmdProviderModels(opts) {
   syncEndpointSideFields(prov, pool, models);
   rebuildEndpointRouting(cfg, name, models);
   saveConfig(cfg);
-  if (adding) console.log(`${name} 已启用 ${adding}（${endpointModelTier(adding) === "light" ? "轻档" : "中档"}）`);
+  if (adding) console.log(`${name} 已启用 ${adding}（${TIER_TEXT[endpointModelTier(adding)]}）`);
   if (removing) console.log(hadRemove ? `${name} 已移出 ${removing}` : `${name} 的白名单里没有 ${removing}`);
 }
 
@@ -1749,6 +1920,25 @@ function cmdProviderCaps(opts) {
   console.log(`已将 ${name} 的模型 ${modelId} 的 ${capName} 设置为 ${val}`);
 }
 
+// 给多额度池厂商的未归池模型指定额度池：在 poolRules 最前面加一条只匹配这个模型的规则
+function cmdProviderPoolRule(opts) {
+  const [, , name, modelId, pool] = opts._;
+  if (!name || !modelId || !pool) throw new Error("用法：provider pool-rule <厂商> <模型id> <额度池>");
+  if (!MODEL_ID_RE.test(modelId)) throw new Error(`模型 id 不合法：${modelId}`);
+  const cfg = loadConfig();
+  const prov = cfg.providers?.[name];
+  if (!prov) throw new Error(`未知厂商 ${name}`);
+  const pools = providerPools(prov);
+  if (pools.length < 2) throw new Error(`${name} 只有一个额度池，模型都归它，不需要指定`);
+  if (!pools.includes(pool)) throw new Error(`${name} 没有额度池 ${pool}，可选：${pools.join("、")}`);
+  // 模型 id 只含字母数字和 ._-，转义点号就能精确匹配
+  const pattern = `^${modelId.replace(/\./g, "\\.")}$`;
+  const rules = (Array.isArray(prov.poolRules) ? prov.poolRules : []).filter((r) => !(Array.isArray(r) && r[0] === pattern));
+  prov.poolRules = [[pattern, pool], ...rules];
+  saveConfig(cfg);
+  console.log(`${name} 的模型 ${modelId} 已归入额度池 ${pool}`);
+}
+
 async function cmdProvider(opts) {
   const sub = opts._[1];
   switch (sub) {
@@ -1759,6 +1949,7 @@ async function cmdProvider(opts) {
     case "test": return cmdProviderTest(opts);
     case "access": return setFullAccess(opts._[2], opts._[3]);
     case "caps": return cmdProviderCaps(opts);
+    case "pool-rule": return cmdProviderPoolRule(opts);
     case "model": return await cmdProviderModel(opts);
     case "models": return cmdProviderModels(opts);
     case "key": return await cmdProviderKey(opts);
@@ -1786,7 +1977,7 @@ function help() {
                                   要写的目录在当前项目外时传 --target，写不到的厂商（如 Codex）会被跳过
                                   --needs 只在具备这些能力的厂商里选（web 联网，exec 执行命令，逗号分隔）
                                   --steps 预览"派单带合格的「## 步骤」规格"时的候选：中等任务的档位门槛降一档，轻档可接（其他难度无效）
-  models [--refresh] [--json]     拉取或查看各厂商官方 CLI 的可用模型清单（缓存 24 小时）
+  models [--refresh] [--json]     拉取或查看各厂商官方 CLI 的可用模型清单（缓存 6 小时，过期自动重新拉取）
   providers [--json]              列出厂商：启用状态、命令是否已安装、参与哪些角色、额度池默认模型
   provider enable|disable <名称>   启用 / 停用某厂商（停用后路由与外派都跳过它）
   provider model <名称> <额度池> <模型id|default>   设置某额度池的默认模型（单池厂商写 default 恢复跟随 CLI 默认）
@@ -1794,6 +1985,9 @@ function help() {
                                   查看或修改自定义接口的模型白名单，并同步档位和路由
   provider caps <名称> <模型id> vision on|off
                                   设置某模型的看图能力
+  provider pool-rule <名称> <模型id> <额度池>
+                                  把多额度池厂商里没归池的模型指定到某个额度池
+  stats [--days N] [--json]       近 N 天（默认 7）员工与主管的工作量：改动行数、有外派的轮次
   provider key <名称> [--stdin] [--clear]
                                   设置或删除自定义接口的密钥。只从终端（不回显）或 --stdin 读取，不能写在命令参数里
   provider add <名称> --preset kimi|qwen|custom|endpoint   新增厂商（面板里用 --json-spec；endpoint 需要 baseUrl 和 models）
@@ -1844,11 +2038,13 @@ async function main() {
       case "context": return cmdContext(opts);
       case "verdict": return cmdVerdict(opts);
       case "clean": return cmdClean(opts);
+      case "stats": return cmdStats(opts);
       case "providers": return cmdProviders(opts);
       case "provider": return await cmdProvider(opts);
       case "run": return await cmdRun(opts);
       case "rework": return await cmdRework(opts);
       case "_worker": return await cmdWorker(opts);
+      case "_autoreview": return cmdAutoReview(opts);
       case "jobs": return cmdJobs(opts);
       case "quota": return await cmdQuota(opts);
       case "usage": return cmdUsage(opts);

@@ -32,6 +32,12 @@ test("verifyOfBrief：解析编号行、列表行，去掉反引号，跳过占�
   ]);
 });
 
+test("verifyOfBrief：代码块围栏不当命令，块内命令照收，终端提示符 $ 去掉", () => {
+  const text = "## 验证命令\n```bash\ncd plugins && node --test\n$ npm run build\n```\n\n## 交付格式\n说明";
+  assert.deepEqual(verifyOfBrief(text), ["cd plugins && node --test", "npm run build"]);
+  assert.deepEqual(verifyOfBrief("## 验证命令\n~~~\nmake test\n~~~\n"), ["make test"]);
+});
+
 test("verifyOfBrief：标题可带 #、括注、冒号；没有这一段或占位符都返回空数组", () => {
   assert.deepEqual(verifyOfBrief("## 验证命令（主控核对）\n\nnode --test\n"), ["node --test"]);
   assert.deepEqual(verifyOfBrief("## 验证命令：\ncd scripts && node --test\n"), ["cd scripts && node --test"]);

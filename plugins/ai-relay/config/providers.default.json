@@ -101,6 +101,10 @@
           "gemini-argon"
         ],
         [
+          "hydrogen",
+          "gemini"
+        ],
+        [
           "flash",
           "gemini"
         ],
@@ -112,12 +116,12 @@
       "poolLabels": {
         "gemini-argon": "Gemini Argon",
         "claude-gpt": "Claude / GPT",
-        "gemini": "Gemini Flash"
+        "gemini": "Gemini Hydrogen / Flash"
       },
       "defaultModels": {
         "gemini-argon": "gemini-4-argon-high",
         "claude-gpt": "claude-opus-5-5-high",
-        "gemini": "gemini-3.8-flash-high"
+        "gemini": "gemini-4-hydrogen-xhigh"
       },
       "pools": {
         "gemini-argon": [
@@ -135,6 +139,10 @@
           "gpt-oss-120b-medium"
         ],
         "gemini": [
+          "gemini-4-hydrogen-xhigh",
+          "gemini-4-hydrogen-high",
+          "gemini-4-hydrogen-medium",
+          "gemini-4-hydrogen-low",
           "gemini-3.8-flash-high",
           "gemini-3.8-flash-medium",
           "gemini-3.8-flash-low"
@@ -173,6 +181,10 @@
         ],
         "fullAccess": [
           "--always-approve"
+        ],
+        "alwaysArgs": [
+          "--reasoning-effort",
+          "xhigh"
         ]
       },
       "modelList": {
@@ -231,7 +243,7 @@
       "codex:codex:gpt-6.1-sol:0.7"
     ],
     "quick": [
-      "agy:gemini:gemini-3.8-flash-medium",
+      "agy:gemini:default",
       "grok:supergrok-weekly:default"
     ],
     "claude-backup": [

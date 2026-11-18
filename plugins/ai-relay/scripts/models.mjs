@@ -298,7 +298,10 @@ function buildPrevFirstSeenMap(prevCache, name) {
 function enrichAndSortModels(models, prov, now) {
   if (!Array.isArray(models)) return [];
   const enriched = models.map((m) => {
-    const pool = m.pool !== undefined ? m.pool : (prov ? assignPool(prov, m.id) : null);
+    let pool = m.pool !== undefined ? m.pool : (prov ? assignPool(prov, m.id) : null);
+    // 缓存里记的「未归池」按当前规则重算：用户刚用 provider pool-rule 指定的池不用等下次拉清单才生效。
+    // 自定义接口的模型带 enabled 字段，未启用的本来就该不归池，不重算
+    if (pool === null && prov && m.enabled === undefined) pool = assignPool(prov, m.id);
     const firstSeen = typeof m.firstSeen === "string" && m.firstSeen ? m.firstSeen : EPOCH_ISO;
     const isNew = isModelNew(firstSeen, now);
     const row = {

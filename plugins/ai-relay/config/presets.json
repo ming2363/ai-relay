@@ -128,7 +128,8 @@
       "ANTHROPIC_BASE_URL": "{baseUrl}",
       "ANTHROPIC_API_KEY": "{secret}",
       "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-      "DISABLE_TELEMETRY": "1"
+      "DISABLE_TELEMETRY": "1",
+      "MAX_THINKING_TOKENS": "32000"
     },
     "envUnset": [
       "ANTHROPIC_AUTH_TOKEN",
@@ -141,6 +142,7 @@
       "vision": false
     },
     "knownModelCaps": {
+      "qwen4-max": { "vision": true },
       "qwen3.8-max": { "vision": true },
       "kimi-k3.1-pro": { "vision": true },
       "doubao-seed-2-0-pro-260215": { "vision": true },

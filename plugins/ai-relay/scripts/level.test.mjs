@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { scoreRoute, modelTier, levelVariant, parseLevel, tierAllowed } from "./score.mjs";
+import { scoreRoute, modelTier, maxVariant, parseLevel, tierAllowed } from "./score.mjs";
 import { levelOfBrief } from "./brief.mjs";
 import { noModelText } from "./relay.mjs";
 
@@ -63,30 +63,44 @@ test("难度解析：派单行和中英文写法", () => {
   assert.equal(tierAllowed("medium", "light"), false);
 });
 
-test("同一模型有几档时按难度换：简单 low、中等 medium、困难 high；池里没有那一档就不换", () => {
-  assert.equal(levelVariant(CFG, "agy", "gemini", "gemini-3.8-flash-high", "easy"), "gemini-3.8-flash-low");
-  assert.equal(levelVariant(CFG, "agy", "gemini-argon", "gemini-4-argon-high", "medium"), "gemini-4-argon-medium");
-  assert.equal(levelVariant(CFG, "grok", "supergrok-weekly", "grok-4.7", "easy"), "grok-4.7");
-  assert.equal(levelVariant({ providers: { agy: { pools: { gemini: ["gemini-3.8-flash-high"] } } } }, "agy", "gemini", "gemini-3.8-flash-high", "easy"), "gemini-3.8-flash-high");
+test("同一模型有几档时一律换成池里最高的一档：xhigh > high > medium > low；池里没有更高的就不换", () => {
+  assert.equal(maxVariant(CFG, "agy", "gemini", "gemini-3.8-flash-low"), "gemini-3.8-flash-high");
+  const hyd = { providers: { agy: { pools: { gemini: ["gemini-4-hydrogen-xhigh", "gemini-4-hydrogen-high", "gemini-4-hydrogen-medium"] } } } };
+  assert.equal(maxVariant(hyd, "agy", "gemini", "gemini-4-hydrogen-medium"), "gemini-4-hydrogen-xhigh");
+  assert.equal(maxVariant(hyd, "agy", "gemini", "gemini-4-hydrogen-xhigh"), "gemini-4-hydrogen-xhigh");
+  assert.equal(maxVariant(CFG, "agy", "gemini-argon", "gemini-4-argon-medium"), "gemini-4-argon-high");
+  assert.equal(maxVariant(CFG, "grok", "supergrok-weekly", "grok-4.7"), "grok-4.7");
+  assert.equal(maxVariant({ providers: { agy: { pools: { gemini: ["gemini-3.8-flash-low"] } } } }, "agy", "gemini", "gemini-3.8-flash-low"), "gemini-3.8-flash-low");
+});
+
+test("换到最高档后同一模型只留一条候选（read 路由里 Argon medium 换成 high 后不重复）", () => {
+  const cfg = structuredClone(CFG);
+  cfg.routes.read = ["agy:gemini-argon:gemini-4-argon-high:0.9", "agy:gemini-argon:gemini-4-argon-medium:0.6"];
+  const r = scoreRoute(cfg, ALL_FULL, "read", { now: NOW });
+  const all = [r.choice, ...r.alternatives, ...r.skipped].filter(Boolean).filter((c) => c.model === "gemini-4-argon-high");
+  assert.equal(all.length, 1);
+  // 点名具体模型时不换档
+  const exact = scoreRoute(cfg, ALL_FULL, "read", { now: NOW, exactModel: true });
+  assert.ok([exact.choice, ...exact.alternatives].some((c) => c.model === "gemini-4-argon-medium"));
 });
 
 test("简单任务：额度充足的轻档 Flash 排第一，强档 Codex 不再因为排名靠前胜出", () => {
   const r = scoreRoute(CFG, ALL_FULL, "implement", { now: NOW, level: "easy" });
   assert.equal(r.choice.provider, "agy");
-  assert.equal(r.choice.model, "gemini-3.8-flash-low");
+  assert.equal(r.choice.model, "gemini-3.8-flash-high");
   assert.equal(r.choice.tier, "light");
   assert.match(r.choice.reason, /^难度简单：优先额度充足、便宜的模型，它是轻档；.*经济 1\.00/);
   // 不写难度时保持旧规则：Codex 排第一
   assert.equal(scoreRoute(CFG, ALL_FULL, "implement", { now: NOW }).choice.provider, "codex");
 });
 
-test("中等任务：跳过轻档，Argon 换成 medium 后按中档参与", () => {
+test("中等任务：跳过轻档，Argon 一律用最高档 high 参与", () => {
   const r = scoreRoute(CFG, ALL_FULL, "implement", { now: NOW, level: "medium" });
   const flash = r.skipped.find((s) => s.provider === "agy" && s.pool === "gemini");
   assert.ok(flash?.tierTooLow);
   assert.equal(flash.why, "中等任务需要中档以上，它是轻档");
   const argon = [r.choice, ...r.alternatives].find((c) => c.pool === "gemini-argon");
-  assert.equal(argon.model, "gemini-4-argon-medium");
+  assert.equal(argon.model, "gemini-4-argon-high");
 });
 
 test("困难任务：只派强档；强档都没额度时不降级，加 downgrade 才放宽到中档", () => {
@@ -156,18 +170,18 @@ test("派给 Codex：没写难度退回；模型档位不够退回；--model / -
   assert.match(call("角色：implement" + body).stdout, /没写难度，已退回/);
   // 不写 --model：用 Codex 自己的默认模型（这里是轻档 Luna），并把它钉在第一行
   const easy = out("角色：implement\n难度：简单" + body);
-  assert.equal(firstLine(easy), "--model gpt-6-luna --effort low");
+  assert.equal(firstLine(easy), "--model gpt-6-luna --effort xhigh");
   assert.match(out("角色：implement\n难度：中等" + body).permissionDecisionReason, /gpt-6-luna 是轻档模型，接不了中等任务/);
   // 困难任务写了强档：参数放第一行，正文里不再出现 --model
   const hard = out("--model gpt-6.1-sol --background\n角色：implement\n难度：困难" + body);
   assert.equal(hard.permissionDecision, "allow");
-  assert.equal(firstLine(hard), "--model gpt-6.1-sol --effort high --background");
+  assert.equal(firstLine(hard), "--model gpt-6.1-sol --effort xhigh --background");
   assert.doesNotMatch(hard.updatedInput.prompt.split("\n").slice(1).join("\n"), /--model/);
   // 写在正文中间的 --model 也要检查，不能绕过档位
   assert.match(out("角色：implement\n难度：中等\n用 --model gpt-6-luna 跑" + body).permissionDecisionReason, /gpt-6-luna 是轻档模型/);
   // --model=x 写法同样认出来，并从正文去掉
   const eq = out("角色：implement\n难度：中等 --model=gpt-6.1-terra" + body);
-  assert.equal(firstLine(eq), "--model gpt-6.1-terra --effort medium");
+  assert.equal(firstLine(eq), "--model gpt-6.1-terra --effort xhigh");
   assert.doesNotMatch(eq.updatedInput.prompt.split("\n").slice(1).join("\n"), /--model/);
   // 写了两个不同的模型、推理强度不合法：退回
   assert.match(out("--model gpt-6.1-sol\n角色：implement\n难度：困难\n--model gpt-6-luna" + body).permissionDecisionReason, /写了不同的值/);
@@ -195,13 +209,13 @@ test("没选出模型：够档位的全因额度跳过才提示降级，否则�
 
 test("换档后的模型共用同一家族的历史验收记录", () => {
   const history = [
-    { provider: "agy", model: "gemini-3.8-flash-high", role: "implement", status: "done", verdict: "fail" },
-    { provider: "agy", model: "gemini-3.8-flash-high", role: "implement", status: "done", verdict: "fail" },
+    { provider: "agy", model: "gemini-3.8-flash-low", role: "implement", status: "done", verdict: "fail" },
+    { provider: "agy", model: "gemini-3.8-flash-medium", role: "implement", status: "done", verdict: "fail" },
   ];
   const r = scoreRoute(CFG, ALL_FULL, "implement", { now: NOW, level: "easy", history });
   const flash = [r.choice, ...r.alternatives].find((c) => c.pool === "gemini");
-  assert.equal(flash.model, "gemini-3.8-flash-low");
-  assert.ok(flash.parts.reliability < 0.8, `flash-low 应带上 flash-high 的两次失败，实际 ${flash.parts.reliability}`);
+  assert.equal(flash.model, "gemini-3.8-flash-high");
+  assert.ok(flash.parts.reliability < 0.8, `flash-high 应带上 low、medium 的两次失败，实际 ${flash.parts.reliability}`);
 });
 
 test("pick 降级选出的模型，打印的派单命令带上同样的 --downgrade", () => {

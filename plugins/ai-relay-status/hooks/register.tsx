@@ -889,7 +889,7 @@ async function computeRoundTokens($: Engine, r: Round, list: JobView[], pool?: r
   let readFailed = false
   for (const info of sessionInfos) {
     try {
-      texts.push(await readClaudeUsageJsonl($, info.file, r.startedAt, r.finishedAt))
+      texts.push(await readClaudeUsageJsonl($, info.file, r.startedAt, r.finishedAt ?? undefined))
     } catch {
       readFailed = true
     }
@@ -1112,6 +1112,9 @@ async function loadAllRounds($: Engine) {
     }
 
     merged.sort((a, b) => b.startedAt - a.startedAt)
+    const prev = await read($, allRounds)
+    // 内容没变就不写状态，避免定时刷新把订阅了 allRounds 的对话页整个重绘、吞掉点击
+    if (JSON.stringify(prev) === JSON.stringify(merged)) return
     await update($, allRounds, () => merged)
   } catch {
     // 读取全部轮次失败时容错
@@ -2510,7 +2513,6 @@ export const register: Register = on => {
     }
 
     const current = await read($, tab)
-    const snap = await read($, snapshot)
     const busyKey = await read($, busy)
     const note = await read($, notice)
     const now = await $.clock.now()
@@ -2593,6 +2595,8 @@ export const register: Register = on => {
 
     // ---------- 额度页 ----------
     if (current === 'quota') {
+      // 只有额度页订阅 snapshot：每次刷新都带新 updatedAt，对话页和厂商页不该跟着重绘
+      const snap = await read($, snapshot)
       if (snap === null) return page(switchSection, <Text dimColor>正在读取额度…</Text>)
       const busyMode = await read($, switching)
 
@@ -3527,17 +3531,12 @@ export const register: Register = on => {
       )
     return page(
       noticeBar,
-      // 统计和模型清单刷新放在页首同一行：刷新会更新全部厂商，按钮只放一个
-      <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1} minWidth={0}>
-        <Text size="caption" dimColor>
-          {data.providers.length} 家 · 启用 {enabledCount} 家 · 最高权限开启 {accessCount} 家
-        </Text>
-        <Box flexDirection="row" columnGap={1} alignItems="center">
-          {modelsAgo !== '' && (
-            <Text size="caption" dimColor>
-              {`模型列表${modelsAgo}${newModelsSuffix}`}
-            </Text>
-          )}
+      // 页首两行：统计+刷新按钮一行，模型清单更新时间单独一行，窄屏不挤在一起换行
+      <Box flexDirection="column" rowGap={0} minWidth={0}>
+        <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1} minWidth={0}>
+          <Text size="caption" dimColor wrap="truncate-end">
+            {data.providers.length} 家 · 启用 {enabledCount} 家 · 最高权限开启 {accessCount} 家
+          </Text>
           <Button
             key="models-refresh"
             label={modelsView.status === 'refreshing' ? '刷新中…' : '刷新模型列表'}
@@ -3548,6 +3547,11 @@ export const register: Register = on => {
             }}
           />
         </Box>
+        {modelsAgo !== '' && (
+          <Text size="caption" dimColor>
+            {`模型列表${modelsAgo}${newModelsSuffix}`}
+          </Text>
+        )}
       </Box>,
       workStatsCard,
       activeProviders.length > 0 && (

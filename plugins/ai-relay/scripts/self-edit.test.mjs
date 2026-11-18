@@ -997,3 +997,60 @@ test("没有运行中任务时计数不变", () => {
     assert.equal(stat.lines, 6, `没有任务时计数变了：lines=${stat.lines}`);
   }));
 });
+
+test("Codex 可写外派：记下发起会话，成功结束时记改动行数并清掉前快照", () => {
+  withHome((home) => {
+    setMode(home, "auto");
+    hideQuota(home);
+    const cfg = JSON.parse(fs.readFileSync(path.join(home, "providers.json"), "utf8"));
+    cfg.providers.codex.quota.provider = "codex-test-none";
+    fs.writeFileSync(path.join(home, "providers.json"), JSON.stringify(cfg));
+    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "ai-relay-codex-"));
+    const repo = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ai-relay-codex-lines-")));
+    try {
+      fs.writeFileSync(path.join(codexHome, "config.toml"), 'model = "gpt-6-luna"\n');
+      initRepo(repo);
+      const prompt = "角色：implement\n难度：简单\n\n## 目标\n加几行\n\n## 验收标准\n加好";
+      const pre = runHook(preHook, {
+        tool_name: "Agent",
+        session_id: "s-codex-lines",
+        tool_use_id: "toolu_lines_1",
+        cwd: repo,
+        tool_input: { subagent_type: "codex:codex-rescue", prompt, description: "派单" },
+      }, home, { CODEX_HOME: codexHome });
+      assert.equal(pre.status, 0, pre.stderr);
+      // Codex 干活：改已跟踪文件加 2 行，新建文件 3 行
+      fs.appendFileSync(path.join(repo, "tracked.txt"), "a\nb\n");
+      fs.writeFileSync(path.join(repo, "new.mjs"), "1\n2\n3\n");
+      const post = runHook(postHook, {
+        tool_name: "Agent",
+        session_id: "s-codex-lines",
+        tool_use_id: "toolu_lines_1",
+        cwd: repo,
+        tool_input: { subagent_type: "codex:codex-rescue", prompt },
+        tool_response: "完成",
+      }, home);
+      assert.equal(post.status, 0, post.stderr);
+      const lines = fs.readFileSync(path.join(home, "history.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+      const merged = Object.assign({}, ...lines.filter((l) => l.id === "toolu_lines_1"));
+      assert.equal(merged.sessionId, "s-codex-lines");
+      assert.equal(merged.changedLines, 5);
+      assert.equal(merged.linesBefore, null);
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+      fs.rmSync(codexHome, { recursive: true, force: true });
+    }
+  });
+});
+
+test("自动模式下主管写 Markdown 文档不触发分工闸门、不计亲手行数", () => {
+  withHome((home) => {
+    setMode(home, "auto");
+    hideQuota(home);
+    assertAllowed(runHook(preHook, editInput("s-doc", "/work/proj/docs/plans/交接.md"), home));
+    const post = runHook(postHook, editInput("s-doc", "/work/proj/docs/plans/交接.md"), home);
+    assert.equal(post.status, 0, post.stderr);
+    assert.equal(fs.existsSync(editsPath(home, "s-doc")), false);
+    assertDenied(runHook(preHook, editInput("s-doc", "/work/proj/src/app.mjs"), home));
+  });
+});

@@ -36,6 +36,8 @@ export const DEFAULT_MODEL_TIERS = {
   "codex:gpt-5.6-*": "light",
   "grok:*": "mid",
   "agy:gemini-3.8-flash*": "light",
+  // Gemini Hydrogen：Flash 系列的新一代，额度和 Flash 同池，按轻档算
+  "agy:gemini-4-hydrogen*": "light",
   "agy:gpt-oss*": "light",
   "agy:gemini-4-argon-low": "mid",
   "agy:gemini-4-argon-medium": "mid",
@@ -50,17 +52,19 @@ const TIER_COST = { light: 1, mid: 0.7, strong: 0.45 };
 
 export const LEVELS = ["easy", "medium", "hard"];
 export const LEVEL_TEXT = { easy: "简单", medium: "中等", hard: "困难" };
-// 每档难度：最低模型档位、打分权重（覆盖默认值）、同一模型有 low/medium/high 几档时用哪一档
+// 每档难度：最低模型档位、打分权重（覆盖默认值）。思考档位不跟难度走，一律最高（见 maxVariant、CODEX_EFFORT）
 const LEVEL_RULES = {
-  easy: { minTier: "light", weights: { fit: 1, reliability: 2, quota: 2, speed: 0.5, load: 0.5, cost: 2 }, effort: "low", note: "优先额度充足、便宜的模型" },
-  medium: { minTier: "mid", preferTier: "mid", weights: null, effort: "medium", note: "中档以上按综合分" },
-  hard: { minTier: "strong", weights: { fit: 3, reliability: 3, quota: 0.1, speed: 0.25, load: 0.25 }, effort: "high", note: "只派强档，看擅长和可靠" },
+  easy: { minTier: "light", weights: { fit: 1, reliability: 2, quota: 2, speed: 0.5, load: 0.5, cost: 2 }, note: "优先额度充足、便宜的模型" },
+  medium: { minTier: "mid", preferTier: "mid", weights: null, note: "中档以上按综合分" },
+  hard: { minTier: "strong", weights: { fit: 3, reliability: 3, quota: 0.1, speed: 0.25, load: 0.25 }, note: "只派强档，看擅长和可靠" },
 };
 
-// 难度对应的推理强度：low / medium / high。Codex 用 --effort 传，agy 用模型名后缀
-export function levelEffort(level) {
-  return LEVEL_RULES[level]?.effort || null;
-}
+// 思考一律开到最高（用户 2026-11-17 定的，不分难度）。
+// Codex：codex-companion 最高只收 xhigh（Codex 模型本身支持到 max/ultra，但插件会拒绝）
+export const CODEX_EFFORT = "xhigh";
+
+// 模型名后缀表示思考档位，从高到低
+const EFFORT_ORDER = ["xhigh", "high", "medium", "low"];
 
 // 这个档位的模型能不能接这个难度的活；downgrade 为真时门槛降一档；
 // steps 为真且难度为中等时，视同带步骤规格，门槛同样降一档（轻档可接）
@@ -98,14 +102,16 @@ export function modelTier(cfg, provider, model) {
   return best ? best.tier : "mid";
 }
 
-// 同一模型有 -low/-medium/-high 几档时，按难度换成对应的一档；该档不在额度池的模型列表里就不换
-export function levelVariant(cfg, provider, pool, model, level) {
-  const effort = LEVEL_RULES[level]?.effort;
-  const m = String(model || "").match(/^(.*)-(low|medium|high)$/);
-  if (!effort || !m || m[2] === effort) return model;
-  const want = `${m[1]}-${effort}`;
+// 同一模型有 -low/-medium/-high/-xhigh 几档时，换成额度池模型列表里有的最高一档；列表里一档都没有就不换
+export function maxVariant(cfg, provider, pool, model) {
+  const m = String(model || "").match(/^(.*)-(xhigh|high|medium|low)$/);
+  if (!m) return model;
   const list = cfg?.providers?.[provider]?.pools?.[pool] || [];
-  return list.includes(want) ? want : model;
+  for (const effort of EFFORT_ORDER) {
+    const want = `${m[1]}-${effort}`;
+    if (want === model || list.includes(want)) return want;
+  }
+  return model;
 }
 
 function windowTotalHours(key) {
@@ -191,8 +197,8 @@ function calcQuota(status, now) {
 //   - verdict: pass(1), partial(0.5), fail(0); 无 verdict: done(1), failed/timeout(0), cancelled 不计入
 //   - sum = Σ 权重 × 成功分, count = Σ 权重
 //   - rate = (sum + 1.8) / (count + 2); reliability = 0.4 + 0.6 * rate
-// 同一模型的 -low/-medium/-high 算一个家族：按难度换档后，历史验收记录照样算数
-const modelFamily = (m) => String(m || "").replace(/-(low|medium|high)$/, "");
+// 同一模型的 -low/-medium/-high/-xhigh 算一个家族：换档后历史验收记录照样算数
+const modelFamily = (m) => String(m || "").replace(/-(xhigh|low|medium|high)$/, "");
 
 function calcReliability(history, provider, model, role) {
   let sum = 0;
@@ -336,8 +342,9 @@ export function capsSkipWhy(caps, needs) {
 
 // level：任务难度（easy / medium / hard），不传按旧规则只看角色路由；downgrade 为真时档位门槛降一档，权重仍按原难度；
 // steps 为真且难度为中等时同样降一档（派单带合格的「## 步骤」规格，轻档可接），其他难度忽略；
-// exactModel：调用方点名了具体模型，不按难度换 low/medium/high
-export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now(), write, target, workspace, needs, level, downgrade, steps, exactModel } = {}) {
+// exactModel：调用方点名了具体模型，不换成最高思考档
+// excludeProviders：不考虑这些厂商（自动初审时排除实现者所在的厂商）
+export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now(), write, target, workspace, needs, level, downgrade, steps, exactModel, excludeProviders } = {}) {
   const route = cfg?.routes?.[role];
   if (!route) {
     const available = Object.keys(cfg?.routes || {}).join(", ");
@@ -352,13 +359,19 @@ export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now
   const minRank = rule ? Math.max(0, TIER_RANK[rule.minTier] - (downgrade || hasSteps ? 1 : 0)) : 0;
   const weights = rule?.weights ? { ...cfg?.scoreWeights, ...rule.weights } : cfg?.scoreWeights;
 
+  // 同一模型的不同思考档都换成最高档后会重复：只留路由里排前面的那条
+  const seen = new Set();
   for (let i = 0; i < route.length; i++) {
     const entry = route[i];
     const [provName, pool, routeModel, fitRaw] = entry.split(":");
     if (only && provName !== only) continue;
+    if (Array.isArray(excludeProviders) && excludeProviders.includes(provName)) continue;
 
     const resolved = resolveModel(cfg, provName, pool, routeModel);
-    const model = level && !exactModel ? levelVariant(cfg, provName, pool, resolved, level) : resolved;
+    const model = exactModel ? resolved : maxVariant(cfg, provName, pool, resolved);
+    const seenKey = `${provName}|${pool}|${model}`;
+    if (seen.has(seenKey)) continue;
+    seen.add(seenKey);
     const tier = modelTier(cfg, provName, model);
     const prov = cfg.providers?.[provName];
     const quotaProvider = prov?.quota?.provider || provName;

@@ -171,10 +171,10 @@ test("只读只用 plan；可写按最高权限替换参数；grok 命令行保�
 
   const grok = { provider: "grok", pool: "supergrok-weekly", model: "grok-4.7", cwd: "/work", wrappedPrompt: "你好" };
   assert.deepEqual(assembleArgs(defaultCfg, { ...grok, write: false }), [
-    "--model", "grok-4.7", "--permission-mode", "plan", "--cwd", "/work", "--always-approve", "-p", "你好",
+    "--model", "grok-4.7", "--reasoning-effort", "xhigh", "--permission-mode", "plan", "--cwd", "/work", "--always-approve", "-p", "你好",
   ]);
   assert.deepEqual(assembleArgs(defaultCfg, { ...grok, write: true }), [
-    "--model", "grok-4.7", "--cwd", "/work", "--always-approve", "-p", "你好",
+    "--model", "grok-4.7", "--reasoning-effort", "xhigh", "--cwd", "/work", "--always-approve", "-p", "你好",
   ]);
 });
 
@@ -413,6 +413,7 @@ test("endpoint 模板写入白名单、环境、命令、档位和路由；重�
       ANTHROPIC_SMALL_FAST_MODEL: "deepseek-v4.1-flash-1017",
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
       DISABLE_TELEMETRY: "1",
+      MAX_THINKING_TOKENS: "32000",
     });
     assert.deepEqual(prov.envUnset, ["ANTHROPIC_AUTH_TOKEN", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"]);
     assert.deepEqual(prov.cli, presets.endpoint.cli);

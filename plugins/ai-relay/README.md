@@ -42,7 +42,7 @@
 
 **1. 分工。** 自动模式下，主模型是主管，其他模型是员工。主管统筹拆解、派发、核验和汇报，也可以自己干活；具体谁做什么按任务分析。成块的、能并行的、别家更擅长的倾向外派；小事、需要 Claude 专属工具的、敏感的倾向自己做。主管亲手写得多时，钩子会提醒考虑外派，只是提醒，不是限制。
 
-**2. 派给谁：先定难度，再质量优先打分。** 每张派单必须写「难度：简单|中等|困难」，缺了会被退回。简单的活三档模型都能接，优先额度多、便宜的轻档（Gemini 3.8 Flash、Codex Luna）；中等要中档以上（Grok、Argon medium、Sonnet、Codex Terra 等）；困难只派强档（Codex Astra / 6.1-Sol、Argon high、Opus）。Codex 按难度选模型，推理强度也跟着难度走（`--effort low|medium|high`），由钩子放在派单第一行，强档都没额度时不悄悄降级，要主控自己做或写明原因 `--downgrade`。档位在配置 `modelTiers` 里改。`relay pick <角色> --level <难度>` 给出首选、备选、跳过的模型和各自的理由。分数是五项的加权几何平均，权重可以在 `scoreWeights` 里调：
+**2. 派给谁：先定难度，再质量优先打分。** 每张派单必须写「难度：简单|中等|困难」，缺了会被退回。简单的活三档模型都能接，优先额度多、便宜的轻档（Gemini Hydrogen / Flash、Codex Luna）；中等要中档以上（Grok、Sonnet、Codex Terra 等）；困难只派强档（Codex Astra / 6.1-Sol、Argon high、Opus）。Codex 按难度选模型；思考一律开到最高、不跟难度走：agy 换成池里最高的一档，Codex 用 `--effort xhigh`（由钩子放在派单第一行），Grok 带 `--reasoning-effort xhigh`，自定义接口带 32000 的思考预算。强档都没额度时不悄悄降级，要主控自己做或写明原因 `--downgrade`。档位在配置 `modelTiers` 里改。`relay pick <角色> --level <难度>` 给出首选、备选、跳过的模型和各自的理由。分数是五项的加权几何平均，权重可以在 `scoreWeights` 里调：
 
 | 项 | 权重 | 怎么算 |
 |---|---|---|
@@ -95,7 +95,7 @@
 
 - 路由条目 `provider:pool:model[:fit]` 中 `model` 为 `default` 时，取该额度池的默认模型；写了具体模型 id 的条目不受影响（如 `implement` 的 `claude-sonnet-5-5-high`、`read` 的 `gemini-4-argon-medium`、`quick` 的 `gemini-3.8-flash-medium`）。
 - 默认模型存在 `~/.claude/ai-relay/providers.json` 的 `providers.<名称>.defaultModels.<额度池>`。单池厂商（Codex、Grok）未设时不传模型参数、跟随 CLI 默认；多池厂商（agy）每个额度池必须指定默认模型。
-- 命令与面板：可在面板「厂商」页切换，或用 `relay models [--refresh]` 从官方 CLI 拉取最新模型清单（缓存 24 小时）、`relay provider model <厂商> <额度池> <模型id|default>` 设置默认模型。
+- 命令与面板：可在面板「厂商」页切换，或用 `relay models [--refresh]` 从官方 CLI 拉取最新模型清单（缓存 6 小时，过期自动重新拉取；7 天内新出现的模型标「新」）、`relay provider model <厂商> <额度池> <模型id|default>` 设置默认模型。多额度池厂商出了没归池的新模型时，面板厂商页可直接选额度池，或 `relay provider pool-rule <厂商> <模型id> <额度池>`。
 
 ## 增删会员 / 启用停用
 
@@ -121,7 +121,7 @@ Gemini 会员不需要新增：Google 已停止 Gemini CLI 的个人版（实测
 - Grok 较慢，单次 10–70 秒。
 - 任务超时按活动判断：每 60 秒检查终端输出、会话日志与工作区改动，连续 20 分钟无活动判定卡死；总时长 4 小时兜底。可用 `--idle-timeout` 与 `--max-runtime` 调整。
 - 额度缓存由状态插件每分钟刷新（agy、Grok 每 5 分钟查一次）；也可手动运行 `relay quota`。Grok 的官方 CLI 没有查额度的命令，relay 用 Grok CLI 的登录令牌直接查 grok.com 的计费接口（令牌只在本机内存里使用，过期时不会自己刷新）；查不到时，装了 AIQuota5h 就沿用它的数据。
-- 外派记录：面板「对话」页按对话轮次列出每轮的主模型、Claude 子代理、Codex 和 relay 外派，每轮回答下方也会写一行"本轮模型"；只看外派列表可用 `relay jobs`。
+- 外派记录：面板「对话」页按对话轮次列出每轮的主模型、Claude 子代理、Codex 和 relay 外派，每轮回答下方也会写一行"本轮模型"；只看外派列表可用 `relay jobs`。可写外派改动不少于 150 行时（自动模式），会自动派另一家厂商做只读初审，`relay result` 里给出初审任务 id，主管仍要复核两边；配置 `autoReview: false` 关闭，`autoReviewMinLines` 改阈值。近 7 天员工和主管各写了多少行、多少轮有可写外派，看面板厂商页的工作量卡片或 `relay stats [--days N]`。
 
 ## 数据与清理
 

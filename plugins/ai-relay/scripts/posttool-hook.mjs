@@ -4,13 +4,14 @@
 //   自动模式下统计主模型读文件次数（含 Bash 里的 cat / grep 等），超过上限任何档位都提醒一次
 //   Bash 里的 relay self / 带 --write 的 relay run 记下这一轮的分工
 import fs from "node:fs";
+import { spawnSync } from "node:child_process";
 import { helpRequestOf } from "./brief.mjs";
 import path from "node:path";
 import {
   RELAY_SCRIPT, JOBS_DIR, ensureStateDir, appendHistory, getMode, loadConfig,
   readSelfEdits, writeSelfEdits, editedLines, readHistory, gitSnapshot,
   diffSnapshots, checkOutOfScope, readQuotaRows, claudeThrottle,
-  isScratchPath, readBashSnap, clearBashSnap, resolveRepos, lineSnapshot, handwrittenDelta,
+  isScratchPath, isDocPath, readBashSnap, clearBashSnap, resolveRepos, lineSnapshot, handwrittenDelta, snapshotDelta,
   selfEditLimitMessage, selfReadLimitMessage, bashWroteReminder, isRelayRunWriteCommand, bashReadCount,
 } from "./lib.mjs";
 
@@ -126,7 +127,7 @@ async function handlePostBash(input) {
   if (parts.length) context(parts.join("\n"));
 }
 
-function main() {
+async function main() {
   const input = JSON.parse(fs.readFileSync(0, "utf8") || "{}");
   const tool = String(input.tool_name || "");
 
@@ -152,7 +153,7 @@ function main() {
     const stat = readSelfEdits(input.session_id);
     // 写在临时目录、计划或会话 memory 里的不是项目代码，不计入
     const target = String(input.tool_input?.file_path || input.tool_input?.notebook_path || "");
-    if (isScratchPath(target)) return;
+    if (isScratchPath(target) || isDocPath(target)) return;
     stat.lines += editedLines(tool, input.tool_input);
     const warn = selfEditLimitMessage(stat, limit);
     writeSelfEdits(input.session_id, stat);
@@ -184,15 +185,41 @@ function main() {
     outOfScope = checkOutOfScope(changedFiles, startEntry.scope, cwd);
     endEntry.changedFiles = changedFiles;
     endEntry.outOfScope = outOfScope;
+    // 成功结束才记改动行数（和 relay 外派一致）；记完清掉前快照，台账不留大块数据
+    if (startEntry.linesBefore && !failed) {
+      try {
+        const before = startEntry.linesBefore;
+        const after = await lineSnapshot(cwd, Object.keys(before.heads || {}), before.heads);
+        endEntry.changedLines = snapshotDelta(before, after);
+      } catch {}
+    }
+    if (startEntry.linesBefore) endEntry.linesBefore = null;
   }
 
   // Codex 汇报里的"需要主控协助"：存进台账，并醒目提示主控决定下一步
   const help = helpRequestOf(logText);
   if (help) endEntry.helpRequest = help;
   appendHistory(endEntry);
+
+  // 改动大时自动初审（条件和 relay 外派一样，由 relay 判断）：起后台只读审查，id 记回台账
+  let review = null;
+  const minLines = Number(loadConfig().autoReviewMinLines ?? 150);
+  if (Number.isFinite(endEntry.changedLines) && endEntry.changedLines >= minLines) {
+    try {
+      const r = spawnSync(process.execPath, [RELAY_SCRIPT, "_autoreview", input.tool_use_id], { encoding: "utf8", timeout: 60_000 });
+      review = JSON.parse(String(r.stdout || "").trim().split("\n").pop() || "{}");
+      if (review.id) appendHistory({ id: input.tool_use_id, autoReviewId: review.id });
+      else if (review.skipped) appendHistory({ id: input.tool_use_id, autoReviewSkipped: review.skipped });
+    } catch {}
+  }
   let msg = `[ai-relay] Codex 外派记录 id：${input.tool_use_id}。亲自复核（逐个看 diff、自己跑测试，或回到代码核对结论）并按验收标准核对后记录结论：node "${RELAY_SCRIPT}" verdict ${input.tool_use_id} pass|partial|fail -- <一句话说明>`;
   if (outOfScope && outOfScope.length) {
     msg += `\n⚠️ Codex 改动超出写入范围：${outOfScope.join("、")}`;
+  }
+  if (review?.id) {
+    msg += `\n自动初审：改动 ${endEntry.changedLines} 行，已在后台派 ${review.provider}${review.model && review.model !== "default" ? " / " + review.model : ""} 只读审查，任务 ${review.id}。实现和初审两边都要复核、各记一次结论：node "${RELAY_SCRIPT}" wait ${review.id}`;
+  } else if (review?.skipped) {
+    msg += `\n自动初审：${review.skipped}`;
   }
   if (help) {
     msg += `\n⚠️ Codex 请求主控协助：${help}\n请决定：自己用工具完成后带上结果重派，或改派有能力的模型，或请用户处理。`;
@@ -201,7 +228,7 @@ function main() {
 }
 
 try {
-  main();
+  main().catch(() => {});
 } catch {
   // 钩子出错不影响正常使用
 }

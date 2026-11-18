@@ -8,11 +8,11 @@ import {
   ULW_RE, MENTION_RE, STATE_DIR, loadConfig, getMode, readQuotaRows, poolStatus,
   loadPrompt, fmtPool, isEnabled, appendHistory, lastPick, runningWriters, scopesOverlap,
   normScope, withWriteLock, gitSnapshot, workspaceRoot, isInside, writePendingDispatch,
-  readSelfEdits, writeSelfEdits, isScratchPath, blockReason, resolveRepos, lineSnapshot, writeBashSnap,
+  readSelfEdits, writeSelfEdits, isScratchPath, isDocPath, blockReason, resolveRepos, lineSnapshot, writeBashSnap,
   isRelayRunCommand, capsOf, runningWriterIds,
 } from "./lib.mjs";
 import { BRIEF_TEMPLATE, checkBrief, roleOfBrief, levelOfBrief, buildDispatchPrompt, readSharedContext, scopeOfBrief, needsWithImages, codexFlagsOf, hasStepSpec } from "./brief.mjs";
-import { modelTier, tierAllowed, levelEffort, LEVEL_TEXT, TIER_TEXT } from "./score.mjs";
+import { modelTier, tierAllowed, CODEX_EFFORT, LEVEL_TEXT, TIER_TEXT } from "./score.mjs";
 import { loadModelsCache } from "./models.mjs";
 
 const EDIT_TOOLS = new Set(["Edit", "MultiEdit", "Write", "NotebookEdit"]);
@@ -73,7 +73,7 @@ function handleEditGate(input) {
   const sessionId = String(input.session_id ?? "").trim();
   if (!sessionId) return;
   const target = String(input.tool_input?.file_path || input.tool_input?.notebook_path || "");
-  if (isScratchPath(target)) return;
+  if (isScratchPath(target) || isDocPath(target)) return;
   const stat = readSelfEdits(sessionId);
   if (stat.decision) return;
   deny(blockReason(stat));
@@ -87,7 +87,7 @@ function deny(reason) {
   );
 }
 
-function main() {
+async function main() {
   const input = JSON.parse(fs.readFileSync(0, "utf8") || "{}");
   const tool = String(input.tool_name || "");
   if (tool === "Bash") return handleBash(input);
@@ -153,11 +153,11 @@ function main() {
     const fits = fitsFor();
     return deny(`[ai-relay] Codex 的 ${usedModel} 是${TIER_TEXT[tier]}模型，接不了${LEVEL_TEXT[level]}任务，已退回。在 prompt 第一行写 --model <模型>${fits.length ? `，可选：${fits.join("、")}` : ""}`);
   }
-  // 推理强度跟难度走：简单 low、中等 medium、困难 high；派单里写了 --effort 就用写的，但取值要是 Codex 认的
+  // 推理强度一律最高（xhigh）；派单里写了 --effort 就用写的，但取值要是 Codex 认的
   if (flags.effort && !CODEX_EFFORTS.has(flags.effort)) {
     return deny(`[ai-relay] --effort ${flags.effort} 不是 Codex 认的推理强度，可选：${[...CODEX_EFFORTS].join(" / ")}`);
   }
-  const effort = flags.effort || levelEffort(level);
+  const effort = flags.effort || CODEX_EFFORT;
   // 派单写了 Codex 做不到的能力就退回，避免它在断网沙箱里硬做或臆测
   const needs = needsWithImages(brief);
   const codexCaps = capsOf(cfg, prov, usedModel);
@@ -210,6 +210,8 @@ function main() {
     reason: `${pickModel ? `${pick.reason}${Array.isArray(pick.skipped) && pick.skipped.length ? `；跳过 ${pick.skipped.join("、")}` : ""}` : flags.model ? `主模型指定 Codex ${flags.model}` : "主模型指定 Codex"}；用 ${usedModel || "Codex 默认模型"}（${TIER_TEXT[tier]}），推理强度 ${effort}`,
     write,
     scope,
+    // 发起外派的 Claude 会话，工作量统计按它把外派归到对应轮次
+    ...(String(input.session_id ?? "").trim() && !input.agent_id ? { sessionId: String(input.session_id).trim() } : {}),
     status: "running",
     startedAt: new Date().toISOString(),
     task: String(input.tool_input?.description || brief).slice(0, 300),
@@ -218,6 +220,12 @@ function main() {
   if (write) {
     const snapshot = gitSnapshot(cwd);
     if (snapshot) historyEntry.snapshot = snapshot;
+    // 原派单全文：改动大时自动初审要附给审查员工（task 只留了前 300 字）
+    historyEntry.brief = brief.slice(0, 20000);
+    // 行数快照：结束时求差记 Codex 改了多少行，工作量统计用
+    try {
+      historyEntry.linesBefore = await lineSnapshot(cwd);
+    } catch {}
   }
 
   if (write) {
@@ -274,7 +282,7 @@ function main() {
 }
 
 try {
-  main();
+  main().catch(() => {});
 } catch {
   // 钩子出错时放行，不影响正常使用
 }

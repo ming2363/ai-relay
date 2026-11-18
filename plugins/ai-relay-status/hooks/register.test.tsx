@@ -29,6 +29,7 @@ const ABOVE = {
   component: 'AbovePrompt',
   props: {
     hasSurvey: false,
+    isCollapsed: false,
     isWorking: true,
     maxRows: 4,
     bodyColumns: 80,
@@ -2189,6 +2190,49 @@ test('对话页：系统轮次并入同一会话的上一轮，不跨会话合�
   expect(await ui.find({ type: 'Text', text: '甲用户的子代理' })).toBeUndefined()
   expect(await shownIncludes(ui, '<ci-monitor-event>')).toBe(false)
   expect(await shownIncludes(ui, 'build finished')).toBe(false)
+  await ui.unmount()
+})
+
+test('对话页：定时刷新时轮次内容没变就不重绘整页，避免吞掉点击', async ($, on) => {
+  const T0 = Date.parse('2026-11-06T05:32:00.000Z')
+  let t = T0
+  const clock = mock.clock(on, { now: T0 })
+  baseStubs(on, new Set<string>(), () => t, undefined, '/projects/fj', { stubClock: false })
+  fakeRelay(on)
+  // 别的会话的一轮：主回话已结束但子代理还在跑，列表用时算到「现在」，重绘一次就会跳一次
+  putRoundFile('s-other', [{
+    id: 'r-1',
+    sessionId: 's-other',
+    project: { name: 'fj', path: '/projects/fj' },
+    env: 'desktop',
+    text: '别的会话的问题',
+    mainModel: 'claude-opus-5-5',
+    startedAt: T0 - 30_000,
+    finishedAt: T0 - 20_000,
+    status: 'answer',
+    agents: [{
+      id: 'ag-1',
+      toolUseId: 'tu-ag-1',
+      subagentType: 'Explore',
+      description: '在跑的子代理',
+      model: 'claude-haiku-4-5-20251001',
+      status: 'running',
+      startedAt: T0 - 25_000,
+      finishedAt: null,
+    }],
+    selfLines: 0,
+  }], T0 - 20_000)
+  await $.session.start({ cwd: '/projects/fj', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab-jobs' })
+  expect(await ui.find({ type: 'Text', text: /· 30 秒/ })).toBeDefined()
+
+  // 60 秒轮询：jobs 和轮次内容都没变就不写状态、不重绘，用时停在上一帧而不是跳到 1 分 30 秒
+  await clock.advance(60_000)
+  t = clock.now()
+  for (let i = 0; i < 20; i++) await Promise.resolve()
+  expect(await ui.find({ type: 'Text', text: /· 30 秒/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /1 分 30 秒/ })).toBeUndefined()
   await ui.unmount()
 })
 
