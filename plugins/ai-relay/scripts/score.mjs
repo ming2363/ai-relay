@@ -38,6 +38,10 @@ export const DEFAULT_MODEL_TIERS = {
   "agy:gemini-3.8-flash*": "light",
   // Gemini Hydrogen：Flash 系列的新一代，额度和 Flash 同池，按轻档算
   "agy:gemini-4-hydrogen*": "light",
+  // Gemini 4 Neon：Gemini 4 里基准分最高（高于 Argon、Hydrogen），和 Hydrogen / Flash 同池；高思考档按强档，低档按中档
+  "agy:gemini-4-neon*": "strong",
+  "agy:gemini-4-neon-low": "mid",
+  "agy:gemini-4-neon-medium": "mid",
   "agy:gpt-oss*": "light",
   "agy:gemini-4-argon-low": "mid",
   "agy:gemini-4-argon-medium": "mid",
@@ -193,6 +197,7 @@ function calcQuota(status, now) {
 
 // 3. reliability 可靠度（按角色加权）：
 //   - 同 provider、同 model 且 status !== 'running'
+//   - 跳过 quotaExhausted === true 的记录（额度耗尽不是模型能力问题）
 //   - 记录 role 与本次 role 相同权重为 1，不同或无 role 权重为 0.5
 //   - verdict: pass(1), partial(0.5), fail(0); 无 verdict: done(1), failed/timeout(0), cancelled 不计入
 //   - sum = Σ 权重 × 成功分, count = Σ 权重
@@ -205,6 +210,8 @@ function calcReliability(history, provider, model, role) {
   let count = 0;
   for (const r of history || []) {
     if (r.provider !== provider || modelFamily(r.model) !== modelFamily(model) || r.status === "running") continue;
+    // 额度耗尽属于配额问题，不计入模型质量可靠度
+    if (r.quotaExhausted === true) continue;
     const w = (r.role && r.role === role) ? 1 : 0.5;
     if (r.verdict === "pass") {
       sum += w * 1;
@@ -276,8 +283,8 @@ function calcLoad(history, provider, now) {
 }
 
 // 6. 加权几何平均打分：
-//   - 权重从 cfg.scoreWeights 读取，缺省为 fit: 3, reliability: 3, quota: 1, speed: 0.5, load: 0.5
-//   - score = exp( Σ w_k * ln(part_k) / Σ w_k )，四舍五入到 3 位小数
+//   - 权重从 cfg.scoreWeights 读取，缺省为 fit: 3, reliability: 3, quota: 0.25, speed: 0.5, load: 0.5
+//   - 返回未取整原始分 exp( Σ w_k * ln(part_k) / Σ w_k )，供排序精确比较；对外展示再保留 3 位小数
 function calcWeightedScore(parts, weightsCfg) {
   const merged = { ...DEFAULT_SCORE_WEIGHTS, ...weightsCfg };
   // 防护：权重只认非负有限数；分值钳到不小于 0.001，避免 ln(0)、ln(负数) 产生 -Infinity 或 NaN
@@ -291,7 +298,7 @@ function calcWeightedScore(parts, weightsCfg) {
     weightedLogSum += w * Math.log(Number.isFinite(v) ? Math.max(v, 0.001) : 0.001);
   }
   if (totalWeight <= 0) return 0;
-  return round(Math.exp(weightedLogSum / totalWeight), 3);
+  return Math.exp(weightedLogSum / totalWeight);
 }
 
 // 格式化原因说明（中文，写给人看）
@@ -340,6 +347,37 @@ export function capsSkipWhy(caps, needs) {
   return labels.length ? `不具备：${labels.join("、")}` : "";
 }
 
+// 判断某额度池是否包含强档模型：纯中档/轻档池不接困难任务，不需要「留给困难任务」
+function poolHasStrongModel(cfg, provName, pool, currentTier) {
+  if (currentTier === "strong") return true;
+  const prov = cfg?.providers?.[provName];
+  const models = new Set();
+  for (const m of prov?.pools?.[pool] || []) {
+    const resolved = resolveModel(cfg, provName, pool, m);
+    models.add(resolved);
+    models.add(maxVariant(cfg, provName, pool, resolved));
+  }
+  const def = prov?.defaultModels?.[pool];
+  if (def) {
+    models.add(def);
+    models.add(maxVariant(cfg, provName, pool, def));
+  }
+  for (const route of Object.values(cfg?.routes || {})) {
+    if (!Array.isArray(route)) continue;
+    for (const entry of route) {
+      const [p, pl, rm] = String(entry).split(":");
+      if (p !== provName || pl !== pool || !rm) continue;
+      const resolved = resolveModel(cfg, provName, pool, rm);
+      models.add(resolved);
+      models.add(maxVariant(cfg, provName, pool, resolved));
+    }
+  }
+  for (const m of models) {
+    if (modelTier(cfg, provName, m) === "strong") return true;
+  }
+  return false;
+}
+
 // level：任务难度（easy / medium / hard），不传按旧规则只看角色路由；downgrade 为真时档位门槛降一档，权重仍按原难度；
 // steps 为真且难度为中等时同样降一档（派单带合格的「## 步骤」规格，轻档可接），其他难度忽略；
 // exactModel：调用方点名了具体模型，不换成最高思考档
@@ -359,8 +397,9 @@ export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now
   const minRank = rule ? Math.max(0, TIER_RANK[rule.minTier] - (downgrade || hasSteps ? 1 : 0)) : 0;
   const weights = rule?.weights ? { ...cfg?.scoreWeights, ...rule.weights } : cfg?.scoreWeights;
 
-  // 同一模型的不同思考档都换成最高档后会重复：只留路由里排前面的那条
-  const seen = new Set();
+  // 同一模型的不同思考档换到最高档、或 defaultModels 切到同一模型后会重复：保留擅长度（fit）更高的条目
+  const deduped = [];
+  const seen = new Map();
   for (let i = 0; i < route.length; i++) {
     const entry = route[i];
     const [provName, pool, routeModel, fitRaw] = entry.split(":");
@@ -369,9 +408,27 @@ export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now
 
     const resolved = resolveModel(cfg, provName, pool, routeModel);
     const model = exactModel ? resolved : maxVariant(cfg, provName, pool, resolved);
+    const rawFit = calcFit(i, fitRaw);
     const seenKey = `${provName}|${pool}|${model}`;
-    if (seen.has(seenKey)) continue;
-    seen.add(seenKey);
+    const item = { i, provName, pool, routeModel, model, rawFit };
+    const prevIdx = seen.get(seenKey);
+    if (prevIdx !== undefined) {
+      if (rawFit > deduped[prevIdx].rawFit + 1e-12) deduped[prevIdx] = item;
+      continue;
+    }
+    seen.set(seenKey, deduped.length);
+    deduped.push(item);
+  }
+
+  const poolStrongCache = new Map();
+  const hasStrongPool = (provName, pool, tier) => {
+    if (tier === "strong") return true;
+    const key = `${provName}|${pool}`;
+    if (!poolStrongCache.has(key)) poolStrongCache.set(key, poolHasStrongModel(cfg, provName, pool, tier));
+    return poolStrongCache.get(key);
+  };
+
+  for (const { i, provName, pool, routeModel, model, rawFit } of deduped) {
     const tier = modelTier(cfg, provName, model);
     const prov = cfg.providers?.[provName];
     const quotaProvider = prov?.quota?.provider || provName;
@@ -450,7 +507,7 @@ export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now
     }
 
     // 各项保留 3 位小数，避免浮点尾差（0.9400000000000001）进入展示和比较
-    const fit = round(calcFit(i, fitRaw), 3);
+    const fit = round(rawFit, 3);
     const quota = round(calcQuota(st, now), 3);
     const reliability = round(calcReliability(history, provName, model, role), 3);
     const speed = round(calcSpeed(history, provName, model), 3);
@@ -459,11 +516,13 @@ export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now
 
     const parts = { fit, reliability, quota, speed, load };
     if (rule?.weights?.cost) parts.cost = TIER_COST[tier];
-    const score = calcWeightedScore(parts, weights);
+    const rawScore = calcWeightedScore(parts, weights);
+    const score = round(rawScore, 3);
     let reason = formatReason(parts, score, st, now, running);
+    const belowMinTier = rule ? TIER_RANK[tier] < TIER_RANK[rule.minTier] : false;
     if (rule) {
       // 中等任务带合格的步骤规格：因规格放宽而能接的轻档，理由里写明（不写降级原因）
-      const stepNote = hasSteps && !downgrade && TIER_RANK[tier] < TIER_RANK[rule.minTier] ? "，带步骤规格，轻档可接" : "";
+      const stepNote = hasSteps && !downgrade && belowMinTier ? "，带步骤规格，轻档可接" : "";
       reason = `难度${LEVEL_TEXT[level]}${downgrade ? "（已降级）" : ""}：${rule.note}，它是${TIER_TEXT[tier]}${stepNote}；${reason}`;
     }
 
@@ -471,27 +530,46 @@ export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now
     const pace = rawPace === null ? null : round(rawPace, 3);
     const metered = prov?.billing === "metered";
     const reserveBelow = cfg?.paceReserveBelow ?? -0.15;
-    const reserved = !metered && rawPace !== null && rawPace < reserveBelow && (level === "easy" || level === "medium");
+    // 只有池内存在强档模型、且该池剩余低于 0.5、且消耗快于进度时，才触发「留给困难任务」
+    const reserved = !metered
+      && (level === "easy" || level === "medium")
+      && hasStrongPool(provName, pool, tier)
+      && typeof st.remaining === "number" && st.remaining < 0.5
+      && rawPace !== null && rawPace < reserveBelow;
 
     let group = 0;
     let demoted;
     if (level === "medium") {
-      if (reserved) {
-        group = 3;
-        demoted = "用得比进度快，留给困难任务";
+      // 中等任务先保够档位，再兜底放宽进来的轻档；同档位梯队内会员（含保留池）优先于按量计费
+      // 够档位：0 会员中档 -> 1 会员强档 -> 2 保留会员 -> 3 按量够档位
+      // 放宽轻档：4 会员轻档 -> 5 保留会员轻档 -> 6 按量轻档
+      if (belowMinTier) {
+        if (metered) {
+          group = 6;
+          demoted = "按量计费，会员候选优先";
+        } else if (reserved) {
+          group = 5;
+          demoted = "用得比进度快，留给困难任务";
+        } else {
+          group = 4;
+        }
       } else if (metered) {
-        group = 2;
+        group = 3;
         demoted = "按量计费，会员候选优先";
+      } else if (reserved) {
+        group = 2;
+        demoted = "用得比进度快，留给困难任务";
       } else if (tier !== (rule?.preferTier || "mid")) {
         group = 1;
       }
     } else if (level === "easy") {
-      if (reserved) {
+      // 简单任务：0 会员 -> 1 保留会员 -> 2 按量计费
+      if (metered) {
         group = 2;
-        demoted = "用得比进度快，留给困难任务";
-      } else if (metered) {
-        group = 1;
         demoted = "按量计费，会员候选优先";
+      } else if (reserved) {
+        group = 1;
+        demoted = "用得比进度快，留给困难任务";
       }
     } else if (!level) {
       if (metered) {
@@ -499,6 +577,9 @@ export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now
         demoted = "按量计费，会员候选优先";
       }
     }
+
+    // 把降序原因带进 reason，pick 输出时可直接看懂排序依据
+    if (demoted) reason += `；${demoted}`;
 
     const cand = {
       provider: provName,
@@ -514,6 +595,7 @@ export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now
       reason,
       _group: group,
       _rawPace: rawPace,
+      _rawScore: rawScore,
       _index: i,
     };
     if (demoted) cand.demoted = demoted;
@@ -524,26 +606,26 @@ export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now
   const maxByGroup = new Map();
   for (const c of cands) {
     const prev = maxByGroup.get(c._group);
-    if (prev === undefined || c.score > prev) maxByGroup.set(c._group, c.score);
+    if (prev === undefined || c._rawScore > prev) maxByGroup.set(c._group, c._rawScore);
   }
 
   cands.sort((a, b) => {
     if (a._group !== b._group) return a._group - b._group;
     if (level !== "hard") {
       const top = maxByGroup.get(a._group) || 0;
-      const aInBand = top > 0 && (top - a.score) / top <= tieBand + 1e-9;
-      const bInBand = top > 0 && (top - b.score) / top <= tieBand + 1e-9;
+      const aInBand = top > 0 && (top - a._rawScore) / top <= tieBand + 1e-9;
+      const bInBand = top > 0 && (top - b._rawScore) / top <= tieBand + 1e-9;
       if (aInBand && bInBand) {
         const pa = a._rawPace ?? 0;
         const pb = b._rawPace ?? 0;
         if (Math.abs(pb - pa) > 1e-9) return pb - pa;
       }
     }
-    if (b.score !== a.score) return b.score - a.score;
+    if (Math.abs(b._rawScore - a._rawScore) > 1e-12) return b._rawScore - a._rawScore;
     return a._index - b._index;
   });
 
-  const ordered = cands.map(({ _group, _rawPace, _index, ...cand }) => cand);
+  const ordered = cands.map(({ _group, _rawPace, _rawScore, _index, ...cand }) => cand);
 
   return {
     role,

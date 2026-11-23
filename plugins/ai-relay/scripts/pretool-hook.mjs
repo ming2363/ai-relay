@@ -62,7 +62,7 @@ function handleBash(input) {
       // 把当时运行中的可写任务 id 记进前快照，后快照再取「前快照 ∪ 现在」，
       // 任务恰好在这次 Bash 期间结束也不会漏掉
       snap.runningWriterIds = runningWriterIds(repos);
-      writeBashSnap(sessionId, snap);
+      writeBashSnap(sessionId, snap, input.tool_use_id);
     }).catch(() => {});
   } catch {}
 }
@@ -136,20 +136,25 @@ async function main() {
   }
   // 模型：派单里写的 --model 优先；没写就用刚才 relay pick 选中的 Codex 模型；都没有就是 Codex 自己的默认模型。
   // 最后实际用哪个都钉在第一行，检查的和跑的是同一个
-  const flags = codexFlagsOf(brief);
+  // 降级：与 relay run 一致写 --downgrade "<原因>"；先摘出来，免得原因里的空格被当成别的参数
+  const dgMatch = brief.match(/(^|[ \t])--downgrade(?:=|[ \t]+)(?:"([^"\n]*)"|'([^'\n]*)'|(\S+))/m);
+  const downgrade = dgMatch ? String(dgMatch[2] ?? dgMatch[3] ?? dgMatch[4] ?? "").trim() : "";
+  const flags = codexFlagsOf(dgMatch ? brief.replace(dgMatch[0], dgMatch[1]) : brief);
   if (flags.conflict.length) {
     return deny(`[ai-relay] 派给 Codex 的 prompt 里 ${flags.conflict.map((k) => `--${k}`).join("、")} 写了不同的值，已退回。只写一次，放在第一行`);
   }
-  const fitsFor = () => (prov?.pools?.codex || []).filter((m) => m !== "default" && tierAllowed(level, modelTier(cfg, "codex", m), false, hasStepSpec(brief)));
+  const fitsFor = () => (prov?.pools?.codex || []).filter((m) => m !== "default" && tierAllowed(level, modelTier(cfg, "codex", m), !!downgrade, hasStepSpec(brief)));
   const pick = lastPick(role);
   const pickModel = !flags.model && pick?.provider === "codex" && pick.level === level && pick.model && pick.model !== "default" ? pick.model : null;
-  const usedModel = flags.model || pickModel || codexDefaultModel();
+  // 面板里给 Codex 设的默认模型优先于 config.toml
+  const panelDefault = prov?.defaultModels?.codex && prov.defaultModels.codex !== "default" ? prov.defaultModels.codex : null;
+  const usedModel = flags.model || pickModel || panelDefault || codexDefaultModel();
   if (!usedModel && level !== "easy") {
     const fits = fitsFor();
     return deny(`[ai-relay] 读不到 Codex 的默认模型，没法判断档位够不够${LEVEL_TEXT[level]}任务，已退回。在 prompt 第一行写 --model <模型>${fits.length ? `，可选：${fits.join("、")}` : ""}`);
   }
   const tier = usedModel ? modelTier(cfg, "codex", usedModel) : "mid";
-  if (!tierAllowed(level, tier, false, hasStepSpec(brief))) {
+  if (!tierAllowed(level, tier, !!downgrade, hasStepSpec(brief))) {
     const fits = fitsFor();
     return deny(`[ai-relay] Codex 的 ${usedModel} 是${TIER_TEXT[tier]}模型，接不了${LEVEL_TEXT[level]}任务，已退回。在 prompt 第一行写 --model <模型>${fits.length ? `，可选：${fits.join("、")}` : ""}`);
   }
@@ -207,7 +212,7 @@ async function main() {
     role,
     level,
     // 只有这次用的正是 pick 选的模型，才沿用 pick 的打分理由
-    reason: `${pickModel ? `${pick.reason}${Array.isArray(pick.skipped) && pick.skipped.length ? `；跳过 ${pick.skipped.join("、")}` : ""}` : flags.model ? `主模型指定 Codex ${flags.model}` : "主模型指定 Codex"}；用 ${usedModel || "Codex 默认模型"}（${TIER_TEXT[tier]}），推理强度 ${effort}`,
+    reason: `${pickModel ? `${pick.reason}${Array.isArray(pick.skipped) && pick.skipped.length ? `；跳过 ${pick.skipped.join("、")}` : ""}` : flags.model ? `主模型指定 Codex ${flags.model}` : "主模型指定 Codex"}；用 ${usedModel || "Codex 默认模型"}（${TIER_TEXT[tier]}），推理强度 ${effort}${downgrade ? `；已降级：${downgrade}` : ""}`,
     write,
     scope,
     // 发起外派的 Claude 会话，工作量统计按它把外派归到对应轮次
@@ -267,7 +272,7 @@ async function main() {
     write,
     role,
     shared: readSharedContext(STATE_DIR, cwd),
-    caps: prov?.caps || { web: false, exec: false },
+    caps: codexCaps,
   });
   process.stdout.write(
     JSON.stringify({

@@ -145,9 +145,9 @@ Claude 自己的 5h 额度低于 20% 时，连第 5 条也改为外派；低于 
 | 中等 | 常规实现、一般排查、单模块的改动 | 中档以上 | 按综合分 |
 | 困难 | 跨模块设计、疑难排查、需要深度推理的 | 只派强档 | 看擅长度和可靠度，额度几乎不算 |
 
-模型档位（配置 `modelTiers` 可改，按「厂商:模型」匹配，`*` 通配）：轻档是 Gemini 4 Hydrogen、Gemini 3.8 Flash、Codex GPT-6-Luna 和 GPT-5.6 系列；中档是 Grok、agy 上的 Claude Sonnet、Codex GPT-6.1-Terra（Codex 命令行默认）和 GPT-6-Sol；强档是 Codex GPT-6-Astra 和 GPT-6.1-Sol、Gemini 4 Argon high、agy 上的 Claude Opus。没列到的模型按中档算。Codex 的几个模型共用一份额度，换成 Luna 只是少用一些，不像 Flash 那样有单独的额度。
+模型档位（配置 `modelTiers` 可改，按「厂商:模型」匹配，`*` 通配）：轻档是 Gemini 4 Hydrogen、Gemini 3.8 Flash、Codex GPT-6-Luna 和 GPT-5.6 系列；中档是 Grok、agy 上的 Claude Sonnet、Codex GPT-6.1-Terra（Codex 命令行默认）和 GPT-6-Sol；强档是 Codex GPT-6-Astra 和 GPT-6.1-Sol、Gemini 4 Neon（Gemini 4 里最强，和 Hydrogen、Flash 共用一份额度）、Gemini 4 Argon high、agy 上的 Claude Opus。没列到的模型按中档算。Codex 的几个模型共用一份额度，换成 Luna 只是少用一些，不像 Flash 那样有单独的额度。
 
-**思考一律开到最高**（用户定的，不分难度）：agy 的模型自动换成额度池里最高的一档（Hydrogen 用 xhigh，Argon、Flash、Claude 用 high），Codex 补 `--effort xhigh`，Grok 带 `--reasoning-effort xhigh`，自定义接口带 32000 的思考预算。点名了具体模型（`--model`）或写了 `--effort` 的照点名的来，所以不要点名低档。
+**思考一律开到最高**（用户定的，不分难度）：agy 的模型自动换成额度池里最高的一档（Neon、Hydrogen 用 xhigh，Argon、Flash、Claude 用 high），Codex 补 `--effort xhigh`，Grok 带 `--reasoning-effort xhigh`，自定义接口带 32000 的思考预算。点名了具体模型（`--model`）或写了 `--effort` 的照点名的来，所以不要点名低档。
 
 档位不够的模型会被跳过或退回（点名的也一样）。困难任务的强档都没额度时，**不会悄悄降级**：你自己做，或确认降一档也能做好时加 `--downgrade "<原因>"`，原因会记进分派理由。
 
@@ -181,6 +181,7 @@ relay pick <角色> --level 简单|中等|困难
 
 - 路由条目 `provider:pool:model[:fit]` 中 `model` 为 `default` 时，取该额度池的默认模型；写了具体模型 id 的条目固定不变（如 `implement` 的 `claude-sonnet-5-5-high`、`read` 的 `gemini-4-argon-medium`、`quick` 的 `gemini-3.8-flash-medium`）。
 - 默认模型存在 `~/.claude/ai-relay/providers.json` 的 `providers.<名称>.defaultModels.<额度池>`。单池厂商（Codex、Grok）未设时跟随 CLI 默认；多池厂商（agy）每个池必须设具体默认模型。
+- 新模型自动接入：面板开着时每 30 分钟请求一次 `relay models discover --background`（relay 按 6 小时节流）。发现新模型后按官方额度分组归池、派能联网的员工调研档位与擅长角色，只增不改地写进配置；面板厂商页首显示结果，可一键撤销（`relay models discover --undo <记录id>`）。自动接入的模型照样要靠验收记录积累可靠度。
 - 查看与切换：`relay models [--refresh]` 从各家官方 CLI 拉取最新模型清单（缓存 24 小时，`models-cache.json`）；`relay provider model <厂商> <额度池> <模型id|default>` 设置默认模型（单池厂商写 `default` 恢复跟随 CLI 默认）。
 
 ## 四、上下文：怎么让看不到对话的模型拿到足够信息

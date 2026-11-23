@@ -81,13 +81,15 @@
 
 | 角色 | 路由表顺序（决定擅长度） |
 |---|---|
-| implement 实现 | Codex → Gemini Argon → Grok → agy·Claude Sonnet → Gemini Flash |
-| debug 排查 | Codex → Grok → Gemini Argon → agy·Claude Opus → Gemini Flash |
-| review 审查 | Grok → Gemini Argon → Gemini Flash → Codex |
-| read 大量阅读 | Gemini Flash → Argon → Grok |
-| deep 深度推理 | Argon → agy·Claude Opus → Codex |
-| quick 简单问答 | Gemini Flash → Grok |
-| claude-backup 替 Claude | agy·Claude Opus → Argon → Codex |
+| implement 实现 | Codex GPT-6.1-Sol → Codex GPT-6.1-Terra → Gemini Argon → Gemini Neon → Grok → agy·Claude Sonnet → Codex GPT-6-Luna → Gemini Hydrogen |
+| debug 排查 | Codex GPT-6.1-Sol → Codex GPT-6-Astra → Grok → Codex GPT-6.1-Terra → Gemini Neon → Gemini Argon → agy·Claude Opus → Codex GPT-6-Luna → Gemini Hydrogen |
+| review 审查 | Grok → Gemini Argon → Gemini Neon → Gemini Hydrogen → Codex GPT-6.1-Sol |
+| read 大量阅读 | Gemini Hydrogen → Gemini Argon → Gemini Neon → Grok |
+| deep 深度推理 | Gemini Argon → Gemini Neon → Codex GPT-6-Astra → agy·Claude Opus → Codex GPT-6.1-Sol |
+| quick 简单问答 | Gemini Hydrogen → Grok |
+| claude-backup 替 Claude | agy·Claude Opus → Gemini Argon → Gemini Neon → Codex GPT-6.1-Sol |
+
+新模型会自动接入：面板定时探测，发现后按官方额度分组归池、联网调研档位和擅长角色，只增不改地写进路由，厂商页可以撤销。详见仓库根目录 README 的「新模型自动接入」。
 
 实际选谁要看打分。Claude 自身 5 小时额度低于 20% 时，验收中的小修补也改为外派。
 

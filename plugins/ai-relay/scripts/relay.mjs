@@ -13,13 +13,14 @@ import {
   runningWriters, scopesOverlap, normScope, isPathInScope, withWriteLock, gitSnapshot, claimPendingDispatch,
   parseGitStatusPath, parseGitStatusPaths, diffSnapshots, checkOutOfScope, workspaceRoot,
   getWorkspaceActivityMtime, recordMeteredUsage, meteredUsedToday, meteredCapReached,
-  lineSnapshot, snapshotDelta,
+  lineSnapshot, snapshotDelta, maskSecrets, withoutOtherWriters, scopeLineSnapshot,
 } from "./lib.mjs";
-import { refreshCache, refreshGrok, loadCache, detectQuotaExhausted, markPoolExhausted } from "./quota.mjs";
+import { refreshCache, refreshGrok, loadCache, detectQuotaExhausted, markPoolExhausted, parseResetMs } from "./quota.mjs";
 import { scoreRoute, parseLevel, modelTier, tierAllowed, CODEX_EFFORT, LEVEL_TEXT, TIER_TEXT } from "./score.mjs";
 import {
   getModels, loadModelsCache, findModelPool, setProviderDefaultModel, buildModelPools,
 } from "./models.mjs";
+import { cmdModelsDiscover } from "./discover.mjs";
 import { sampleQuotaHistory, lastCycles, workStats } from "./stats.mjs";
 import { usageForJob, usageFromOutputJson, parseClaudeOutput, backfill, attachLiveUsage, getSessionActivityMtime } from "./usage.mjs";
 import {
@@ -98,14 +99,16 @@ const CODEX_PLUGIN_ID = "codex@openai-codex";
 
 function parseArgs(argv) {
   const opts = { _: [] };
-  const valueFlags = new Set(["--role", "--model", "--cwd", "--prompt-file", "--timeout", "--provider", "--json-spec", "--preset", "--claude-json", "--limit", "--with", "--scope", "--target", "--needs", "--idle-timeout", "--max-runtime", "--verdict", "--level", "--downgrade", "--add", "--remove", "--days"]);
+  const valueFlags = new Set(["--role", "--model", "--cwd", "--prompt-file", "--timeout", "--provider", "--json-spec", "--preset", "--claude-json", "--limit", "--with", "--scope", "--target", "--needs", "--idle-timeout", "--max-runtime", "--verdict", "--level", "--downgrade", "--add", "--remove", "--days", "--undo"]);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--") {
       opts.text = argv.slice(i + 1).join(" ");
       break;
     }
-    if (valueFlags.has(a)) opts[a.slice(2).replace(/-(\w)/g, (_, c) => c.toUpperCase())] = argv[++i];
+    // --downgrade 必须带原因；后面缺值或紧跟别的开关时记为 true，不吞掉下一个参数（由命令自己报错）
+    if (a === "--downgrade" && (i + 1 >= argv.length || String(argv[i + 1]).startsWith("--"))) opts.downgrade = true;
+    else if (valueFlags.has(a)) opts[a.slice(2).replace(/-(\w)/g, (_, c) => c.toUpperCase())] = argv[++i];
     else if (a.startsWith("--")) opts[a.slice(2).replace(/-(\w)/g, (_, c) => c.toUpperCase())] = true;
     else opts._.push(a);
   }
@@ -261,7 +264,8 @@ function cmdPick(opts) {
   if (!r.choice) {
     console.log(noModelText(role, level, r.skipped));
     // 中等任务一个候选都没有：按"带步骤规格"再打一次分，把届时能接的轻档列出来，提示主管补写「## 步骤」
-    if (level === "medium" && !opts.steps) console.log(stepsHintText(cfg, readQuotaRows(cfg), role, extra, opts.provider));
+    // 快问是简单问答，没有文件级步骤可写，不给步骤规格提示
+    if (level === "medium" && !opts.steps && role !== "quick") console.log(stepsHintText(cfg, readQuotaRows(cfg), role, extra, opts.provider));
     process.exit(3);
   }
   const c = r.choice;
@@ -458,7 +462,8 @@ export function changesDiff(cwd, changedFiles) {
     for (const p of paths) (String(line).startsWith("??") ? untracked : tracked).add(p);
   }
   const run = (args) => {
-    const r = spawnSync("git", ["-C", cwd, "-c", "core.quotePath=false", ...args], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+    // 快照里的路径相对仓库根：在仓库根执行，cwd 是子目录时也能对上
+    const r = spawnSync("git", ["-C", workspaceRoot(cwd), "-c", "core.quotePath=false", ...args], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
     return r.stdout || "";
   };
   let out = tracked.size ? run(["diff", "HEAD", "--", ...tracked]) : "";
@@ -606,6 +611,23 @@ export async function executeJob(job, testOpts = {}) {
   if (spawnEnv) spawnOpts.env = spawnEnv;
   const child = spawn(bin, args, spawnOpts);
 
+  // 员工 CLI 在自己的进程组里（detached）：relay 本身被结束（Ctrl-C、调用方超时 kill、relay cancel 杀 worker）时，
+  // 先把员工进程组一起结束再退出，不留下继续改文件、耗额度的孤儿进程
+  const onParentSignal = (sig) => {
+    try {
+      process.kill(-child.pid, "SIGTERM");
+    } catch {
+      try { child.kill("SIGTERM"); } catch {}
+    }
+    process.exit(sig === "SIGINT" ? 130 : 143);
+  };
+  process.once("SIGTERM", onParentSignal);
+  process.once("SIGINT", onParentSignal);
+  child.once("close", () => {
+    process.removeListener("SIGTERM", onParentSignal);
+    process.removeListener("SIGINT", onParentSignal);
+  });
+
   job.childPid = child.pid;
   if (!job.pid) job.pid = child.pid;
   saveJob(job);
@@ -713,6 +735,24 @@ export async function executeJob(job, testOpts = {}) {
   const stderrStr = Buffer.concat(stderrChunks).toString("utf8");
   const output = stdoutStr + (stderrStr ? `\n[stderr]\n${stderrStr}` : "");
 
+  // 写回前重读一次磁盘：已被 relay cancel 标成 cancelled 的任务，不能被事后覆盖成 failed/done
+  let cancelledOnDisk = false;
+  try { cancelledOnDisk = loadJob(job.id, job._jobsDir)?.status === "cancelled"; } catch {}
+  if (cancelledOnDisk) {
+    job.exitCode = code;
+    job.status = "cancelled";
+    job.finishedAt = new Date().toISOString();
+    // 取消前员工可能已经改了文件：留下改动清单，主管才能核对残留改动
+    if (before !== null && after !== null) {
+      job.changedFiles = withoutOtherWriters(job, diffSnapshots(before, after));
+      const out = job.write && job.changedFiles?.length ? checkOutOfScope(job.changedFiles, job.scope, job.cwd) : [];
+      if (out.length) job.outOfScope = out;
+    }
+    try { fs.writeFileSync(jobPath(job.id, "log", job._jobsDir), maskSecrets(maskSecretValue(output, taskSecret))); } catch {}
+    saveJob(job);
+    return job;
+  }
+
   job.exitCode = code;
   if (timedOut) {
     job.status = "timeout";
@@ -745,7 +785,7 @@ export async function executeJob(job, testOpts = {}) {
     recordMeteredUsage(job.provider, usage.input + usage.output);
   }
   if (before !== null && after !== null) {
-    job.changedFiles = diffSnapshots(before, after);
+    job.changedFiles = withoutOtherWriters(job, diffSnapshots(before, after));
   }
   if (job.write && job.changedFiles?.length) {
     const out = checkOutOfScope(job.changedFiles, job.scope, job.cwd);
@@ -762,7 +802,8 @@ export async function executeJob(job, testOpts = {}) {
     try {
       const linesAfter = await lineSnapshot(job.cwd, Object.keys(linesBefore.heads || {}), linesBefore.heads);
       if (linesAfter && job.status === "done") {
-        job.changedLines = snapshotDelta(linesBefore, linesAfter);
+        // 只数本任务写入范围内的行，并行任务改的不算进来（免得误触发初审、重复计工作量）
+        job.changedLines = snapshotDelta(scopeLineSnapshot(linesBefore, job), scopeLineSnapshot(linesAfter, job));
       }
     } catch {}
   }
@@ -775,7 +816,7 @@ export async function executeJob(job, testOpts = {}) {
       const startedMs = Date.now();
       const res = spawnSync("sh", ["-c", cmd], { cwd: job.cwd, encoding: "utf8", timeout: verifyTimeoutMs });
       const rawTail = `${res.stdout || ""}${res.stderr ? `\n${res.stderr}` : ""}`.trim();
-      const tail = maskSecretValue(rawTail.split("\n").slice(-40).join("\n"), taskSecret);
+      const tail = maskSecrets(maskSecretValue(rawTail.split("\n").slice(-40).join("\n"), taskSecret));
       const entry = { cmd, exitCode: res.status, ms: Date.now() - startedMs, tail };
       if (res.error?.code === "ETIMEDOUT") {
         entry.exitCode = null;
@@ -794,13 +835,14 @@ export async function executeJob(job, testOpts = {}) {
     job.quotaExhausted = true;
     try {
       const qp = cfg.providers?.[job.provider]?.quota?.provider || job.provider;
-      if (job.pool) markPoolExhausted(testOpts.stateDir || STATE_DIR, qp, job.pool);
+      const resetAt = parseResetMs(`${stderrStr}\n${stdoutStr.slice(-2000)}`);
+      if (job.pool) markPoolExhausted(testOpts.stateDir || STATE_DIR, qp, job.pool, Date.now(), 24, resetAt);
     } catch {}
   }
   // 写日志和结果前打掉本任务密钥的原值。标准错误留在日志里，结果只取 JSON 的 result。
-  const maskedLog = maskSecretValue(output, taskSecret);
-  if (typeof job.result === "string") job.result = maskSecretValue(job.result, taskSecret);
-  if (typeof job.error === "string") job.error = maskSecretValue(job.error, taskSecret);
+  const maskedLog = maskSecrets(maskSecretValue(output, taskSecret));
+  if (typeof job.result === "string") job.result = maskSecrets(maskSecretValue(job.result, taskSecret));
+  if (typeof job.error === "string") job.error = maskSecrets(maskSecretValue(job.error, taskSecret));
   fs.writeFileSync(jobPath(job.id, "log", job._jobsDir), maskedLog);
   job.helpRequest = helpRequestOf(typeof job.result === "string" ? job.result : maskedLog);
   // 改动大的可写任务：后台起另一家厂商的只读初审，不等它结束
@@ -919,6 +961,10 @@ async function cmdRun(opts) {
     console.error(`ai-relay 错误：派单没写难度，已退回。${LEVEL_HELP}`);
     process.exit(2);
   }
+  if (opts.downgrade === true) {
+    console.error('ai-relay 错误：--downgrade 要写原因，例如 --downgrade "强档都没额度，这次改动只涉及单个文件"');
+    process.exit(2);
+  }
   const downgrade = opts.downgrade ? String(opts.downgrade) : "";
   // --needs 优先；否则从派单「需要的能力」读。空数组表示不按能力筛选
   const needs = opts.needs ? parseNeedsFlag(opts.needs) : needsWithImages(task);
@@ -935,7 +981,8 @@ async function cmdRun(opts) {
     // 可写任务按目标目录判断沙箱：Codex 写不到项目外的目录时自动跳过
     const target = path.resolve(opts.cwd || process.cwd());
     const workspace = workspaceRoot(process.env.CLAUDE_PROJECT_DIR || process.cwd());
-    const r = route(cfg, rows, role, undefined, { needs, write: !!opts.write, target, workspace, level, downgrade: !!downgrade, steps, exactModel: !!opts.model });
+    // 不传 exactModel：路由条目照常换到最高思考档参与选人；点名的模型按它自己的档位在后面过门槛
+    const r = route(cfg, rows, role, undefined, { needs, write: !!opts.write, target, workspace, level, downgrade: !!downgrade, steps });
     // 首选是 Codex 时不悄悄改派：Codex 要走 Agent 工具（官方插件），交给主管去派
     if (!opts.model && !opts.skipCodex && r.choice?.via === "codex-plugin") {
       recordPick(role, r);
@@ -968,7 +1015,10 @@ async function cmdRun(opts) {
 
   const prov = cfg.providers[provName];
   if (!prov) throw new Error(`未知提供方 ${provName}，可选：${Object.keys(cfg.providers).join(", ")}`);
-  const missingNeeds = missingNeedLabels(capsOf(cfg, prov, opts.model || model), needs);
+  const concreteModel = opts.model || model;
+  // 模型还没定（点名厂商、没写 --model）时只查联网和执行命令；能不能看图按模型定，选出模型后再查
+  const earlyNeeds = concreteModel && concreteModel !== "default" ? needs : needs.filter((n) => n !== "vision");
+  const missingNeeds = missingNeedLabels(capsOf(cfg, prov, concreteModel, { write: !!opts.write }), earlyNeeds);
   if (missingNeeds.length) {
     console.error(`${provName} 不具备：${missingNeeds.join("、")}；需要这项能力的部分请改派，或由主控先完成后把结果写进背景`);
     process.exit(3);
@@ -1011,7 +1061,7 @@ async function cmdRun(opts) {
     throw new Error(`模型 ${model} 不在 ${provName} 的配置里，可选：${allowed.join(", ")}`);
   }
   model = resolveModel(cfg, provName, pool, model);
-  const missingNeedsAfter = missingNeedLabels(capsOf(cfg, prov, model), needs);
+  const missingNeedsAfter = missingNeedLabels(capsOf(cfg, prov, model, { write: !!opts.write }), needs);
   if (missingNeedsAfter.length) {
     console.error(`${provName} 不具备：${missingNeedsAfter.join("、")}；需要这项能力的部分请改派，或由主控先完成后把结果写进背景`);
     process.exit(3);
@@ -1071,7 +1121,7 @@ async function cmdRun(opts) {
       shared: readSharedContext(STATE_DIR, cwd),
       attachments: withJobs.length ? attachJobs(withJobs) : null,
       diff: opts.diff ? gitDiff(cwd) : null,
-      caps: capsOf(cfg, prov, model),
+      caps: capsOf(cfg, prov, model, { write: !!opts.write }),
     }),
     status: "running", startedAt: new Date().toISOString(), quotaAtStart: quotaText(cfg, provName, st),
   };
@@ -1079,7 +1129,8 @@ async function cmdRun(opts) {
   // 真正落盘时才认领。写入范围冲突时任务不会创建，记录留给下一次。
   // 优先 cwd 与 CLAUDE_PROJECT_DIR（没有则用进程 cwd）相同的记录，没有就取 30 秒内最新一条。
   const persistNewJob = () => {
-    const sessionId = claimPendingDispatch(process.env.CLAUDE_PROJECT_DIR || process.cwd());
+    // 认领不到（如返工命令没经过钩子）时沿用原任务的会话，工作量统计才归得到对应轮次
+    const sessionId = claimPendingDispatch(process.env.CLAUDE_PROJECT_DIR || process.cwd()) || opts.sessionId || "";
     if (sessionId) job.sessionId = sessionId;
     saveJob(job);
     // 返工任务真正建好了，才给原任务记「退回返工」的结论；前面任何一步退回都不动原任务
@@ -1160,6 +1211,7 @@ ${feedback.trim()}
     force: opts.force,
     level,
     downgrade: opts.downgrade || orig.downgrade,
+    sessionId: orig.sessionId,
     // 原任务没记结论的，等返工任务建好后记上：返工说明这一次没通过，计入这个员工的可靠度
     rework: { of: orig.id, round, verdict: orig.verdict ? null : verdict, note: `退回返工：${feedback.trim().split("\n")[0].slice(0, 80)}` },
   });
@@ -1289,16 +1341,56 @@ async function cmdWait(opts) {
   }
 }
 
+// 同步等待，供 cancel 这种短命命令使用
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// 进程组（detached 启动的进程 pgid = pid）或单个进程是否还活着；无权限（EPERM）也算存在
+function procAlive(pid) {
+  for (const target of [-pid, pid]) {
+    try {
+      process.kill(target, 0);
+      return true;
+    } catch (e) {
+      if (e.code === "EPERM") return true;
+    }
+  }
+  return false;
+}
+
+// 向进程组发信号，进程组不存在时回退单进程；ESRCH 等错误忽略
+function signalProc(pid, sig) {
+  try {
+    process.kill(-pid, sig);
+  } catch {
+    try { process.kill(pid, sig); } catch {}
+  }
+}
+
+// 先 SIGTERM，最多等 2 秒，仍活着再 SIGKILL
+function terminateProc(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return;
+  signalProc(pid, "SIGTERM");
+  const deadline = Date.now() + 2000;
+  while (procAlive(pid) && Date.now() < deadline) sleepSync(50);
+  if (procAlive(pid)) {
+    signalProc(pid, "SIGKILL");
+    const end = Date.now() + 1000;
+    while (procAlive(pid) && Date.now() < end) sleepSync(50);
+  }
+}
+
 function cmdCancel(opts) {
   const job = loadJob(opts._[1]);
   if (job.status !== "running") return console.log(`任务 ${job.id} 状态为 ${job.status}，无需取消`);
-  try {
-    process.kill(-job.pid, "SIGTERM");
-  } catch {
-    try { process.kill(job.pid, "SIGTERM"); } catch {}
-  }
+  // 先落盘 cancelled：前台模式下执行进程在员工 CLI 退出后会重读，看到 cancelled 就不覆盖
   job.status = "cancelled";
   saveJob(job);
+  // 先杀 _worker 进程组，让它没机会在员工 CLI 退出后把状态写回成 failed/done；
+  // 员工 CLI 在自己的进程组里，worker 死后不会跟着退出，再单独杀 childPid
+  terminateProc(job.pid);
+  if (job.childPid && job.childPid !== job.pid) terminateProc(job.childPid);
   console.log(`已取消任务 ${job.id}`);
 }
 
@@ -1670,7 +1762,7 @@ function cmdProviderTest(opts) {
     const spawnOpts = { cwd, encoding: "utf8", timeout: Number(opts.timeout || 120) * 1000, stdio: ["ignore", "pipe", "pipe"] };
     if (env) spawnOpts.env = env;
     const res = spawnSync(bin, args, spawnOpts);
-    const out = maskSecretValue(`${res.stdout || ""}${res.stderr ? `\n${res.stderr}` : ""}`.trim(), secret);
+    const out = maskSecrets(maskSecretValue(`${res.stdout || ""}${res.stderr ? `\n${res.stderr}` : ""}`.trim(), secret));
     const timedOut = res.error?.code === "ETIMEDOUT";
     result = { ok: res.status === 0 && !timedOut && !!(res.stdout || "").trim(), exitCode: res.status, timedOut, seconds: Math.round((Date.now() - started) / 1000), output: out.slice(-400) };
   } catch (e) {
@@ -1869,6 +1961,7 @@ function withEnabledMarks(cfg, cache) {
 }
 
 async function cmdModels(opts) {
+  if (opts._[1] === "discover") return await cmdModelsDiscover(opts);
   const cfg = loadConfig();
   const cache = await getModels(cfg, { stateDir: STATE_DIR, refresh: !!opts.refresh });
   if (opts.json) return console.log(JSON.stringify(withEnabledMarks(cfg, cache), null, 2));
@@ -1978,6 +2071,10 @@ function help() {
                                   --needs 只在具备这些能力的厂商里选（web 联网，exec 执行命令，逗号分隔）
                                   --steps 预览"派单带合格的「## 步骤」规格"时的候选：中等任务的档位门槛降一档，轻档可接（其他难度无效）
   models [--refresh] [--json]     拉取或查看各厂商官方 CLI 的可用模型清单（缓存 6 小时，过期自动重新拉取）
+  models discover [--force] [--background] [--json]
+                                  探测各厂商新模型，自动归池、联网调研能力并增量写入配置（默认 6 小时节流）
+  models discover --list [--json] | --undo <记录id>
+                                  查看自动接入记录，或精确撤销指定记录对配置做的改动
   providers [--json]              列出厂商：启用状态、命令是否已安装、参与哪些角色、额度池默认模型
   provider enable|disable <名称>   启用 / 停用某厂商（停用后路由与外派都跳过它）
   provider model <名称> <额度池> <模型id|default>   设置某额度池的默认模型（单池厂商写 default 恢复跟随 CLI 默认）

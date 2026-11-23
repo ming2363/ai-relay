@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface as Engine, FsEntry, Register, RenderChildren, SelectOption } from 'claude-code'
 
-import type { AddForm, JobView, LastCycle, ModelFixedRole, ModelPool, ModelsCatalog, ModelsView, PoolView, ProviderCatalog, RelayMode, Round, RoundAgent, RoundTokenRow, Snapshot, TokenUsage, Vendor, VendorData, WindowView, WorkStats, WorkStatsView } from '../types'
+import type { AddForm, DiscoverView, JobView, LastCycle, ModelFixedRole, ModelPool, ModelsCatalog, ModelsView, PoolView, ProviderCatalog, RelayMode, Round, RoundAgent, RoundTokenRow, Snapshot, TokenUsage, Vendor, VendorData, WindowView, WorkStats, WorkStatsView } from '../types'
 
 // 家目录在会话启动时用 $.env.get('HOME') 读取，不写死，别人安装也能用
 let HOME = ''
@@ -14,6 +14,8 @@ const NODE_CANDIDATES = ['/opt/homebrew/bin/node', '/usr/local/bin/node', 'node'
 const REFRESH_MS = 60_000
 // 提示条上的已运行时长：5 秒跳一次，不每秒重绘
 const BAND_TICK_MS = 5_000
+// 新模型自动发现：面板每 30 分钟请求一次，relay 自己按 6 小时节流，真正探测并不频繁
+const DISCOVER_TICK_MS = 30 * 60_000
 const BAND_SHOW = 3
 const BRIEF_CHARS = 12
 const PANE = 'relay-quota'
@@ -56,6 +58,10 @@ const workStats = atom({ plugin: 'ai-relay-status', key: 'workStats' } as const,
 const bandTick = atom({ plugin: 'ai-relay-status', key: 'bandTick' } as const, 0)
 // 插件总开关：记录在 ~/.claude/settings.json 的 enabledPlugins 中
 const relayEnabled = atom({ plugin: 'ai-relay-status', key: 'relayEnabled' } as const, true)
+// 新模型自动发现的最近一次结果（读 ~/.claude/ai-relay/discover-state.json）
+type DiscoverAdded = NonNullable<DiscoverView>['added'][number]
+type DiscoverMiss = NonNullable<DiscoverView>['missed'][number]
+const discoverView = atom({ plugin: 'ai-relay-status', key: 'discoverView' } as const, null as DiscoverView, { shape: 'discover-1' })
 // 启停切换状态：切换中标记 busy，失败记录 error，成功记录 text
 const relayToggle = atom({ plugin: 'ai-relay-status', key: 'relayToggle' } as const, null as { busy: boolean; error?: string; text?: string } | null)
 // 同步锁：状态写回去之前拦住同一行的下一次选择
@@ -91,7 +97,7 @@ const MODE_DESC: Record<RelayMode, string> = {
 const POOL_META: Record<string, { name: string; provider: string; order: number }> = {
   'claude/claude-subscription': { name: 'Claude', provider: 'Claude Pro · 主模型', order: 0 },
   'codex/codex': { name: 'Codex', provider: 'ChatGPT Plus', order: 1 },
-  'agy/gemini': { name: 'Gemini 3.8 Flash', provider: 'Antigravity', order: 2 },
+  'agy/gemini': { name: 'Gemini Neon / Hydrogen / Flash', provider: 'Antigravity', order: 2 },
   'agy/gemini-argon': { name: 'Gemini 4 Argon', provider: 'Antigravity', order: 3 },
   'agy/claude-gpt': { name: 'Claude / GPT', provider: 'Antigravity', order: 4 },
   'grok/supergrok-weekly': { name: 'Grok', provider: 'SuperGrok', order: 5 },
@@ -271,15 +277,17 @@ function mainModelText(id: string) {
 // 外派模型 id 转成可读名：gemini-3.8-flash-high → Gemini 3.8 Flash · High
 function modelText(provider: string, model: string) {
   if (!model || model === 'default') return PROVIDER_TEXT[provider] ?? provider
-  const effort = model.match(/-(high|medium|low)$/)?.[1]
-  const base = model.replace(/-(high|medium|low)$/, '')
+  const effort = model.match(/-(xhigh|high|medium|low)$/)?.[1]
+  const base = model.replace(/-(xhigh|high|medium|low)$/, '')
   const name = base
     .replace(/^claude-(opus|sonnet|haiku)-(\d+)-(\d+)$/i, (_, f: string, a: string, b: string) => `Claude ${f.charAt(0).toUpperCase()}${f.slice(1)} ${a}.${b}`)
     .replace(/^gpt-([\d.]+)-([a-z]+)$/i, (_, v: string, f: string) => `GPT-${v} ${f.charAt(0).toUpperCase()}${f.slice(1)}`)
+    // gemini-4-neon → Gemini 4 Neon（Hydrogen、Argon、Flash 同理）
+    .replace(/^gemini-([\d.]+)-([a-z]+)$/i, (_, v: string, f: string) => `Gemini ${v} ${f.charAt(0).toUpperCase()}${f.slice(1)}`)
     .replace(/^gemini-/i, 'Gemini ')
     .replace(/-(flash|argon|pro)$/i, (_, f: string) => ` ${f.charAt(0).toUpperCase()}${f.slice(1)}`)
     .replace(/-(argon|flash|pro)-/i, (_, f: string) => ` ${f.charAt(0).toUpperCase()}${f.slice(1)} `)
-  const effortText = effort ? ` · ${{ high: 'High', medium: 'Medium', low: 'Low' }[effort]}` : ''
+  const effortText = effort ? ` · ${{ xhigh: 'XHigh', high: 'High', medium: 'Medium', low: 'Low' }[effort]}` : ''
   return `${name}${effortText}`
 }
 
@@ -768,10 +776,8 @@ async function findCodexUsage($: Engine, r: Round, a: RoundAgent, rec?: JobView)
     dayDirs.add(`${base}/${d.getFullYear()}/${pad2(d.getMonth() + 1)}/${pad2(d.getDate())}`)
   }
 
-  let input = 0
-  let output = 0
-  let cacheRead = 0
-  let matchedEvents = 0
+  // 每个 rollout 文件单独算增量；多个文件命中（并发或紧挨着外派）时只计一个，不相加
+  let best: { usage: TokenUsage; firstTs: number } | null = null
 
   for (const dir of dayDirs) {
     let entries: FsEntry[] = []
@@ -809,7 +815,13 @@ async function findCodexUsage($: Engine, r: Round, a: RoundAgent, rec?: JobView)
       }
       if (!cwdOk) continue
 
-      let prevTotalTokens: number | null = null
+      let input = 0
+      let output = 0
+      let cacheRead = 0
+      let matchedEvents = 0
+      let firstTs = Number.POSITIVE_INFINITY
+      // 上一条累计值：整个文件内跟踪（含时间窗外的事件），缺 last_token_usage 时用来求增量
+      let prevTotal: { input: number; output: number; cacheRead: number; total: number | null } | null = null
       for (const line of lines) {
         const trimmed = line.trim()
         if (!trimmed) continue
@@ -826,29 +838,46 @@ async function findCodexUsage($: Engine, r: Round, a: RoundAgent, rec?: JobView)
         if (!payload || payload.type !== 'token_count') continue
         const ts = typeof entry.timestamp === 'string' ? Date.parse(entry.timestamp) : typeof entry.timestamp === 'number' ? entry.timestamp : Number.NaN
         if (!Number.isFinite(ts)) continue
-        if (ts < startMs - 2000 || ts > endMs + 5000) continue
         const info = payload.info && typeof payload.info === 'object' ? (entry.info ?? payload.info) as Record<string, unknown> : null
         if (!info) continue
         const totalObj = info.total_token_usage && typeof info.total_token_usage === 'object' ? (info.total_token_usage as Record<string, unknown>) : null
         const lastObj = info.last_token_usage && typeof info.last_token_usage === 'object' ? (info.last_token_usage as Record<string, unknown>) : null
         const curTotal = totalObj && typeof totalObj.total_tokens === 'number' ? totalObj.total_tokens : null
         // Codex 单轮末尾可能连续写出两条 total_tokens 完全相同的 token_count 事件，跳过重复条
-        if (curTotal !== null && prevTotalTokens !== null && curTotal === prevTotalTokens) {
+        if (curTotal !== null && prevTotal !== null && curTotal === prevTotal.total) {
           continue
         }
-        if (curTotal !== null) prevTotalTokens = curTotal
-        const src = lastObj ?? totalObj
-        if (!src) continue
-        input += toNum(src.input_tokens)
-        output += toNum(src.output_tokens)
-        cacheRead += toNum(src.cached_input_tokens)
+        let inc: { input: number; output: number; cacheRead: number } | null = null
+        if (lastObj) {
+          inc = { input: toNum(lastObj.input_tokens), output: toNum(lastObj.output_tokens), cacheRead: toNum(lastObj.cached_input_tokens) }
+        } else if (totalObj) {
+          // 缺 last_token_usage 时用本条累计值与上一条累计值的差作增量；第一条没有上一条时取它本身
+          inc = {
+            input: toNum(toNum(totalObj.input_tokens) - (prevTotal?.input ?? 0)),
+            output: toNum(toNum(totalObj.output_tokens) - (prevTotal?.output ?? 0)),
+            cacheRead: toNum(toNum(totalObj.cached_input_tokens) - (prevTotal?.cacheRead ?? 0)),
+          }
+        }
+        if (totalObj) {
+          prevTotal = { input: toNum(totalObj.input_tokens), output: toNum(totalObj.output_tokens), cacheRead: toNum(totalObj.cached_input_tokens), total: curTotal }
+        }
+        if (!inc) continue
+        if (ts < startMs - 2000 || ts > endMs + 5000) continue
+        input += inc.input
+        output += inc.output
+        cacheRead += inc.cacheRead
+        if (matchedEvents === 0) firstTs = ts
         matchedEvents++
+      }
+      if (matchedEvents === 0) continue
+      // 多文件命中时只取首个命中事件时间离任务开始最近的那个
+      if (!best || Math.abs(firstTs - startMs) < Math.abs(best.firstTs - startMs)) {
+        best = { usage: { input, output, cacheRead, total: input + output + cacheRead }, firstTs }
       }
     }
   }
 
-  if (matchedEvents === 0) return null
-  return { input, output, cacheRead, total: input + output }
+  return best ? best.usage : null
 }
 
 // 读取 relay 外派任务（agy / grok）的 usage 字段
@@ -1472,9 +1501,44 @@ async function refreshVendors($: Engine) {
       }
     }
     await update($, vendors, () => data)
+    void loadDiscover($)
   } catch (err) {
     await update($, notice, () => ({ text: `读取厂商列表失败：${errText(err)}`, ok: false }))
   }
+}
+
+// 读新模型自动发现的最近一次结果；内容没变不写状态，免得定时刷新把厂商页整个重绘
+async function loadDiscover($: Engine) {
+  try {
+    const raw = await $.fs.read(`${HOME}/.claude/ai-relay/discover-state.json`)
+    const r = (JSON.parse(raw) as { lastResult?: Record<string, unknown> }).lastResult
+    if (!r || r.skipped || r.initial) return
+    const at = typeof r.at === 'string' ? r.at : ''
+    const added = (Array.isArray(r.added) ? r.added : []) as DiscoverAdded[]
+    const missed = [...(Array.isArray(r.unpooled) ? r.unpooled : []), ...(Array.isArray(r.failed) ? r.failed : [])] as DiscoverMiss[]
+    const next: DiscoverView = { at, added, missed }
+    const prev = await read($, discoverView)
+    if (JSON.stringify(prev) === JSON.stringify(next)) return
+    await update($, discoverView, () => next)
+  } catch {
+    // 还没跑过或文件损坏：不显示
+  }
+}
+
+// 定时请求一次后台探测（relay 按 6 小时节流、同一时间只跑一个），然后刷新显示
+async function triggerDiscover($: Engine) {
+  if (!(await read($, relayEnabled))) return
+  try {
+    await runRelay($, ['models', 'discover', '--background', '--json'], 30_000)
+  } catch {
+    // 探测失败不影响面板
+  }
+  await loadDiscover($)
+}
+
+async function undoDiscover($: Engine, id: string) {
+  await vendorAction($, `undo:${id}`, ['models', 'discover', '--undo', id], () => '已撤销这条自动接入')
+  await loadDiscover($)
 }
 
 // 进入厂商页或点刷新时取模型清单。失败只改这块的状态，不拖垮面板
@@ -1584,14 +1648,22 @@ async function switchMode($: Engine, mode: RelayMode) {
 }
 
 // 厂商操作的统一入口：标记忙碌、执行 relay、写提示、刷新两页数据
-async function vendorAction($: Engine, key: string, args: string[], okText: (stdout: string) => string, timeoutMs = 30_000) {
+async function vendorAction(
+  $: Engine,
+  key: string,
+  args: string[],
+  okText: (stdout: string) => string,
+  timeoutMs = 30_000,
+  failText?: (stdout: string) => string | null,
+) {
   if ((await read($, busy)) !== null) return false
   await update($, busy, () => key)
   let ok = false
   try {
     const { exitCode, stdout, stderr } = await runRelay($, args, timeoutMs)
     ok = exitCode === 0
-    const text = ok ? okText(stdout) : cleanErr(stderr) || cleanErr(stdout) || `失败（退出码 ${exitCode}）`
+    // 失败文案先用调用方从完整 stdout 里解析的结果，避免截断后的半截 JSON 直接露出来
+    const text = ok ? okText(stdout) : (failText?.(stdout) || cleanErr(stderr) || cleanErr(stdout) || `失败（退出码 ${exitCode}）`)
     await update($, notice, () => ({ text, ok }))
   } catch (err) {
     await update($, notice, () => ({ text: errText(err), ok: false }))
@@ -1628,17 +1700,16 @@ async function testVendor($: Engine, v: Vendor) {
       return `${v.label} 试运行成功（${r.seconds} 秒）：${r.output.replace(/\s+/g, ' ').slice(0, 60)}`
     },
     150_000,
+    // 试运行失败时 relay 退出码非 0，stdout 里仍是完整 JSON：在截断前解析出原因
+    stdout => {
+      try {
+        const r = JSON.parse(stdout) as { output?: string; timedOut?: boolean }
+        return `${v.label} 试运行失败${r.timedOut ? '（超时）' : ''}：${String(r.output ?? '').replace(/\s+/g, ' ').slice(0, 120)}`
+      } catch {
+        return null
+      }
+    },
   )
-  // 试运行失败时 relay 退出码非 0，stdout 里仍是 JSON；这里把原因读出来
-  const n = await read($, notice)
-  if (n && !n.ok && n.text.startsWith('{')) {
-    try {
-      const r = JSON.parse(n.text) as { output: string; timedOut: boolean }
-      await update($, notice, () => ({ text: `${v.label} 试运行失败${r.timedOut ? '（超时）' : ''}：${r.output.replace(/\s+/g, ' ').slice(0, 120)}`, ok: false }))
-    } catch {
-      // 保留原提示
-    }
-  }
 }
 
 function blankForm(data: VendorData, presetKey: string): AddForm {
@@ -1738,20 +1809,23 @@ function modelHasVision(v: Vendor, modelId: string): boolean {
   return Boolean(v.caps?.vision)
 }
 
-// 打开面板并切到对话页。已经开着就只切页，不把面板关掉
+// 打开面板并切到对话页。面板已开着也要再 open 一次：开着但没显示（被顶到别的标签后面）时，
+// 只有 open 能把它重新顶到前面，只切页签用户看不到任何变化；open 对已开的面板不会把它关掉
 async function openConversation($: Engine) {
   try {
     await update($, tab, () => 'jobs')
-    const panes = await $.ui.panes()
-    if (!panes.some(p => p.id === PANE)) {
-      await $.ui.open({ id: PANE, title: PANE_TITLE })
+    const wasOpen = (await $.ui.panes()).some(p => p.id === PANE)
+    const placed = await $.ui.open({ id: PANE, title: PANE_TITLE })
+    // 引擎没把面板放下（窗口太窄、没有能放面板的界面）时给个结果提示，不能点了没反应
+    if (placed && placed.isPlaced === false) $.ui.toast('面板暂未显示')
+    if (!wasOpen) {
       void refresh($)
       void refreshVendors($)
     }
     void refreshJobs($)
     void loadAllRounds($)
-  } catch {
-    // 打不开面板也不影响输入框
+  } catch (err) {
+    $.ui.toast(`打开面板失败：${errText(err).slice(0, 80)}`)
   }
 }
 
@@ -1826,7 +1900,9 @@ function mergedRound(base: Round, incoming: Round, startedAt: number): Round {
     status: mergedRoundStatus(base.status, incoming.status),
     agents: [...(base.agents ?? []), ...(incoming.agents ?? [])],
     selfLines: (base.selfLines ?? 0) + (incoming.selfLines ?? 0),
-    ...(base.selfReason || incoming.selfReason ? { selfReason: base.selfReason || incoming.selfReason } : {}),
+    ...(base.selfReason || incoming.selfReason
+      ? { selfReason: [...new Set([base.selfReason, incoming.selfReason].filter(Boolean))].join('；') }
+      : {}),
   }
 }
 
@@ -2097,6 +2173,11 @@ function startTimers($: Engine) {
   $.clock.every(BAND_TICK_MS, () => {
     void tickRunningBand($)
   })
+  // 新模型自动发现：启动时先请求一次，之后每 30 分钟请求一次
+  void triggerDiscover($)
+  $.clock.every(DISCOVER_TICK_MS, () => {
+    void triggerDiscover($)
+  })
 }
 
 /** 启停 ai-relay 插件：依次尝试 claude 命令路径，执行 plugin enable/disable */
@@ -2315,9 +2396,13 @@ export const register: Register = on => {
     if (!(await read($, relayEnabled))) return next(e)
     const result = await next(e)
     if (e.agentId !== undefined) return result
-    // 写在临时 / 草稿目录里的（派单、笔记）不是代码改动，不计入
+    // 被钩子拦下的编辑没有真正写进去，不计入
+    if ((result as { deny?: unknown } | undefined)?.deny !== undefined) return result
+    // 与 relay 钩子口径一致：临时 / 草稿目录（派单、计划、记忆）和文档文件都不是代码改动，不计入
     const file = e.tool === 'NotebookEdit' ? e.notebook_path : e.tool === 'Edit' || e.tool === 'Write' ? e.file_path : ''
     if (/^(\/private)?\/tmp\/|^\/var\/folders\//.test(file ?? '')) return result
+    if (/\/\.claude\/(plans|projects\/[^/]+\/memory)\//.test(file ?? '')) return result
+    if (/\.(md|markdown|mdx|txt|rst)$/i.test(file ?? '')) return result
     const text = e.tool === 'Edit' ? e.new_string : e.tool === 'Write' ? e.content : e.tool === 'NotebookEdit' ? e.new_source : ''
     const lines = text ? text.split('\n').length : 0
     if (lines > 0) {
@@ -2369,8 +2454,9 @@ export const register: Register = on => {
       const idx = all.findIndex(r => r.status === 'running')
       if (idx < 0) return all
       done = { ...all[idx]!, status: e.reason, finishedAt: now }
-      // 用户消息开始的这一轮：行数取 relay 钩子的统计（含 Bash 写入），并带上主管自己做的原因
-      if (selfStat && !isCarriedRound(done)) {
+      // 行数取 relay 钩子的统计（含 Bash 写入），并带上主管自己做的原因。
+      // 续跑轮次（后台任务通知唤醒）同样记下：显示时会并入前面的用户轮次，原因和行数不能丢
+      if (selfStat) {
         done = {
           ...done,
           selfLines: Math.max(done.selfLines ?? 0, selfStat.lines),
@@ -3123,6 +3209,27 @@ export const register: Register = on => {
       0,
     )
     const newModelsSuffix = totalNewModels > 0 ? ` · ${totalNewModels} 个新模型` : ''
+    // 新模型自动发现：最近 7 天内的结果显示在页首，自动接入的可以撤销
+    const disc = await read($, discoverView)
+    const discRecent = disc && disc.at && now - Date.parse(disc.at) < 7 * 86_400_000 ? disc : null
+    const DISC_TIER: Record<string, string> = { light: '轻档', mid: '中档', strong: '强档' }
+    const discoverBlock = discRecent && (discRecent.added.length > 0 || discRecent.missed.length > 0) && (
+      <Box flexDirection="column" rowGap={0} minWidth={0}>
+        {discRecent.added.map(a => (
+          <Box key={`disc-${a.id}`} flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1} minWidth={0}>
+            <Text size="caption" dimColor>
+              {`自动接入 ${a.provider} / ${a.family}${a.tier ? `（${DISC_TIER[a.tier] ?? a.tier}）` : ''}${a.roles?.length ? ` · ${a.roles.join('、')}` : ''} · ${fmtAgo(discRecent.at, now)}`}
+            </Text>
+            <Button key={`disc-undo-${a.id}`} label="撤销" dimColor onPress={() => void undoDiscover($, a.id)} />
+          </Box>
+        ))}
+        {discRecent.missed.map(m => (
+          <Text key={`disc-miss-${m.provider}-${m.family}`} size="caption" dimColor>
+            {`未接入 ${m.provider} / ${m.family}${m.reason ? `：${m.reason.slice(0, 40)}` : ''}`}
+          </Text>
+        ))}
+      </Box>
+    )
     const modelSection = (v: Vendor) => {
       const pools = v.modelPools ?? []
       const entry = modelsView.catalog?.providers?.[v.name]
@@ -3552,6 +3659,7 @@ export const register: Register = on => {
             {`模型列表${modelsAgo}${newModelsSuffix}`}
           </Text>
         )}
+        {discoverBlock}
       </Box>,
       workStatsCard,
       activeProviders.length > 0 && (

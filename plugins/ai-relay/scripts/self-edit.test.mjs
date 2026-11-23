@@ -167,7 +167,7 @@ test("带 --write 的 relay run 之后 decision 为 dispatch", () => {
       session_id: "s-run",
       cwd: "/work/proj",
       tool_input: { command: `node ${JSON.stringify(relay)} run grok --role implement --write` },
-      tool_response: { stdout: "已启动\n" },
+      tool_response: { stdout: "已后台启动任务 20261124000000-grok-abcd（grok / grok-4.7，implement，可写）\n" },
     }, home);
     assert.equal(res.status, 0, res.stderr);
     const stat = readEdits(home, "s-run");
@@ -687,6 +687,21 @@ test("同一条命令里普通写入仍计数", () => {
   });
 });
 
+test("relay run 被退回（没建出任务）或只读派单正文写了 --write，都不算定了可写分工", () => {
+  withHome((home) => {
+    setMode(home, "auto");
+    const cases = [
+      [`node ${JSON.stringify(relay)} run auto --role implement --write`, "首选是 Codex（…）。请用 Agent 工具…\n"],
+      [`node ${JSON.stringify(relay)} run grok --role review <<'E'\n正文提到 --write\nE`, "已后台启动任务 20261124000000-grok-abcd（grok / grok-4.7，review，只读）\n"],
+    ];
+    for (const [command, stdout] of cases) {
+      const res = runHook(postHook, { tool_name: "Bash", session_id: "s-nd", cwd: "/work/proj", tool_input: { command }, tool_response: { stdout } }, home);
+      assert.equal(res.status, 0, res.stderr);
+      assert.equal(readEdits(home, "s-nd").decision, null);
+    }
+  });
+});
+
 test("只读 relay run 之后编辑仍被拦", () => {
   withHome((home) => {
     setMode(home, "auto");
@@ -758,7 +773,7 @@ test("decision 为 dispatch 时超限不重置", () => {
       session_id: session,
       cwd: "/work/proj",
       tool_input: { command: `node ${JSON.stringify(relay)} run grok --role implement --write` },
-      tool_response: { stdout: "已启动\n" },
+      tool_response: { stdout: "已后台启动任务 20261124000000-grok-abcd（grok / grok-4.7，implement，可写）\n" },
     }, home);
     assert.equal(resRun.status, 0, resRun.stderr);
     assert.equal(readEdits(home, session).decision, "dispatch");

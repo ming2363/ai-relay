@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { parseGrokCredits, codexRows, rowsFromCodexSnapshot } from "./quota.mjs";
+import { parseGrokCredits, codexRows, rowsFromCodexSnapshot, refreshCache, cachedRows } from "./quota.mjs";
 import { poolStatus } from "./lib.mjs";
 
 const varint = (n) => {
@@ -167,4 +167,36 @@ test("app-server 的实时快照：已用 100% 是 5 小时剩 0，已用 47% �
   assert.equal(windowOf(rows, "weekly").remaining_fraction, 0.53);
   assert.equal(windowOf(rows, "weekly").reset_at, 1794463672 * 1000);
   assert.equal(rowsFromCodexSnapshot({ limitId: "other", primary: { usedPercent: 1, windowDurationMins: 300 } }, now).length, 0);
+});
+
+test("Codex 额度回退读本地会话日志时保留旧快照的 updated_at，不改成当前时间", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "ai-relay-codex-fallback-"));
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-relay-codex-state-"));
+  try {
+    const dir = path.join(home, ".codex", "sessions", "2026", "11", "06");
+    fs.mkdirSync(dir, { recursive: true });
+    const snapIso = "2026-11-06T03:38:23.716Z";
+    const snapMs = Date.parse(snapIso);
+    fs.writeFileSync(
+      path.join(dir, "session.jsonl"),
+      codexEvent(snapIso, {
+        primary: { used_percent: 25, window_minutes: 300, resets_at: 1793951647 },
+        secondary: { used_percent: 40, window_minutes: 10080, resets_at: 1794463675 },
+      }) + "\n",
+    );
+
+    const now = Date.parse("2026-11-06T06:00:00.000Z");
+    refreshCache({ stateDir, codexHome: home, codexLive: false, now });
+    const rows = cachedRows(stateDir).filter((r) => r.provider === "codex");
+    assert.equal(rows.length, 2);
+    assert.equal(windowOf(rows, "5h").updated_at, snapMs);
+    assert.equal(windowOf(rows, "weekly").updated_at, snapMs);
+
+    const cfg = { minRemaining: 0.15, lowRemaining: 0.3, staleMinutes: 15 };
+    const st = poolStatus(cfg, rows, "codex", "codex", now);
+    assert.equal(st.stale, true);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
 });

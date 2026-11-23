@@ -675,3 +675,133 @@ test("24. route 写 default 且有 defaultModels 时，候选 model 是实际模
   // 按实际模型 gemini-4-argon-high 查到 1 条同角色 fail，reliability 从 0.94 降为 0.76
   assert.equal(res.choice?.parts.reliability, 0.76);
 });
+
+test("25. 路由去重遇到同一 厂商|池|模型 时保留 fit 更高的条目（含 defaultModels 切到同模型和思考档合并）", () => {
+  const cfg = {
+    minRemaining: 0.15,
+    lowRemaining: 0.3,
+    providers: {
+      agy: {
+        via: "relay",
+        quota: { provider: "antigravity" },
+        defaultModels: {
+          gemini: "gemini-4-neon-xhigh",
+          "gemini-argon": "gemini-4-argon-high",
+        },
+        pools: {
+          gemini: ["gemini-4-neon-xhigh", "gemini-4-neon-high", "gemini-4-hydrogen-xhigh"],
+          "gemini-argon": ["gemini-4-argon-high", "gemini-4-argon-medium"],
+        },
+      },
+    },
+    routes: {
+      // default 解析为 gemini-4-neon-xhigh（fit 0.4）在前，末尾显式 Neon 条目（fit 0.9）在后
+      implement: [
+        "agy:gemini:default:0.4",
+        "agy:gemini-argon:default:0.85",
+        "agy:gemini:gemini-4-neon-xhigh:0.9",
+      ],
+      // 思考档换到最高档后同为 gemini-4-argon-high：低 fit 在前、高 fit 在后应留高 fit；同 fit 留先出现的
+      review: [
+        "agy:gemini-argon:gemini-4-argon-medium:0.6",
+        "agy:gemini-argon:gemini-4-argon-high:0.9",
+        "agy:gemini:gemini-4-neon-high:0.8",
+        "agy:gemini:gemini-4-neon-xhigh:0.8",
+      ],
+    },
+  };
+  const now = 1700000000000;
+  const rows = [
+    { provider: "antigravity", pool_id: "gemini", window_key: "5h", remaining_fraction: 0.9, reset_at: now + 4 * 3600000, allowance: "available", updated_at: now },
+    { provider: "antigravity", pool_id: "gemini-argon", window_key: "5h", remaining_fraction: 0.9, reset_at: now + 4 * 3600000, allowance: "available", updated_at: now },
+  ];
+
+  const impl = scoreRoute(cfg, rows, "implement", { now, level: "hard" });
+  const neons = [impl.choice, ...impl.alternatives].filter((c) => c.model === "gemini-4-neon-xhigh");
+  assert.equal(neons.length, 1);
+  assert.equal(impl.choice?.model, "gemini-4-neon-xhigh");
+  assert.equal(impl.choice?.parts.fit, 0.9);
+  assert.equal(impl.choice?.routeModel, "gemini-4-neon-xhigh");
+
+  const rev = scoreRoute(cfg, rows, "review", { now, level: "hard" });
+  assert.equal(rev.choice?.model, "gemini-4-argon-high");
+  assert.equal(rev.choice?.parts.fit, 0.9);
+  assert.equal(rev.choice?.routeModel, "gemini-4-argon-high");
+  const revNeon = rev.alternatives.find((c) => c.model === "gemini-4-neon-xhigh");
+  assert.equal(revNeon?.parts.fit, 0.8);
+  // 同 fit（0.8）时保留先出现的条目
+  assert.equal(revNeon?.routeModel, "gemini-4-neon-high");
+});
+
+test("26. 排序比较用未取整原始分：3 位小数取整并列时高原始分胜出，不再靠路由下标决胜", () => {
+  const cfg = {
+    minRemaining: 0.15,
+    lowRemaining: 0.3,
+    modelTiers: {
+      "provA:*": "strong",
+      "provB:*": "strong",
+    },
+    providers: {
+      provA: { via: "relay", quota: { provider: "provA" } },
+      provB: { via: "relay", quota: { provider: "provB" } },
+    },
+    routes: {
+      // provA 排在下标 0，provB 排在下标 1；两者 fit / reliability / speed / load 均相同
+      review: [
+        "provA:pA:mA:0.85",
+        "provB:pB:mB:0.85",
+      ],
+    },
+  };
+  const now = 1700000000000;
+  // hard 权重 fit=3, rel=3, quota=0.1, speed=0.25, load=0.25
+  // provA: pace=0 -> quota=0.800 -> rawScore ≈ 0.899984 -> round3 = 0.9
+  // provB: pace=+0.025 -> quota=0.815 -> rawScore ≈ 0.900237 -> round3 = 0.9
+  const rows = [
+    { provider: "provA", pool_id: "pA", window_key: "5h", remaining_fraction: 0.5, reset_at: now + 2.5 * 3600000, allowance: "available", updated_at: now },
+    { provider: "provB", pool_id: "pB", window_key: "5h", remaining_fraction: 0.525, reset_at: now + 2.5 * 3600000, allowance: "available", updated_at: now },
+  ];
+
+  const res = scoreRoute(cfg, rows, "review", { now, level: "hard" });
+  assert.equal(res.choice?.provider, "provB");
+  assert.equal(res.alternatives[0]?.provider, "provA");
+  // 对外返回的 score 字段仍保留 3 位小数（本例两者同为 0.9）
+  assert.equal(res.choice?.score, 0.9);
+  assert.equal(res.alternatives[0]?.score, 0.9);
+  // 内部排序字段不泄漏到返回对象
+  assert.equal("_rawScore" in res.choice, false);
+});
+
+test("27. calcReliability 跳过 quotaExhausted === true 的历史记录，不拉低可靠度", () => {
+  const cfg = {
+    minRemaining: 0.15,
+    lowRemaining: 0.3,
+    providers: {
+      agy: { via: "relay", quota: { provider: "antigravity" } },
+    },
+    routes: {
+      implement: ["agy:claude-gpt:claude-opus-5-5-high"],
+    },
+  };
+  const now = 1700000000000;
+  const rows = [
+    { provider: "antigravity", pool_id: "claude-gpt", window_key: "5h", remaining_fraction: 0.8, reset_at: now + 4 * 3600000, allowance: "available", updated_at: now },
+  ];
+
+  // 全部是额度耗尽导致的失败（含带 verdict: fail 和不带 verdict 两种）：跳过后可靠度保持默认 0.94
+  const onlyExhausted = [
+    { provider: "agy", model: "claude-opus-5-5-high", status: "failed", verdict: "fail", role: "implement", quotaExhausted: true },
+    { provider: "agy", model: "claude-opus-5-5-high", status: "failed", verdict: "fail", role: "implement", quotaExhausted: true },
+    { provider: "agy", model: "claude-opus-5-5-high", status: "failed", role: "implement", quotaExhausted: true },
+  ];
+  const resExhausted = scoreRoute(cfg, rows, "implement", { now, history: onlyExhausted });
+  assert.equal(resExhausted.choice?.parts.reliability, 0.94);
+
+  // 混入 1 条非额度耗尽的普通失败（quotaExhausted 为 false 或缺省）：只算这条普通失败，可靠度降为 0.76
+  const mixed = [
+    ...onlyExhausted,
+    { provider: "agy", model: "claude-opus-5-5-high", status: "failed", verdict: "fail", role: "implement", quotaExhausted: false },
+  ];
+  const resMixed = scoreRoute(cfg, rows, "implement", { now, history: mixed });
+  assert.equal(resMixed.choice?.parts.reliability, 0.76);
+});

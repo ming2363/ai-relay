@@ -93,17 +93,28 @@ export function levelOfBrief(text) {
   return null;
 }
 
-// 派给 Codex 的 prompt 里的运行参数。codex-rescue 会把全文任何位置的 --model / --effort 当运行参数，
-// 所以这里全文查找（--model x 和 --model=x 两种写法），全部拿出来交给钩子检查，并从正文里去掉；
-// 开头整行的其他参数（如 --background）原样保留。
-// 返回 { model, effort, conflict（同一参数写了不同的值）, others, rest（去掉参数后的派单正文） }
+// 派给 Codex 的 prompt 开头的运行参数：只从第一行起连续以 -- 开头的参数区提取 --model / --effort
+// （支持 --model x 和 --model=x，空行跳过），遇到第一行不以 -- 开头的非空行即结束，正文原样保留；
+// 参数区里的其他参数（如 --background）保留在 others。
+// 返回 { model, effort, conflict（同一参数写了不同的值）, others, rest（去掉参数区后的派单正文） }
 export function codexFlagsOf(text) {
   const values = { model: new Set(), effort: new Set() };
-  const cleaned = String(text || "").replace(/(^|[ \t])--(model|effort)(?:=|[ \t]+)([^\s]+)/gm, (_, lead, key, value) => {
-    values[key].add(value);
-    return lead;
+  // 全文提取并剥离 --model / --effort：正文里写的也可能被 Codex 采用，必须过档位检查，不能绕过；
+  // 只跳过 ``` / ~~~ 围起来的代码块，代码示例里的参数原样保留、不提取
+  const flagRe = /(^|[ \t])--(model|effort)(?:=|[ \t]+)([^\s]+)/g;
+  let inFence = false;
+  const cleaned = String(text || "").split(/\r?\n/).map((line) => {
+    if (/^\s*(```|~~~)/.test(line)) {
+      inFence = !inFence;
+      return line;
+    }
+    if (inFence) return line;
+    return line.replace(flagRe, (_, lead, key, value) => {
+      values[key].add(value);
+      return lead;
+    });
   });
-  const lines = cleaned.split(/\r?\n/);
+  const lines = cleaned;
   const others = [];
   let i = 0;
   for (; i < lines.length; i++) {
@@ -122,6 +133,26 @@ export function codexFlagsOf(text) {
   };
 }
 
+// 派单模板里的全部段落名：四处段落解析统一用它判断下一段何时开始，避免新增段落后漏同步
+const BRIEF_SECTIONS = [
+  "目标",
+  "背景",
+  "相关文件",
+  "写入范围",
+  "需要的能力",
+  "步骤",
+  "约束",
+  "验收标准",
+  "验证命令",
+  "交付格式",
+];
+
+// 构造某一段的结束边界正则：遇到 # 开头标题，或任一其它「段名：」行时结束本段
+function sectionBreakRe(currentSection) {
+  const others = BRIEF_SECTIONS.filter((name) => name !== currentSection);
+  return new RegExp(`^[ \\t]*(?:#|(?:${others.join("|")})[ \\t]*[:：])`);
+}
+
 // 从派单里读出写入范围
 export function scopeOfBrief(text) {
   const lines = String(text || "").split(/\r?\n/);
@@ -130,6 +161,7 @@ export function scopeOfBrief(text) {
 
   const titleWithHash = /^[ \t]*#{1,6}[ \t]*写入范围(?:\s*[（(][^）\n]*[）)])?[ \t]*[:：]?[ \t]*(.*)$/;
   const titleNoHash = /^[ \t]*写入范围[ \t]*[:：][ \t]*(.*)$/;
+  const breakRe = sectionBreakRe("写入范围");
 
   const addPath = (raw) => {
     let s = raw.replace(/^[\s\-*`]+/, "").replace(/[`\s]+$/, "");
@@ -161,7 +193,7 @@ export function scopeOfBrief(text) {
       }
       continue;
     }
-    if (/^[ \t]*#/.test(rawLine) || /^[ \t]*(?:目标|背景|相关文件|约束|验收标准|交付格式)[:：]/.test(rawLine)) {
+    if (breakRe.test(rawLine)) {
       break;
     }
     parseLine(rawLine);
@@ -177,6 +209,7 @@ export function needsOfBrief(text) {
   const chunks = [];
   const titleWithHash = /^[ \t]*#{1,6}[ \t]*需要的能力(?:\s*[（(][^）\n]*[）)])?[ \t]*[:：]?[ \t]*(.*)$/;
   const titleNoHash = /^[ \t]*需要的能力[ \t]*[:：][ \t]*(.*)$/;
+  const breakRe = sectionBreakRe("需要的能力");
 
   for (const rawLine of lines) {
     if (!inSection) {
@@ -187,7 +220,7 @@ export function needsOfBrief(text) {
       }
       continue;
     }
-    if (/^[ \t]*#/.test(rawLine) || /^[ \t]*(?:目标|背景|相关文件|写入范围|约束|验收标准|交付格式)[:：]/.test(rawLine)) {
+    if (breakRe.test(rawLine)) {
       break;
     }
     chunks.push(rawLine);
@@ -211,6 +244,7 @@ export function stepsOfBrief(text) {
   const body = [];
   const titleWithHash = /^[ \t]*#{1,6}[ \t]*步骤(?:\s*[（(][^）\n]*[）)])?[ \t]*[:：]?[ \t]*(.*)$/;
   const titleNoHash = /^[ \t]*步骤[ \t]*[:：][ \t]*(.*)$/;
+  const breakRe = sectionBreakRe("步骤");
 
   for (const rawLine of lines) {
     if (!inSection) {
@@ -221,7 +255,7 @@ export function stepsOfBrief(text) {
       }
       continue;
     }
-    if (/^[ \t]*#/.test(rawLine) || /^[ \t]*(?:目标|背景|相关文件|写入范围|需要的能力|约束|验收标准|交付格式)[:：]/.test(rawLine)) {
+    if (breakRe.test(rawLine)) {
       break;
     }
     body.push(rawLine);
@@ -248,6 +282,7 @@ export function verifyOfBrief(text) {
   const body = [];
   const titleWithHash = /^[ \t]*#{1,6}[ \t]*验证命令(?:\s*[（(][^）\n]*[）)])?[ \t]*[:：]?[ \t]*(.*)$/;
   const titleNoHash = /^[ \t]*验证命令[ \t]*[:：][ \t]*(.*)$/;
+  const breakRe = sectionBreakRe("验证命令");
 
   for (const rawLine of lines) {
     if (!inSection) {
@@ -258,7 +293,7 @@ export function verifyOfBrief(text) {
       }
       continue;
     }
-    if (/^[ \t]*#/.test(rawLine) || /^[ \t]*(?:目标|背景|相关文件|写入范围|需要的能力|约束|步骤|验收标准|交付格式)[:：]/.test(rawLine)) {
+    if (breakRe.test(rawLine)) {
       break;
     }
     body.push(rawLine);

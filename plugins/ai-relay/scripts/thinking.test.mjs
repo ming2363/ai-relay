@@ -40,9 +40,9 @@ test("旧配置升级：Grok 补 --reasoning-effort xhigh，自定义接口补�
   const rules = agy.poolRules.map((r) => r[0]);
   assert.ok(rules.indexOf("hydrogen") >= 0 && rules.indexOf("hydrogen") < rules.indexOf("flash"));
   assert.equal(agy.defaultModels.gemini, "gemini-4-hydrogen-xhigh");
-  assert.equal(agy.poolLabels.gemini, "Gemini Hydrogen / Flash");
+  assert.equal(agy.poolLabels.gemini, "Gemini Neon / Hydrogen / Flash");
   assert.ok(cfg.routes.quick.includes("agy:gemini:default"));
-  assert.deepEqual(cfg.migrated, ["max-thinking", "gemini-hydrogen"]);
+  assert.deepEqual(cfg.migrated, ["max-thinking", "gemini-hydrogen", "gemini-neon", "read-route-0.27"]);
 });
 
 test("旧配置升级只做一次：用户改过的默认模型不覆盖，升级后删掉的不再加回", () => {

@@ -2,6 +2,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { JOBS_DIR } from "./lib.mjs";
@@ -188,21 +189,33 @@ export function agyBlobMatchesCwd(data, targetCwd) {
   return false;
 }
 
-// 判断 agy SQLite 库是否匹配目标 cwd：trajectory_metadata_blob 为空或无 file:/// 时用 executor_metadata 兜底
-function agyDbMatchesCwd(db, targetCwd) {
+// 判断 agy SQLite 库与目标 cwd 的三态关系：
+// - "match"：属于目标 cwd
+// - "other"：元数据中明确包含其它目录的 file:/// 工作区 URI
+// - "unknown"：两张元数据表均无任何 file:/// 工作区 URI（库刚建立尚未写入元数据）
+export function agyDbMatchState(db, targetCwd) {
   let trajRows = [];
   try {
     trajRows = db.prepare("SELECT data FROM trajectory_metadata_blob").all();
   } catch {}
   const hasTrajUri = trajRows.some((r) => bufferHasFileUri(r?.data));
   if (hasTrajUri) {
-    return trajRows.some((r) => r?.data && agyBlobMatchesCwd(r.data, targetCwd));
+    return trajRows.some((r) => r?.data && agyBlobMatchesCwd(r.data, targetCwd)) ? "match" : "other";
   }
   let execRows = [];
   try {
     execRows = db.prepare("SELECT data FROM executor_metadata").all();
   } catch {}
-  return execRows.some((r) => r?.data && agyBlobMatchesCwd(r.data, targetCwd));
+  const hasExecUri = execRows.some((r) => bufferHasFileUri(r?.data));
+  if (hasExecUri) {
+    return execRows.some((r) => r?.data && agyBlobMatchesCwd(r.data, targetCwd)) ? "match" : "other";
+  }
+  return "unknown";
+}
+
+// 判断 agy SQLite 库是否匹配目标 cwd：trajectory_metadata_blob 为空或无 file:/// 时用 executor_metadata 兜底
+function agyDbMatchesCwd(db, targetCwd) {
+  return agyDbMatchState(db, targetCwd) === "match";
 }
 
 // 读取 jobsDir 下所有已有任务占用的 usage.source（可排除当前任务自身）
@@ -348,13 +361,62 @@ function resolveAgyDir(opts) {
   return opts?.agyDir || opts?.conversationsDir || DEFAULT_AGY_CONVERSATIONS_DIR;
 }
 
+function readAgyDbUsage(dbPath, source, opts) {
+  let db;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true });
+    const rows = db.prepare("SELECT data FROM gen_metadata ORDER BY idx").all();
+    let input = 0;
+    let output = 0;
+    let count = 0;
+    for (const r of rows) {
+      if (!r?.data) continue;
+      const u = readAgyGenMetadataUsage(r.data);
+      if (u) {
+        input += u.input;
+        output += u.output;
+        count++;
+      }
+    }
+    if (count > 0) {
+      const result = { input, output, cacheRead: 0, total: input + output, source };
+      if (opts?.usedSources instanceof Set) opts.usedSources.add(source);
+      return result;
+    }
+  } catch {} finally {
+    try {
+      db?.close();
+    } catch {}
+  }
+  return null;
+}
+
 export function agyUsageFor(job, opts = {}) {
   const win = jobTimeWindow(job);
   if (!win) return null;
   const convDir = resolveAgyDir(opts);
+  const usedSources = getUsedSourcesSet(job, opts);
+
+  // 优先复用运行期已识别并绑定到任务的 _matchedAgyDb（兼容复用创建时间在时间窗外的旧库）
+  if (typeof job?._matchedAgyDb === "string" && job._matchedAgyDb) {
+    const hasExplicitDir = typeof opts === "string" || Boolean(opts?.agyDir || opts?.conversationsDir);
+    const matchedSource = path.basename(job._matchedAgyDb);
+    let matchedPath = null;
+    if (path.isAbsolute(job._matchedAgyDb)) {
+      if (!hasExplicitDir || path.resolve(path.dirname(job._matchedAgyDb)) === path.resolve(convDir)) {
+        matchedPath = job._matchedAgyDb;
+      }
+    } else {
+      matchedPath = path.join(convDir, matchedSource);
+    }
+    if (matchedPath && !usedSources.has(matchedSource) && fs.existsSync(matchedPath)) {
+      const matchedUsage = readAgyDbUsage(matchedPath, matchedSource, opts);
+      if (matchedUsage) return matchedUsage;
+    }
+  }
+
   if (!fs.existsSync(convDir)) return null;
 
-  const usedSources = getUsedSourcesSet(job, opts);
   let files = [];
   try {
     files = fs.readdirSync(convDir).filter((f) => f.endsWith(".db"));
@@ -397,32 +459,8 @@ export function agyUsageFor(job, opts = {}) {
   candidates.sort((a, b) => a.createdMs - b.createdMs || a.source.localeCompare(b.source));
 
   for (const cand of candidates) {
-    let db;
-    try {
-      db = new DatabaseSync(cand.dbPath, { readOnly: true });
-      const rows = db.prepare("SELECT data FROM gen_metadata ORDER BY idx").all();
-      let input = 0;
-      let output = 0;
-      let count = 0;
-      for (const r of rows) {
-        if (!r?.data) continue;
-        const u = readAgyGenMetadataUsage(r.data);
-        if (u) {
-          input += u.input;
-          output += u.output;
-          count++;
-        }
-      }
-      if (count > 0) {
-        const result = { input, output, cacheRead: 0, total: input + output, source: cand.source };
-        if (opts?.usedSources instanceof Set) opts.usedSources.add(cand.source);
-        return result;
-      }
-    } catch {} finally {
-      try {
-        db?.close();
-      } catch {}
-    }
+    const usage = readAgyDbUsage(cand.dbPath, cand.source, opts);
+    if (usage) return usage;
   }
   return null;
 }
@@ -567,7 +605,7 @@ export function getGrokSessionActivityMtime(job, opts = {}) {
   return getDirMaxMtime(primary.sDir);
 }
 
-function getAgyDbMaxMtime(dbPath, includeShm = true) {
+function getAgyDbMaxMtime(dbPath, includeShm = false) {
   let maxMtime = 0;
   for (const suffix of includeShm ? ["", "-wal", "-shm"] : ["", "-wal"]) {
     try {
@@ -578,10 +616,93 @@ function getAgyDbMaxMtime(dbPath, includeShm = true) {
   return maxMtime;
 }
 
-// 只读探测也可能触碰 SHM；DB/WAL 不变时复用匹配结果，避免监测器自己制造持续活动。
+// 读取 .db 与 .db-wal 的最大修改时间与内容指纹（不含 -shm，避免只读探测触碰 -shm 触发重查）
+function getAgyDbContentInfo(dbPath) {
+  let contentMtime = 0;
+  const parts = [];
+  for (const suffix of ["", "-wal"]) {
+    try {
+      const st = fs.statSync(dbPath + suffix);
+      if (st.mtimeMs > contentMtime) contentMtime = st.mtimeMs;
+      parts.push(`${st.mtimeMs}:${st.ctimeMs}:${st.size}`);
+    } catch {
+      parts.push("");
+    }
+  }
+  return { contentMtime, contentSig: parts.join("|") };
+}
+
+// 只读探测也可能触碰 SHM；DB/WAL 内容未变时复用三态匹配结果，避免监测器自己制造持续活动。
 const agyActivityMatches = new Map();
 
-// 获取 Antigravity (agy) 会话日志文件的最新修改时间（.db、.db-wal、.db-shm 的最大 mtime）
+// 解析 lsof -n -P -F n 输出，提取 convDir 下被进程组打开的 agy 会话库文件名（归一化为 *.db）。
+// 若输出中不含任何进程记录，返回 null 表示未查到目标进程组。
+function parseLsofHeldAgyDbs(output, convDir) {
+  const convDirs = new Set([path.resolve(convDir)]);
+  try {
+    convDirs.add(fs.realpathSync(convDir));
+  } catch {}
+  const held = new Set();
+  let hasProcess = false;
+  for (const line of String(output || "").split(/\r?\n/)) {
+    if (!line) continue;
+    if (/^p\d+$/.test(line)) {
+      hasProcess = true;
+      continue;
+    }
+    if (!line.startsWith("n")) continue;
+    const filePath = line.slice(1);
+    if (!convDirs.has(path.dirname(filePath))) continue;
+    const base = path.basename(filePath);
+    if (/\.db(?:-wal|-shm)?$/.test(base)) {
+      held.add(base.replace(/-(?:wal|shm)$/, ""));
+    }
+  }
+  return hasProcess ? held : null;
+}
+
+function normalizeHeldAgyDbs(raw) {
+  if (raw == null) return null;
+  const held = new Set();
+  for (const item of raw) {
+    if (!item) continue;
+    held.add(path.basename(String(item)).replace(/-(?:wal|shm)$/, ""));
+  }
+  return held;
+}
+
+// 查询本任务进程组（pgid = job.childPid）打开的 conversations 目录下 agy 库文件名集合。
+// 返回 Set 表示成功拿到集合（可为空）；返回 null 表示拿不到进程信息（无 childPid 或 lsof 失败）。
+function getAgyHeldDbs(job, convDir, opts) {
+  if (
+    opts &&
+    typeof opts === "object" &&
+    Object.prototype.hasOwnProperty.call(opts, "heldAgyDbs") &&
+    opts.heldAgyDbs !== undefined
+  ) {
+    try {
+      const injected = typeof opts.heldAgyDbs === "function" ? opts.heldAgyDbs(job, convDir) : opts.heldAgyDbs;
+      return normalizeHeldAgyDbs(injected);
+    } catch {
+      return null;
+    }
+  }
+  const pgid = job?.childPid;
+  if (!Number.isInteger(pgid) || pgid <= 0) return null;
+  try {
+    const out = execFileSync("lsof", ["-n", "-P", "-F", "n", "-g", String(pgid)], {
+      encoding: "utf8",
+      timeout: 2000,
+      maxBuffer: 4 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return parseLsofHeldAgyDbs(out, convDir);
+  } catch {
+    return null;
+  }
+}
+
+// 获取 Antigravity (agy) 会话日志文件的最新修改时间（只看 .db 与 .db-wal，不把只读打开也会刷新的 -shm 算作员工活动）
 export function getAgySessionActivityMtime(job, opts = {}) {
   const win = jobTimeWindow(job);
   if (!win) return 0;
@@ -589,26 +710,27 @@ export function getAgySessionActivityMtime(job, opts = {}) {
   if (!fs.existsSync(convDir)) return 0;
 
   if (job?._matchedAgyDb && path.dirname(job._matchedAgyDb) === convDir && fs.existsSync(job._matchedAgyDb)) {
-    return getAgyDbMaxMtime(job._matchedAgyDb);
+    return getAgyDbMaxMtime(job._matchedAgyDb, false);
   }
 
   const usedSources = getUsedSourcesSet(job, opts);
+  const normCwd = normalizeCwd(job.cwd);
   let files = [];
   try {
     files = [...new Set(fs.readdirSync(convDir)
       .filter((f) => /\.db(?:-wal|-shm)?$/.test(f))
-      .map((f) => f.replace(/-(?:wal|shm)$/, "")))];
+      .map((f) => f.replace(/-(?:wal|shm)$/, "")))]
+      .filter((f) => !usedSources.has(f));
   } catch {
     return 0;
   }
+  if (!files.length) return 0;
 
+  const heldDbs = getAgyHeldDbs(job, convDir, opts);
   const candidates = [];
   let fallbackMtime = 0;
   for (const f of files) {
-    if (usedSources.has(f)) continue;
     const dbPath = path.join(convDir, f);
-    const activityMtime = getAgyDbMaxMtime(dbPath);
-    fallbackMtime = Math.max(fallbackMtime, activityMtime);
     let st;
     try {
       st = fs.statSync(dbPath);
@@ -616,29 +738,53 @@ export function getAgySessionActivityMtime(job, opts = {}) {
       continue;
     }
     const createdMs = st.birthtimeMs > 0 ? st.birthtimeMs : st.mtimeMs;
+
+    // 本任务进程组直接打开的库，无论元数据是 match/other/unknown 都视为本任务的库（兼容复用旧库）。
+    if (heldDbs?.has(f)) {
+      candidates.push({ source: f, dbPath, createdMs, activityMtime: getAgyDbMaxMtime(dbPath, false), held: true });
+      continue;
+    }
+
     // agy 可能复用旧库，活动识别不能用创建时间排除仍在写 WAL 的会话。
-    const contentMtime = getAgyDbMaxMtime(dbPath, false);
+    const { contentMtime, contentSig } = getAgyDbContentInfo(dbPath);
     if (contentMtime < win.minMs) continue;
-    const cached = agyActivityMatches.get(dbPath);
-    let matched = cached?.cwd === job.cwd && cached.mtime === contentMtime ? cached.matched : undefined;
-    if (matched === undefined) {
+
+    // 只看 .db 与 -wal 的修改时间，避免把只读探测或面板轮询触碰的 -shm 算成外部活动。
+    const activityMtime = getAgyDbMaxMtime(dbPath, false);
+    const cacheKey = `${dbPath}\0${normCwd}`;
+    const cached = agyActivityMatches.get(cacheKey);
+    let state = cached && cached.sig === contentSig ? cached.state : undefined;
+    if (state === undefined) {
       let db;
       try {
         db = new DatabaseSync(dbPath, { readOnly: true });
-        matched = agyDbMatchesCwd(db, job.cwd);
+        state = agyDbMatchState(db, job.cwd);
       } catch {
-        matched = false;
+        state = "unknown";
       } finally {
         try { db?.close(); } catch {}
       }
-      agyActivityMatches.set(dbPath, { cwd: job.cwd, mtime: contentMtime, matched });
+      // 打不开的库也按 DB/WAL 指纹缓存：否则每轮重开都会碰 -shm，把探测自己的动静当成活动无限续命；
+      // agy 真正写入时 DB/WAL 指纹会变，届时自然重查
+      agyActivityMatches.set(cacheKey, { cwd: normCwd, mtime: contentMtime, sig: contentSig, state });
     }
-    if (matched) candidates.push({ source: f, dbPath, createdMs, activityMtime });
+    if (state === "match") {
+      candidates.push({ source: f, dbPath, createdMs, activityMtime, held: false });
+    } else if (state === "unknown" || (state === "other" && heldDbs === null)) {
+      fallbackMtime = Math.max(fallbackMtime, activityMtime);
+    }
   }
 
-  // 初期元数据为空或仍指向旧 cwd 时不缓存猜测；有目录活动就保活，总时长上限仍生效。
+  // 尚未匹配到本任务库时：
+  // - "unknown"（两张元数据表均无工作区 URI）按时间窗保活，不缓存到 job._matchedAgyDb；
+  // - "other" 仅在拿不到进程打开集合时保守保活，拿到集合且确认未被本组打开时排除。
   if (!candidates.length) return fallbackMtime;
-  candidates.sort((a, b) => Math.abs(a.createdMs - win.startMs) - Math.abs(b.createdMs - win.startMs) || a.source.localeCompare(b.source));
+  candidates.sort((a, b) =>
+    (b.held ? 1 : 0) - (a.held ? 1 : 0) ||
+    (b.activityMtime >= win.minMs ? 1 : 0) - (a.activityMtime >= win.minMs ? 1 : 0) ||
+    Math.abs(a.createdMs - win.startMs) - Math.abs(b.createdMs - win.startMs) ||
+    a.source.localeCompare(b.source),
+  );
   const primary = candidates[0];
   if (job && typeof job === "object") {
     try { job._matchedAgyDb = primary.dbPath; } catch {}

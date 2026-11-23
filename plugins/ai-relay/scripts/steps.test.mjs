@@ -125,6 +125,101 @@ test("scoreRoute：困难任务和其他情况忽略 steps，行为不变", () =
   assert.equal(both.choice.provider, "midp");
 });
 
+test("scoreRoute：中等任务带 steps 时，分组为 够档位中档 → 够档位强档 → 放宽轻档，read 下强档优先于轻档", () => {
+  const cfg = {
+    minRemaining: 0.15,
+    lowRemaining: 0.3,
+    providers: {
+      agy: {
+        via: "relay",
+        quota: { provider: "antigravity" },
+        defaultModels: {
+          gemini: "gemini-4-hydrogen-xhigh",
+          "gemini-argon": "gemini-4-argon-high",
+        },
+        pools: {
+          gemini: ["gemini-4-neon-xhigh", "gemini-4-hydrogen-xhigh"],
+          "gemini-argon": ["gemini-4-argon-high"],
+        },
+      },
+      grok: {
+        via: "relay",
+        quota: { provider: "grok" },
+        pools: { "supergrok-weekly": ["default"] },
+      },
+    },
+    routes: {
+      // 模拟真实 read 路由：轻档 Hydrogen 排第 0 位（fit 1.0），强档 Argon/Neon 在后，中档 Grok 排最后
+      read: [
+        "agy:gemini:default:1.0",
+        "agy:gemini-argon:default:0.85",
+        "agy:gemini:gemini-4-neon-xhigh:0.8",
+        "grok:supergrok-weekly:default:0.7",
+      ],
+    },
+  };
+  const fullRows = [
+    row("antigravity", "gemini", 0.9),
+    row("antigravity", "gemini-argon", 0.9),
+    row("grok", "supergrok-weekly", 0.9),
+  ];
+
+  // 1) 三档都在时：中档 Grok → 强档 Argon / Neon → 放宽轻档 Hydrogen
+  const all = scoreRoute(cfg, fullRows, "read", { now: NOW, level: "medium", steps: true });
+  const tiers = [all.choice, ...all.alternatives].map((c) => c.tier);
+  assert.deepEqual(tiers, ["mid", "strong", "strong", "light"]);
+  assert.equal(all.choice.provider, "grok");
+  assert.equal(all.alternatives.at(-1).model, "gemini-4-hydrogen-xhigh");
+
+  // 2) 中档停用、只有强档和轻档时（真实 read 在线场景）：强档优先于轻档，绝不因 steps 反选轻档
+  const noMidCfg = structuredClone(cfg);
+  noMidCfg.providers.grok.enabled = false;
+  const noMid = scoreRoute(noMidCfg, fullRows, "read", { now: NOW, level: "medium", steps: true });
+  assert.equal(noMid.choice.tier, "strong");
+  assert.equal(noMid.alternatives[0].tier, "strong");
+  assert.equal(noMid.alternatives[1].model, "gemini-4-hydrogen-xhigh");
+  assert.equal(noMid.alternatives[1].tier, "light");
+});
+
+test("scoreRoute：中等任务带 steps 时，按量计费组内够档位在前、轻档在后；有够档位候选时绝不反选轻档", () => {
+  const cfg = {
+    minRemaining: 0.15,
+    lowRemaining: 0.3,
+    modelTiers: {
+      "agy:light-m": "light",
+      "maas:qwen4-max": "mid",
+      "maas:flash": "light",
+    },
+    providers: {
+      agy: { via: "relay", quota: { provider: "antigravity" }, pools: { g: ["light-m"] } },
+      maas: { via: "relay", billing: "metered", quota: { provider: "maas" }, pools: { maas: ["qwen4-max", "flash"] } },
+    },
+    routes: {
+      // 故意让轻档 fit 都高于中档，验证分组优先于分数
+      read: [
+        "agy:g:light-m:1.0",
+        "maas:maas:flash:0.95",
+        "maas:maas:qwen4-max:0.75",
+      ],
+    },
+  };
+  const rows = [row("antigravity", "g", 0.95)];
+
+  // 1) 会员仅剩轻档、按量有中档：按量中档够档位排第一，之后才是会员轻档、按量轻档
+  const res = scoreRoute(cfg, rows, "read", { now: NOW, level: "medium", steps: true });
+  assert.deepEqual(
+    [res.choice, ...res.alternatives].map((c) => `${c.provider}/${c.model}`),
+    ["maas/qwen4-max", "agy/light-m", "maas/flash"],
+  );
+
+  // 2) 仅按量（only: maas）：组内够档位 qwen4-max 在前，轻档 flash 在后
+  const maasOnly = scoreRoute(cfg, rows, "read", { now: NOW, level: "medium", steps: true, only: "maas" });
+  assert.deepEqual(
+    [maasOnly.choice, ...maasOnly.alternatives].map((c) => c.model),
+    ["qwen4-max", "flash"],
+  );
+});
+
 test("tierAllowed：第 4 个参数 steps 只对中等任务放宽一档", () => {
   assert.equal(tierAllowed("medium", "light"), false);
   assert.equal(tierAllowed("medium", "light", false, true), true);

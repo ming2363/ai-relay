@@ -10,9 +10,10 @@ import path from "node:path";
 import {
   RELAY_SCRIPT, JOBS_DIR, ensureStateDir, appendHistory, getMode, loadConfig,
   readSelfEdits, writeSelfEdits, editedLines, readHistory, gitSnapshot,
-  diffSnapshots, checkOutOfScope, readQuotaRows, claudeThrottle,
+  diffSnapshots, checkOutOfScope, readQuotaRows, claudeThrottle, maskSecrets,
   isScratchPath, isDocPath, readBashSnap, clearBashSnap, resolveRepos, lineSnapshot, handwrittenDelta, snapshotDelta,
-  selfEditLimitMessage, selfReadLimitMessage, bashWroteReminder, isRelayRunWriteCommand, bashReadCount,
+  selfEditLimitMessage, selfReadLimitMessage, bashWroteReminder, isRelayRunCommand, bashReadCount,
+  withoutOtherWriters, scopeLineSnapshot,
 } from "./lib.mjs";
 
 const EDIT_TOOLS = new Set(["Edit", "MultiEdit", "Write", "NotebookEdit"]);
@@ -41,6 +42,12 @@ function bashOutputText(res) {
   if (typeof res === "string") return res;
   if (res && typeof res === "object" && typeof res.stdout === "string") return res.stdout;
   return responseToText(res);
+}
+
+// relay run / rework 的输出里有「已后台启动任务 …（…，可写）」或前台结果头「任务 … · 可写 · 状态」才算建出了可写任务
+function createdWriteJob(out) {
+  const text = String(out || "");
+  return /已后台启动任务 \S+（[^）\n]*可写）/.test(text) || /^任务 \S+ · .* · 可写 · 状态/m.test(text);
 }
 
 // 取出 [relay-self] 那一行里的原因。面板直接显示这段文字。
@@ -92,13 +99,14 @@ async function handlePostBash(input) {
       stat.decision = "self";
       stat.bashPending = false;
       justSelf = true;
-    } else if (isRelayRunWriteCommand(command)) {
+    } else if (isRelayRunCommand(command) && createdWriteJob(bashOutputText(input.tool_response))) {
+      // 只认真正建出了可写任务的 relay run / rework：被退回的、只读的（哪怕正文里写了 --write）都不算定了分工
       stat.decision = "dispatch";
       stat.bashPending = false;
     }
   }
   let delta = 0;
-  const before = readBashSnap(sessionId);
+  const before = readBashSnap(sessionId, input.tool_use_id);
   if (before) {
     try {
       const cwd = typeof input.cwd === "string" && input.cwd ? input.cwd : process.cwd();
@@ -109,7 +117,7 @@ async function handlePostBash(input) {
     } catch {
       delta = 0;
     }
-    clearBashSnap(sessionId);
+    clearBashSnap(sessionId, input.tool_use_id);
   }
   if (delta > 0) {
     stat.lines += delta;
@@ -167,7 +175,7 @@ async function main() {
   const failed = !!(resp && typeof resp === "object" && (resp.is_error === true || resp.status === "failed" || resp.status === "error"));
 
   ensureStateDir();
-  let logText = responseToText(resp);
+  let logText = maskSecrets(responseToText(resp));
   if (logText.length > 20000) logText = logText.slice(-20000);
   try {
     fs.writeFileSync(path.join(JOBS_DIR, `${input.tool_use_id}.log`), logText);
@@ -181,7 +189,9 @@ async function main() {
   if (startEntry && startEntry.write) {
     const cwd = startEntry.cwd || input.cwd || process.cwd();
     const afterSnapshot = gitSnapshot(cwd);
-    const changedFiles = diffSnapshots(startEntry.snapshot, afterSnapshot);
+    // 归属：并行的其他可写任务改的文件不算 Codex 这次的改动
+    const jobView = { ...startEntry, cwd, finishedAt: new Date().toISOString() };
+    const changedFiles = withoutOtherWriters(jobView, diffSnapshots(startEntry.snapshot, afterSnapshot));
     outOfScope = checkOutOfScope(changedFiles, startEntry.scope, cwd);
     endEntry.changedFiles = changedFiles;
     endEntry.outOfScope = outOfScope;
@@ -190,7 +200,7 @@ async function main() {
       try {
         const before = startEntry.linesBefore;
         const after = await lineSnapshot(cwd, Object.keys(before.heads || {}), before.heads);
-        endEntry.changedLines = snapshotDelta(before, after);
+        endEntry.changedLines = snapshotDelta(scopeLineSnapshot(before, jobView), scopeLineSnapshot(after, jobView));
       } catch {}
     }
     if (startEntry.linesBefore) endEntry.linesBefore = null;

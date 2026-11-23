@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { Round, RoundAgent } from '../types'
-import { foldSystemRounds, maskSecrets } from './register'
+import { computeRoundTokens, foldSystemRounds, maskSecrets } from './register'
 
 type TestOn = Parameters<Extract<Parameters<typeof test>[1], (...args: never[]) => unknown>>[1]
 
@@ -232,6 +232,11 @@ function putRoundFile(sessionId: string, rounds: unknown, mtimeMs: number) {
   fileMap.set(`${ROUNDS_DIR}/${sessionId}.json`, { text: JSON.stringify(rounds), mtimeMs })
 }
 
+// 面板 open 调用记录；hiddenPanes 里的面板开着但没显示；unplacedOpen 为真时 open 回报没放下
+let openCalls: string[] = []
+let hiddenPanes = new Set<string>()
+let unplacedOpen = false
+
 function baseStubs(
   on: TestOn,
   opened = new Set<string>(),
@@ -297,15 +302,21 @@ function baseStubs(
     toastLog.push(e.text)
     return { value: undefined }
   })
+  openCalls = []
+  hiddenPanes = new Set()
+  unplacedOpen = false
   on('ui.open', (_, e) => {
+    openCalls.push(e.id)
     opened.add(e.id)
-    return { value: { isPlaced: true } }
+    // 再 open 一次会把开着但没显示的面板顶到前面
+    hiddenPanes.delete(e.id)
+    return { value: unplacedOpen ? { isPlaced: false, reason: '窗口太窄' } : { isPlaced: true } }
   })
   on('ui.close', (_, e) => {
     opened.delete(e.id)
     return { value: undefined }
   })
-  on('ui.panes', () => ({ value: [...opened].map(id => ({ id, title: '', isShown: true, isFocused: false, isPlaced: true })) }))
+  on('ui.panes', () => ({ value: [...opened].map(id => ({ id, title: '', isShown: !hiddenPanes.has(id), isFocused: false, isPlaced: true })) }))
   on('session.id', () => ({ value: 's-cur' }))
   on('session.cwd', () => ({ value: curCwd }))
   on('session.repo', () => ({ value: { root: '/projects/fj', remote: null, internal: false, name: 'fj' } }))
@@ -1768,6 +1779,104 @@ test('对话页详情：Token 消耗按模型列出主管、子代理、Codex、
   await ui.unmount()
 })
 
+// 构造 Codex rollout 的 token_count 事件行；total / last 传 null 表示不写对应字段
+function codexTokenLine(iso: string, total: Record<string, number> | null, last: Record<string, number> | null) {
+  const info: Record<string, unknown> = {}
+  if (total) info.total_token_usage = total
+  if (last) info.last_token_usage = last
+  return JSON.stringify({ timestamp: `2026-11-04T${iso}.000Z`, type: 'event_msg', payload: { type: 'token_count', info } })
+}
+
+// Codex 的用量对象：total_tokens = input + output（cached 是 input 的一部分）
+const cxUsage = (input: number, cached: number, output: number) => ({ input_tokens: input, cached_input_tokens: cached, output_tokens: output, total_tokens: input + output })
+
+// 只有一个 Codex 子代理、没有 relay 外派记录的轮次，用来直接测 computeRoundTokens 的 Codex 行
+function codexOnlyRound(startIso: string, endIso: string): Round {
+  const startedAt = Date.parse(`2026-11-04T${startIso}.000Z`)
+  const finishedAt = Date.parse(`2026-11-04T${endIso}.000Z`)
+  return {
+    id: 't-cx', text: '实现功能', mainModel: 'claude-opus-5-5',
+    startedAt, finishedAt, status: 'answer',
+    agents: [{ id: 'ag-codex:codex-rescue', toolUseId: 'tu-cx', subagentType: 'codex:codex-rescue', description: '实现功能', model: 'default', status: 'done', startedAt, finishedAt }],
+    selfLines: 0, sessionId: 's-cur', project: { name: 'fj', path: '/projects/fj' }, env: 'desktop',
+  }
+}
+
+// 直接调 computeRoundTokens 用的引擎桩：基于 fileMap 提供 fs / clock / env，不经过宿主转发
+function tokenEngine(now: number) {
+  return {
+    env: { get: async (name: string) => (name === 'HOME' ? TEST_HOME : undefined) },
+    clock: { now: async () => now },
+    fs: {
+      read: async (path: string) => fileMap.get(path)?.text ?? '{}',
+      exists: async (path: string) => fileMap.has(path),
+      list: async (path: string) => {
+        const prefix = path.endsWith('/') ? path : `${path}/`
+        const files: { name: string; kind: 'file'; size: number; mtimeMs: number; isLink: boolean }[] = []
+        const dirs = new Set<string>()
+        for (const [p, f] of fileMap) {
+          if (!p.startsWith(prefix)) continue
+          const rest = p.slice(prefix.length)
+          if (!rest) continue
+          const slash = rest.indexOf('/')
+          if (slash === -1) files.push({ name: rest, kind: 'file', size: f.text.length, mtimeMs: f.mtimeMs, isLink: false })
+          else dirs.add(rest.slice(0, slash))
+        }
+        return [...files, ...[...dirs].map(name => ({ name, kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false }))]
+      },
+    },
+  } as unknown as Parameters<typeof computeRoundTokens>[0]
+}
+
+test('Codex Token：缺 last_token_usage 时按累计差值计增量不翻倍，total 含缓存读', async ($, on) => {
+  const t = Date.parse('2026-11-04T07:05:00.000Z')
+  baseStubs(on, new Set<string>(), () => t)
+
+  const rollout = [
+    JSON.stringify({ timestamp: '2026-11-04T07:00:00.000Z', type: 'session_meta', payload: { id: 'cx-delta', cwd: '/projects/fj' } }),
+    // 时间窗前的累计事件：只作差值基线，不计入本轮
+    codexTokenLine('07:00:30', cxUsage(1000, 500, 100), null),
+    // 只有累计值：增量 = 与上一条的差 input 2000 / output 200 / cacheRead 1000
+    codexTokenLine('07:02:00', cxUsage(3000, 1500, 300), null),
+    // 有 last_token_usage：直接取本条增量 500 / 50 / 200
+    codexTokenLine('07:02:30', cxUsage(3500, 1700, 350), cxUsage(500, 200, 50)),
+    // 只有累计值：增量 500 / 50 / 300
+    codexTokenLine('07:03:00', cxUsage(4000, 2000, 400), null),
+    // 与上一条累计值完全相同的重复条：跳过
+    codexTokenLine('07:03:01', cxUsage(4000, 2000, 400), null),
+  ].join('\n')
+  fileMap.set(`${TEST_HOME}/.codex/sessions/2026/11/04/rollout-2026-11-04T07-01-10-delta.jsonl`, { text: rollout, mtimeMs: t })
+
+  const rows = await computeRoundTokens(tokenEngine(t), codexOnlyRound('07:01:10', '07:04:00'), [])
+  const codex = rows.find(row => row.label === 'Codex')?.usage
+  // total = input + output + cacheRead = 3000 + 300 + 1500，口径与 Claude / relay 外派一致
+  expect(codex).toEqual({ input: 3000, output: 300, cacheRead: 1500, total: 4800 })
+})
+
+test('Codex Token：同目录多个 rollout 命中时只计首个事件离任务开始最近的一个', async ($, on) => {
+  const t = Date.parse('2026-11-04T07:05:00.000Z')
+  baseStubs(on, new Set<string>(), () => t)
+
+  // 先写入较远的文件 B：若按文件顺序取第一个或把两个相加，结果都会错
+  const rolloutFar = [
+    JSON.stringify({ timestamp: '2026-11-04T07:01:39.000Z', type: 'session_meta', payload: { id: 'cx-far', cwd: '/projects/fj' } }),
+    codexTokenLine('07:01:40', cxUsage(9000, 4000, 900), cxUsage(9000, 4000, 900)),
+  ].join('\n')
+  fileMap.set(`${TEST_HOME}/.codex/sessions/2026/11/04/rollout-2026-11-04T07-01-39-far.jsonl`, { text: rolloutFar, mtimeMs: t })
+
+  // 文件 A 首个命中事件 07:01:12 离任务开始 07:01:10 最近，只计它
+  const rolloutNear = [
+    JSON.stringify({ timestamp: '2026-11-04T07:01:11.000Z', type: 'session_meta', payload: { id: 'cx-near', cwd: '/projects/fj' } }),
+    codexTokenLine('07:01:12', cxUsage(2000, 800, 200), cxUsage(2000, 800, 200)),
+    codexTokenLine('07:02:00', cxUsage(2600, 1000, 260), cxUsage(600, 200, 60)),
+  ].join('\n')
+  fileMap.set(`${TEST_HOME}/.codex/sessions/2026/11/04/rollout-2026-11-04T07-01-11-near.jsonl`, { text: rolloutNear, mtimeMs: t })
+
+  const rows = await computeRoundTokens(tokenEngine(t), codexOnlyRound('07:01:10', '07:04:00'), [])
+  const codex = rows.find(row => row.label === 'Codex')?.usage
+  expect(codex).toEqual({ input: 2600, output: 260, cacheRead: 1000, total: 3860 })
+})
+
 test('对话页详情：进行中的轮次每次打开详情重新计算 Token 消耗', async ($, on) => {
   let t = Date.parse('2026-11-04T09:00:00.000Z')
   baseStubs(on, new Set<string>(), () => t)
@@ -2700,6 +2809,65 @@ test('输入框上方：子任务结束后提示条消失', async ($, on) => {
   await $.turn.complete({ turnId: 't-end', agentId: 'ag-Explore', reason: 'answer', answer: '', durationMs: 1000, isAborted: false })
   expect(await bandLine(band)).not.toContain('个子任务进行中')
   expect(await band.find({ type: 'Button', key: 'relay-running-view' })).toBeUndefined()
+  await band.unmount()
+})
+
+test('输入框上方：定时刷新期间点查看仍能打开面板并切到对话页，面板已开着也只切页', async ($, on) => {
+  const T0 = Date.parse('2026-11-06T05:32:00.000Z')
+  const clock = mock.clock(on, { now: T0 })
+  const opened = baseStubs(on, new Set<string>(), () => clock.now(), undefined, '/projects/fj', { stubClock: false })
+  const relay = fakeRelay(on)
+  relay.jobs = JSON.stringify([
+    runningJob({ id: 'j-tick', provider: 'grok', model: 'default', startedAt: new Date(T0).toISOString(), task: goalTask('定时刷新中') }),
+  ])
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  await $.session.start({ cwd: '/projects/fj', surface: 'desktop', isInteractive: true })
+  await $.turn.start({ text: '刷新期间点查看', turnId: 't-tick' })
+
+  const band = await $.ui.mount({ ...ABOVE, surface: 'desktop' })
+  const footer = await $.ui.mount({ ...FOOTER, surface: 'desktop' })
+  expect(await bandLine(band)).toContain('⏳ 1 个子任务进行中')
+  // 先让提示条被定时刷新重绘几轮
+  for (let i = 0; i < 3; i++) {
+    await clock.advance(5_000)
+    expect(await bandLine(band)).toContain('⏳ 1 个子任务进行中')
+  }
+  await band.press({ key: 'relay-running-view' })
+  expect(opened.has('relay-quota')).toBe(true)
+  const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await pane.find({ type: 'Button', key: 'tab-jobs' }))?.props.variant).toBe('primary')
+
+  // 面板已开着、停在额度页：点查看只切页，不把面板关掉
+  await pane.press({ key: 'tab-quota' })
+  expect((await pane.find({ type: 'Button', key: 'tab-quota' }))?.props.variant).toBe('primary')
+  await clock.advance(5_000)
+  await band.press({ key: 'relay-running-view' })
+  expect(opened.has('relay-quota')).toBe(true)
+  expect((await pane.find({ type: 'Button', key: 'tab-jobs' }))?.props.variant).toBe('primary')
+  expect((await pane.find({ type: 'Button', key: 'tab-quota' }))?.props.variant).toBe('secondary')
+  // 面板开着但被顶到别的标签后面：点查看要重新 open 把它顶到前面
+  hiddenPanes.add('relay-quota')
+  openCalls.length = 0
+  await band.press({ key: 'relay-running-view' })
+  expect(openCalls).toEqual(['relay-quota'])
+  expect(hiddenPanes.has('relay-quota')).toBe(false)
+  await pane.unmount()
+  await footer.unmount()
+  await band.unmount()
+})
+
+test('输入框上方：查看按钮打开面板但引擎没放下时给出提示', async ($, on) => {
+  baseStubs(on)
+  fakeRelay(on)
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('agent.spawn', (_, e) => ({ model: 'claude-haiku-4-5-20251001', agentId: `ag-${e.subagentType}` }))
+  await $.session.start({ cwd: '/projects/fj', surface: 'desktop', isInteractive: true })
+  await $.turn.start({ text: '放不下', turnId: 't-unplaced' })
+  await $.agent.spawn({ tool_use_id: 'tu-unplaced', prompt: '看进度', description: '看进度', subagentType: 'Explore', provider: { plugin: 'engine', tier: 'core' }, parentModel: 'claude-opus-5-5', background: true, fork: false })
+  unplacedOpen = true
+  const band = await $.ui.mount({ ...ABOVE, surface: 'desktop' })
+  await band.press({ key: 'relay-running-view' })
+  expect(toastLog).toContain('面板暂未显示')
   await band.unmount()
 })
 
@@ -3815,13 +3983,13 @@ test('厂商页：模型清单 updatedAt 超过 6 小时打开时后台拉取，
 
   // 第一次打开厂商页：初始状态为 idle，触发一次拉取
   await ui.press({ key: 'tab-vendors' })
-  const callsAfterFirstOpen = relay.calls.filter(a => a[0] === 'models' && a.includes('--json')).length
+  const callsAfterFirstOpen = relay.calls.filter(a => a[0] === 'models' && a[1] !== 'discover' && a.includes('--json')).length
   expect(callsAfterFirstOpen).toBe(1)
 
   // 切到对话页，再切回厂商页（此时距离 updatedAt 依然只有 1 小时，未超过 6 小时）
   await ui.press({ key: 'tab-jobs' })
   await ui.press({ key: 'tab-vendors' })
-  const callsAfterSecondOpen = relay.calls.filter(a => a[0] === 'models' && a.includes('--json')).length
+  const callsAfterSecondOpen = relay.calls.filter(a => a[0] === 'models' && a[1] !== 'discover' && a.includes('--json')).length
   // 未超过 6 小时，不重新拉取
   expect(callsAfterSecondOpen).toBe(1)
 
@@ -3830,7 +3998,7 @@ test('厂商页：模型清单 updatedAt 超过 6 小时打开时后台拉取，
   await ui.press({ key: 'tab-jobs' })
   await ui.press({ key: 'tab-vendors' })
 
-  const callsAfterThirdOpen = relay.calls.filter(a => a[0] === 'models' && a.includes('--json')).length
+  const callsAfterThirdOpen = relay.calls.filter(a => a[0] === 'models' && a[1] !== 'discover' && a.includes('--json')).length
   // 超过 6 小时，多调一次 models --json
   expect(callsAfterThirdOpen).toBe(2)
 
@@ -4023,7 +4191,7 @@ test('厂商页：多池厂商未归池模型下拉选择后调用 provider pool
   await ui.select({ key: 'pool-rule-agy-gemini-4-hydrogen-pro', value: 'gemini-argon' })
   expect(relay.calls.some(a => a.join(' ') === 'provider pool-rule agy gemini-4-hydrogen-pro gemini-argon')).toBe(true)
   // 成功后刷新模型清单和厂商数据
-  expect(relay.calls.filter(a => a[0] === 'models' && a.includes('--json')).length).toBeGreaterThanOrEqual(2)
+  expect(relay.calls.filter(a => a[0] === 'models' && a[1] !== 'discover' && a.includes('--json')).length).toBeGreaterThanOrEqual(2)
   expect(relay.calls.filter(a => a[0] === 'providers' && a.includes('--json')).length).toBeGreaterThanOrEqual(2)
   // 归池后不再在未归池区显示，并进入 Gemini Argon 默认模型选项
   expect(await ui.find({ type: 'Select', key: 'pool-rule-agy-gemini-4-hydrogen-pro' })).toBeUndefined()
@@ -4099,4 +4267,30 @@ test('额度页：lastCycles 仅显示 reliable 为 true 的上个周期剩余�
   expect(await ui.find({ type: 'Text', text: '上个本周周期剩 42% 未用' })).toBeUndefined()
 
   await ui.unmount()
+})
+
+test('厂商页：新模型自动发现的结果显示在页首，自动接入的可撤销；启动时请求一次后台探测', async ($, on) => {
+  baseStubs(on, new Set<string>(), () => NOW)
+  const relay = fakeRelay(on)
+  fileMap.set(`${TEST_HOME}/.claude/ai-relay/discover-state.json`, {
+    text: JSON.stringify({
+      lastResult: {
+        at: new Date(NOW - 3600_000).toISOString(),
+        added: [{ id: 'disc-1', provider: 'agy', family: 'gemini-5-xenon', tier: 'strong', roles: ['implement', 'deep'] }],
+        unpooled: [{ provider: 'agy', family: 'gemini-pro-orchestrator-g1-pro', reason: '归不进额度池' }],
+        failed: [],
+      },
+    }),
+    mtimeMs: NOW,
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab-vendors' })
+
+  expect(relay.calls.some(a => a.join(' ') === 'models discover --background --json')).toBe(true)
+  expect(await ui.find({ type: 'Text', text: /自动接入 agy \/ gemini-5-xenon（强档） · implement、deep/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /未接入 agy \/ gemini-pro-orchestrator-g1-pro：归不进额度池/ })).toBeDefined()
+
+  await ui.press({ key: 'disc-undo-disc-1' })
+  expect(relay.calls.some(a => a.join(' ') === 'models discover --undo disc-1')).toBe(true)
 })

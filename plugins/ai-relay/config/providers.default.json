@@ -105,6 +105,10 @@
           "gemini"
         ],
         [
+          "neon",
+          "gemini"
+        ],
+        [
           "flash",
           "gemini"
         ],
@@ -116,7 +120,7 @@
       "poolLabels": {
         "gemini-argon": "Gemini Argon",
         "claude-gpt": "Claude / GPT",
-        "gemini": "Gemini Hydrogen / Flash"
+        "gemini": "Gemini Neon / Hydrogen / Flash"
       },
       "defaultModels": {
         "gemini-argon": "gemini-4-argon-high",
@@ -139,6 +143,10 @@
           "gpt-oss-120b-medium"
         ],
         "gemini": [
+          "gemini-4-neon-xhigh",
+          "gemini-4-neon-high",
+          "gemini-4-neon-medium",
+          "gemini-4-neon-low",
           "gemini-4-hydrogen-xhigh",
           "gemini-4-hydrogen-high",
           "gemini-4-hydrogen-medium",
@@ -210,6 +218,7 @@
       "codex:codex:gpt-6.1-sol",
       "codex:codex:gpt-6.1-terra:0.95",
       "agy:gemini-argon:default:0.9",
+      "agy:gemini:gemini-4-neon-xhigh:0.9",
       "grok:supergrok-weekly:default:0.85",
       "agy:claude-gpt:claude-sonnet-5-5-high:0.55",
       "codex:codex:gpt-6-luna:0.5",
@@ -221,6 +230,7 @@
       "grok:supergrok-weekly:default:0.85",
       "codex:codex:gpt-6.1-terra:0.8",
       "agy:gemini-argon:default:0.7",
+      "agy:gemini:gemini-4-neon-xhigh:0.75",
       "agy:claude-gpt:default:0.55",
       "codex:codex:gpt-6-luna:0.45",
       "agy:gemini:default:0.4"
@@ -228,16 +238,19 @@
     "review": [
       "grok:supergrok-weekly:default",
       "agy:gemini-argon:default:0.85",
+      "agy:gemini:gemini-4-neon-xhigh:0.8",
       "agy:gemini:default:0.7",
       "codex:codex:gpt-6.1-sol:0.55"
     ],
     "read": [
       "agy:gemini:default",
-      "agy:gemini-argon:gemini-4-argon-medium",
-      "grok:supergrok-weekly:default"
+      "agy:gemini-argon:default:0.85",
+      "agy:gemini:gemini-4-neon-xhigh:0.8",
+      "grok:supergrok-weekly:default:0.7"
     ],
     "deep": [
       "agy:gemini-argon:default",
+      "agy:gemini:gemini-4-neon-xhigh:0.95",
       "codex:codex:gpt-6-astra:0.9",
       "agy:claude-gpt:default:0.85",
       "codex:codex:gpt-6.1-sol:0.7"
@@ -249,6 +262,7 @@
     "claude-backup": [
       "agy:claude-gpt:default",
       "agy:gemini-argon:default:0.85",
+      "agy:gemini:gemini-4-neon-xhigh:0.8",
       "codex:codex:gpt-6.1-sol:0.7"
     ]
   }

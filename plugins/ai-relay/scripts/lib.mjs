@@ -42,25 +42,85 @@ function readMeteredUsage() {
   return {};
 }
 
+// 原子写文件：先写同目录临时文件再 rename，避免并发读到半截内容
+export function writeFileAtomic(file, content) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+  try {
+    fs.writeFileSync(tmp, content);
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch {}
+    throw e;
+  }
+}
+
+// 通用同步文件锁：用 wx 抢 .lock 文件，短暂重试，超时约 2 秒；锁文件超过约 10 秒视为陈旧可删。
+// 拿不到锁时退化为原行为直接执行 fn，不抛错影响主流程。
+export function withFileLock(file, fn, { timeoutMs = 2000, staleMs = 10_000, retryMs = 0 } = {}) {
+  const lock = `${file}.lock`;
+  try {
+    fs.mkdirSync(path.dirname(lock), { recursive: true });
+  } catch {}
+  const deadline = Date.now() + timeoutMs;
+  let acquired = false;
+  while (Date.now() <= deadline) {
+    try {
+      const fd = fs.openSync(lock, "wx");
+      try {
+        fs.closeSync(fd);
+      } catch {}
+      acquired = true;
+      break;
+    } catch (err) {
+      if (err.code !== "EEXIST") break;
+      try {
+        const st = fs.statSync(lock);
+        if (Date.now() - st.mtimeMs > staleMs) {
+          const staleTmp = `${lock}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.stale`;
+          try {
+            fs.renameSync(lock, staleTmp);
+            fs.unlinkSync(staleTmp);
+          } catch {}
+          continue;
+        }
+      } catch {}
+      if (Date.now() >= deadline) break;
+      const waitMs = retryMs > 0 ? retryMs : 10 + Math.floor(Math.random() * 15);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waitMs);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    if (acquired) {
+      try { fs.unlinkSync(lock); } catch {}
+    }
+  }
+}
+
 // 按本地日期累加用量，只保留最近 7 天（含今天，即从今天往前推 6 天起）。
 export function recordMeteredUsage(provider, tokens, now = Date.now()) {
   const key = localDateKey(now);
   const n = Number(tokens);
   if (!Number.isFinite(n) || n <= 0) return;
   ensureStateDir();
-  const data = readMeteredUsage();
-  const cutoff = new Date(now);
-  cutoff.setDate(cutoff.getDate() - 6);
-  const cutoffKey = localDateKey(cutoff.getTime());
-  const kept = {};
-  for (const [day, byProvider] of Object.entries(data)) {
-    if (day < cutoffKey) continue;
-    if (byProvider && typeof byProvider === "object" && !Array.isArray(byProvider)) {
-      kept[day] = { ...byProvider };
+  const file = meteredUsagePath();
+  withFileLock(file, () => {
+    const data = readMeteredUsage();
+    const cutoff = new Date(now);
+    cutoff.setDate(cutoff.getDate() - 6);
+    const cutoffKey = localDateKey(cutoff.getTime());
+    const kept = {};
+    for (const [day, byProvider] of Object.entries(data)) {
+      if (day < cutoffKey) continue;
+      if (byProvider && typeof byProvider === "object" && !Array.isArray(byProvider)) {
+        kept[day] = { ...byProvider };
+      }
     }
-  }
-  kept[key] = { ...(kept[key] || {}), [provider]: (Number(kept[key]?.[provider]) || 0) + Math.round(n) };
-  fs.writeFileSync(meteredUsagePath(), JSON.stringify(kept, null, 2) + "\n");
+    kept[key] = { ...(kept[key] || {}), [provider]: (Number(kept[key]?.[provider]) || 0) + Math.round(n) };
+    writeFileAtomic(file, JSON.stringify(kept, null, 2) + "\n");
+  });
 }
 
 // 某厂商当天已累计的 token 数；没有记录返回 0
@@ -334,6 +394,45 @@ function migrateHydrogen(cfg, def) {
   });
 }
 
+// Gemini Neon（0.26）：Neon 模型进 gemini 池（官方额度组与 Hydrogen / Flash 同组）、补归池规则和各角色的 Neon 路由。
+// 只补缺的，用户删掉的不再加回（migrateOnce）
+const OLD_GEMINI_LABEL = "Gemini Hydrogen / Flash";
+function migrateNeon(cfg, def) {
+  const dp = def.providers?.agy;
+  const p = cfg.providers?.agy;
+  if (!dp || !p?.pools?.gemini) return false;
+  return migrateOnce(cfg, "gemini-neon", () => {
+    const neon = (dp.pools?.gemini || []).filter((m) => /neon/i.test(m));
+    p.pools.gemini = [...neon.filter((m) => !p.pools.gemini.includes(m)), ...p.pools.gemini];
+    const rule = (dp.poolRules || []).find((r) => Array.isArray(r) && r[0] === "neon");
+    if (rule && Array.isArray(p.poolRules) && !p.poolRules.some((r) => Array.isArray(r) && /neon/i.test(String(r[0])))) {
+      const at = p.poolRules.findIndex((r) => Array.isArray(r) && r[0] === "flash");
+      p.poolRules.splice(at < 0 ? p.poolRules.length : at, 0, [...rule]);
+    }
+    if (p.poolLabels?.gemini === OLD_GEMINI_LABEL && dp.poolLabels?.gemini) p.poolLabels.gemini = dp.poolLabels.gemini;
+    for (const [role, fresh] of Object.entries(def.routes || {})) {
+      const route = cfg.routes?.[role];
+      if (!Array.isArray(route) || !Array.isArray(fresh)) continue;
+      for (const e of fresh) {
+        if (/:gemini-4-neon/.test(e) && !route.some((x) => x.split(":").slice(0, 3).join(":") === e.split(":").slice(0, 3).join(":"))) route.push(e);
+      }
+    }
+  });
+}
+
+// read 路由（0.27）：旧写法 gemini-4-argon-medium 会让 pick 选出 high、run 点名时又按 medium 判档位自己拒掉；
+// grok 没写擅长度、按位置算，插入新条目后会漂移。用户改过的条目不动
+function migrateReadRoute(cfg) {
+  if (!Array.isArray(cfg.routes?.read)) return false;
+  return migrateOnce(cfg, "read-route-0.27", () => {
+    cfg.routes.read = cfg.routes.read.map((e) => {
+      if (e === "agy:gemini-argon:gemini-4-argon-medium") return "agy:gemini-argon:default:0.85";
+      if (e === "grok:supergrok-weekly:default") return "grok:supergrok-weekly:default:0.7";
+      return e;
+    });
+  });
+}
+
 export function migrateModelFields(cfg, def) {
   if (!def) {
     try {
@@ -345,6 +444,8 @@ export function migrateModelFields(cfg, def) {
   let changed = migrateCodexRoutes(cfg, def);
   if (migrateMaxThinking(cfg, def)) changed = true;
   if (migrateHydrogen(cfg, def)) changed = true;
+  if (migrateNeon(cfg, def)) changed = true;
+  if (migrateReadRoute(cfg)) changed = true;
   const freshDefaults = new Set();
   for (const [name, dp] of Object.entries(def.providers || {})) {
     const p = cfg.providers?.[name];
@@ -861,6 +962,8 @@ export function allJobRecords(limit = Infinity) {
           ...(j.autoReviewId ? { autoReviewId: j.autoReviewId } : {}),
           ...(j.autoReviewSkipped ? { autoReviewSkipped: j.autoReviewSkipped } : {}),
           ...(j.autoReviewOf ? { autoReviewOf: j.autoReviewOf } : {}),
+          // 员工报额度用完的失败不是能力问题，打分算可靠度时跳过
+          ...(j.quotaExhausted ? { quotaExhausted: true } : {}),
         };
       } catch {
         return null;
@@ -868,11 +971,13 @@ export function allJobRecords(limit = Infinity) {
     })
     .filter(Boolean);
   const codexJobs = readHistory().map((h) => ({
-    changedFiles: Array.isArray(h.changedFiles) ? h.changedFiles.length : (h.changedFiles || 0),
     finishedAt: null, role: null, reason: "", verdict: null, verdictNote: "",
     ...h,
-    // Codex 运行中的行数前快照、原派单全文只给钩子和初审用，不往外带
+    // 派生字段放在展开之后，避免被原记录覆盖：改动文件只给数量
+    changedFiles: Array.isArray(h.changedFiles) ? h.changedFiles.length : (h.changedFiles || 0),
+    // Codex 运行中的行数前快照、git 快照、原派单全文只给钩子和初审用，不往外带
     linesBefore: undefined,
+    snapshot: undefined,
     brief: undefined,
     scope: h.scope ?? null,
     outOfScope: h.outOfScope ?? null,
@@ -884,7 +989,28 @@ export function allJobRecords(limit = Infinity) {
 }
 
 // 会话工作区根：git 仓库取仓库根，不是仓库时就是目录本身。Codex 沙箱只能写这个根里面
+const repoRootCache = new Map();
 export function workspaceRoot(dir) {
+  const key = path.resolve(dir || process.cwd());
+  if (repoRootCache.has(key)) return repoRootCache.get(key);
+  const root = workspaceRootUncached(key);
+  repoRootCache.set(key, root);
+  return root;
+}
+
+// git status --porcelain 输出的路径（相对仓库根）换成相对 cwd；cwd 以外的返回 null
+export function repoPathToCwd(cwd, p) {
+  let base = path.resolve(cwd || process.cwd());
+  // git 给的仓库根已解析符号链接（如 macOS 的 /var → /private/var），cwd 也要换成真实路径再比
+  try { base = fs.realpathSync(base); } catch {}
+  const abs = path.resolve(workspaceRoot(base), p);
+  const rel = path.relative(base, abs);
+  if (!rel) return ".";
+  if (rel.startsWith("..") || path.isAbsolute(rel)) return null;
+  return rel.split(path.sep).join("/");
+}
+
+function workspaceRootUncached(dir) {
   try {
     const out = execFileSync("git", ["-C", dir, "rev-parse", "--show-toplevel"], {
       encoding: "utf8",
@@ -950,13 +1076,24 @@ export function isPathInScope(filePath, scope, cwd) {
   return normList.some((s) => normFile === s || normFile.startsWith(s + "/"));
 }
 
-export function runningWriters(cwd, now = Date.now(), maxMinutes = 240) {
+export function runningWriters(cwd, now = Date.now(), maxMinutes = 240, idleMinutes) {
   const targetCwd = path.resolve(cwd);
   const maxMs = maxMinutes * 60_000;
+  let idleMin = Number(idleMinutes);
+  if (!Number.isFinite(idleMin) || idleMin <= 0) {
+    try {
+      idleMin = Number(loadConfig()?.idleTimeoutMin);
+    } catch {}
+  }
+  if (!Number.isFinite(idleMin) || idleMin <= 0) idleMin = 20;
+  const idleMs = idleMin * 60_000;
+  let activityMtime;
+  const targetRoot = workspaceRoot(targetCwd);
   return allJobRecords().filter((r) => {
     if (r.status !== "running") return false;
     if (!r.write) return false;
-    if (path.resolve(r.cwd || "") !== targetCwd) return false;
+    const rCwd = path.resolve(r.cwd || "");
+    if (rCwd !== targetCwd && workspaceRoot(rCwd) !== targetRoot) return false;
     const startMs = Date.parse(r.startedAt);
     if (Number.isNaN(startMs)) return false;
     const elapsed = now - startMs;
@@ -967,16 +1104,38 @@ export function runningWriters(cwd, now = Date.now(), maxMinutes = 240) {
       } catch (e) {
         if (e.code === "ESRCH") return false;
       }
+    } else if (elapsed > idleMs) {
+      // 无 pid 的 Codex 可写记录：超过 idleTimeoutMin 且工作区最近 idleTimeoutMin 内无活动时视为已失效
+      if (activityMtime === undefined) {
+        activityMtime = getWorkspaceActivityMtime(targetCwd);
+      }
+      if (!activityMtime || now - activityMtime > idleMs) return false;
     }
     return true;
-  });
+  }).map((r) => {
+    const rCwd = path.resolve(r.cwd || "");
+    if (rCwd === targetCwd) return r;
+    return { ...r, scope: rebaseScope(r.scope, rCwd, targetCwd) };
+  }).filter((r) => r.scope === null || r.scope.length > 0);
+}
+
+// 把别的目录下任务的写入范围换算成相对 targetCwd：覆盖 targetCwd 的记为 "."，落在 targetCwd 以外的丢掉
+function rebaseScope(scope, fromCwd, targetCwd) {
+  const list = Array.isArray(scope) && scope.length ? scope : ["."];
+  const out = [];
+  for (const s of list) {
+    const abs = path.resolve(fromCwd, s);
+    if (isInside(targetCwd, abs)) out.push(".");
+    else if (isInside(abs, targetCwd)) out.push(path.relative(targetCwd, abs).split(path.sep).join("/"));
+  }
+  return [...new Set(out)];
 }
 
 export function withWriteLock(cwd, fn) {
   ensureStateDir();
   const locksDir = path.join(STATE_DIR, "locks");
   fs.mkdirSync(locksDir, { recursive: true });
-  const key = crypto.createHash("sha1").update(path.resolve(cwd || process.cwd())).digest("hex").slice(0, 12);
+  const key = crypto.createHash("sha1").update(workspaceRoot(cwd || process.cwd())).digest("hex").slice(0, 12);
   const lockDir = path.join(locksDir, `${key}.lock`);
   const deadline = Date.now() + 5000;
   let acquired = false;
@@ -1052,7 +1211,8 @@ export function parseGitStatusPath(line) {
 export function gitSnapshot(cwd) {
   try {
     // --untracked-files=all：新建目录里的文件逐个列出，否则只显示成「?? 目录/」，判断写入范围时会误报越界
-    const raw = execFileSync("git", ["-C", cwd, "-c", "core.quotePath=false", "status", "--porcelain", "--untracked-files=all"], {
+    // pathspec "." 只看 cwd 子树；路径相对仓库根，按仓库根解析
+    const raw = execFileSync("git", ["-C", cwd, "-c", "core.quotePath=false", "status", "--porcelain", "--untracked-files=all", "--", "."], {
       encoding: "utf8",
       // 未跟踪文件逐个列出后输出会变大，默认 1MB 不够时整张快照会丢，越界检查也跟着失效
       maxBuffer: 64 * 1024 * 1024,
@@ -1064,7 +1224,7 @@ export function gitSnapshot(cwd) {
       for (const p of parseGitStatusPaths(line)) {
         if (!files[p]) {
           try {
-            const st = fs.statSync(path.resolve(cwd, p));
+            const st = fs.statSync(path.resolve(workspaceRoot(cwd), p));
             files[p] = `${st.size}:${st.mtimeMs}`;
           } catch {
             files[p] = "missing";
@@ -1103,12 +1263,70 @@ export function diffSnapshots(before, after) {
 export const changedFilesFromSnapshots = diffSnapshots;
 export const computeChangedFiles = diffSnapshots;
 
+// ---------- 并行外派时的改动归属 ----------
+// git 快照以整个仓库为粒度：同一仓库里同时跑的其他可写任务（或主管）改的文件也会出现在本任务的前后差里。
+// 归属规则：在本任务写入范围外、又落在「时间上重叠的其他可写任务」写入范围内的文件，算别人的，不算本任务的改动。
+function realDir(p) {
+  try { return fs.realpathSync(p); } catch { return path.resolve(p); }
+}
+
+function scopeDirsOf(rec) {
+  const base = realDir(rec.cwd || process.cwd());
+  const list = Array.isArray(rec.scope) && rec.scope.length ? rec.scope : ["."];
+  return list.map((s) => path.resolve(base, s));
+}
+
+// 绝对路径是否在任务的写入范围内
+export function inJobScope(job, absPath) {
+  return scopeDirsOf(job).some((dir) => isInside(absPath, dir));
+}
+
+// 同一仓库里、和本任务时间有重叠的其他可写任务的写入范围（绝对路径）
+export function otherWriterDirs(job, records = allJobRecords()) {
+  const root = workspaceRoot(job.cwd || process.cwd());
+  const start = Date.parse(job.startedAt) || 0;
+  const end = Date.parse(job.finishedAt) || Date.now();
+  const dirs = [];
+  for (const r of records) {
+    if (!r || r.id === job.id || !r.write || !r.cwd) continue;
+    if (workspaceRoot(r.cwd) !== root) continue;
+    const rs = Date.parse(r.startedAt) || 0;
+    const re = r.finishedAt ? Date.parse(r.finishedAt) || Date.now() : Date.now();
+    if (rs > end || re < start) continue;
+    dirs.push(...scopeDirsOf(r));
+  }
+  return dirs;
+}
+
+// 去掉归属于其他并行任务的改动（git status 行，路径相对仓库根）
+export function withoutOtherWriters(job, changedFiles, records) {
+  const lines = Array.isArray(changedFiles) ? changedFiles : [];
+  if (!lines.length) return lines;
+  const others = otherWriterDirs(job, records);
+  if (!others.length) return lines;
+  const root = workspaceRoot(job.cwd || process.cwd());
+  return lines.filter((line) => {
+    const paths = parseGitStatusPaths(line).map((p) => path.resolve(root, p));
+    return !paths.every((abs) => !inJobScope(job, abs) && others.some((dir) => isInside(abs, dir)));
+  });
+}
+
+// 行数快照只留本任务写入范围内的文件，改动行数不把别人的算进来
+export function scopeLineSnapshot(snap, job) {
+  if (!snap || typeof snap !== "object" || !snap.files) return snap;
+  const files = {};
+  for (const [abs, v] of Object.entries(snap.files)) if (inJobScope(job, abs)) files[abs] = v;
+  return { ...snap, files };
+}
+
 export function checkOutOfScope(changedFiles, scope, cwd) {
   const out = [];
   for (const l of changedFiles || []) {
     const paths = parseGitStatusPaths(l);
     for (const p of paths) {
-      if (p && !isPathInScope(p, scope, cwd) && !out.includes(p)) {
+      // 快照路径相对仓库根，写入范围相对 cwd：先换算；cwd 以外的一律算越界
+      const rel = p ? repoPathToCwd(cwd, p) : null;
+      if (p && (rel === null || !isPathInScope(rel, scope, cwd)) && !out.includes(p)) {
         out.push(p);
       }
     }
@@ -1120,10 +1338,11 @@ export function checkOutOfScope(changedFiles, scope, cwd) {
 export function getWorkspaceActivityMtime(cwd, limit = 2000) {
   if (!cwd) return 0;
   try {
-    const raw = execFileSync("git", ["-C", cwd, "-c", "core.quotePath=false", "status", "--porcelain"], {
+    const raw = execFileSync("git", ["-C", cwd, "-c", "core.quotePath=false", "status", "--porcelain", "--", "."], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
     });
+    const root = workspaceRoot(cwd);
     const lines = raw.split("\n").filter(Boolean);
     const paths = new Set();
     for (const line of lines) {
@@ -1136,7 +1355,7 @@ export function getWorkspaceActivityMtime(cwd, limit = 2000) {
     const now = Date.now();
     for (const p of paths) {
       try {
-        const full = path.resolve(cwd, p);
+        const full = path.resolve(root, p);
         const st = fs.statSync(full);
         const mtime = Math.min(st.mtimeMs, now);
         if (mtime > maxMtime) maxMtime = mtime;
@@ -1208,8 +1427,9 @@ function selfEditFile(sessionId) {
   return path.join(STATE_DIR, "prompts", `${sessionId}.edits.json`);
 }
 
-function bashSnapFile(sessionId) {
-  return path.join(STATE_DIR, "prompts", `${sessionId}.bashsnap.json`);
+function bashSnapFile(sessionId, toolUseId) {
+  const tag = String(toolUseId || "").replace(/[^A-Za-z0-9_-]/g, "");
+  return path.join(STATE_DIR, "prompts", tag ? `${sessionId}.${tag}.bashsnap.json` : `${sessionId}.bashsnap.json`);
 }
 
 // 不算项目代码：临时目录、会话 memory、计划草稿。不拦截，也不计行数。
@@ -1285,9 +1505,9 @@ export function writeSelfEdits(sessionId, data) {
   fs.writeFileSync(selfEditFile(sessionId), JSON.stringify(out));
 }
 
-export function readBashSnap(sessionId) {
+export function readBashSnap(sessionId, toolUseId) {
   try {
-    const data = JSON.parse(fs.readFileSync(bashSnapFile(sessionId), "utf8"));
+    const data = JSON.parse(fs.readFileSync(bashSnapFile(sessionId, toolUseId), "utf8"));
     if (!data || typeof data !== "object" || Array.isArray(data)) return null;
     return data;
   } catch {
@@ -1295,27 +1515,29 @@ export function readBashSnap(sessionId) {
   }
 }
 
-export function writeBashSnap(sessionId, snap) {
+export function writeBashSnap(sessionId, snap, toolUseId) {
   if (!sessionId) return;
   ensureStateDir();
-  fs.writeFileSync(bashSnapFile(sessionId), JSON.stringify(snap && typeof snap === "object" ? snap : {}));
+  fs.writeFileSync(bashSnapFile(sessionId, toolUseId), JSON.stringify(snap && typeof snap === "object" ? snap : {}));
 }
 
-export function clearBashSnap(sessionId) {
+export function clearBashSnap(sessionId, toolUseId) {
   if (!sessionId) return;
   try {
-    fs.unlinkSync(bashSnapFile(sessionId));
+    fs.unlinkSync(bashSnapFile(sessionId, toolUseId));
   } catch {}
 }
 
-// relay.mjs 后面紧跟的子命令是 run。原因文字里碰巧出现 “ run ” 不算。
+// relay.mjs 后面紧跟的子命令是 run 或 rework。原因文字、派单正文（heredoc）里碰巧出现的不算。
 export function isRelayRunCommand(command) {
-  return /relay\.mjs["']?\s+run(?:\s|$)/.test(String(command || ""));
+  return /relay\.mjs["']?\s+(?:run|rework)(?:\s|$)/.test(stripHeredocBodies(String(command || "")));
 }
 
-// 只有带 --write 的 relay run 才算定了可写分工。--writer 这类前缀不算。
+// 只有带 --write 的 relay run 才算定了可写分工（看命令本身，不看 heredoc 正文）。--writer 这类前缀不算。
+// rework 沿用原任务的读写属性，命令行看不出来，由 posttool 钩子按输出判断
 export function isRelayRunWriteCommand(command) {
-  return isRelayRunCommand(command) && /(?:^|\s)--write(?:\s|=|$)/.test(String(command || ""));
+  const head = stripHeredocBodies(String(command || ""));
+  return /relay\.mjs["']?\s+run(?:\s|$)/.test(head) && /(?:^|\s)--write(?:\s|=|$)/.test(head);
 }
 
 // 自动模式下，第一次改项目代码前还没定分工时的拒绝理由
@@ -1838,6 +2060,13 @@ function activeWritersByRoot(roots, beforeIds, now) {
 
   const ids = new Set();
   const maxMs = 240 * 60_000;
+  let idleMin = 20;
+  try {
+    const v = Number(loadConfig()?.idleTimeoutMin);
+    if (Number.isFinite(v) && v > 0) idleMin = v;
+  } catch {}
+  const idleMs = idleMin * 60_000;
+  const activity = new Map();
   const isActive = (r) => {
     if (r.status !== "running" || !r.write) return false;
     const startMs = Date.parse(r.startedAt);
@@ -1850,6 +2079,12 @@ function activeWritersByRoot(roots, beforeIds, now) {
       } catch (e) {
         if (e.code === "ESRCH") return false;
       }
+    } else if (elapsed > idleMs) {
+      // 与 runningWriters 一致：无 pid 的 Codex 记录超过空闲时长且工作区没动静，视为已失效
+      const key = path.resolve(r.cwd || "");
+      if (!activity.has(key)) activity.set(key, getWorkspaceActivityMtime(key));
+      const mt = activity.get(key);
+      if (!mt || now - mt > idleMs) return false;
     }
     return true;
   };
@@ -1960,8 +2195,9 @@ export function fullAccessOn(cfg, prov) {
   return typeof prov.fullAccessEnabled === "boolean" ? prov.fullAccessEnabled : workerFullAccess(cfg);
 }
 
-export function capsOf(cfg, prov, model) {
-  const full = fullAccessOn(cfg, prov);
+export function capsOf(cfg, prov, model, { write } = {}) {
+  // fullAccessWriteOnly 的厂商（如自定义接口）只读时固定走只读模式，执行不了命令
+  const full = fullAccessOn(cfg, prov) && !(prov?.cli?.fullAccessWriteOnly && write === false);
   const vision = typeof prov?.modelCaps?.[model]?.vision === "boolean"
     ? prov.modelCaps[model].vision
     : prov?.caps?.vision === true;

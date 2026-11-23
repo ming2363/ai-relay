@@ -225,6 +225,8 @@ test("pick 降级选出的模型，打印的派单命令带上同样的 --downgr
   // 强档都停用，只剩中档 Grok
   cfg.providers.codex.enabled = false;
   cfg.routes.implement = cfg.routes.implement.filter((e) => !e.startsWith("agy:"));
+  // 已升级过的配置：加载时不再补回 Neon 路由
+  cfg.migrated = ["max-thinking", "gemini-hydrogen", "gemini-neon", "read-route-0.27"];
   fs.writeFileSync(path.join(home, "providers.json"), JSON.stringify(cfg));
   const r = spawnSync(process.execPath, [path.join(DIR, "relay.mjs"), "pick", "implement", "--level", "困难", "--downgrade", "强档停用，Grok 做得了"], {
     encoding: "utf8", env: { ...process.env, AI_RELAY_HOME: home, CLAUDE_PROJECT_DIR: "" },
@@ -242,7 +244,8 @@ test("旧配置迁移：没改过的角色换成 Codex 分模型的新路由，�
   cfg.routes.deep = ["codex:codex:default", "agy:gemini-argon:default"];
   assert.equal(migrateModelFields(cfg, def), true);
   assert.deepEqual(cfg.routes.implement, [...def.routes.implement, "kimi:kimi:default"]);
-  assert.deepEqual(cfg.routes.deep, ["codex:codex:default", "agy:gemini-argon:default"]);
+  // Codex 迁移不动改过的 deep；Neon 迁移照常补上 Neon
+  assert.deepEqual(cfg.routes.deep, ["codex:codex:default", "agy:gemini-argon:default", "agy:gemini:gemini-4-neon-xhigh:0.95"]);
   assert.ok(cfg.providers.codex.pools.codex.includes("gpt-6-luna"));
   assert.equal(migrateModelFields(cfg, def), false);
 });

@@ -10,6 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { withFileLock, writeFileAtomic } from "./lib.mjs";
 
 const CODEX_TAIL_BYTES = 256 * 1024;
 const AGY_MIN_INTERVAL_MS = 5 * 60_000;
@@ -293,45 +294,63 @@ export function agyRows(bin, cwd, now) {
 }
 
 // 刷新缓存：每个来源单独成败，失败时保留上次的数据并记下原因
-export function refreshCache({ stateDir, claudeLimits, agyBin, force = false, now = Date.now() }) {
-  const cache = loadCache(stateDir);
-  const set = (name, fn) => {
-    const prev = cache.sources[name] || {};
-    try {
-      const rows = fn();
-      if (rows === null) return;
-      cache.sources[name] = { rows, fetchedAt: now, error: null };
-    } catch (e) {
-      cache.sources[name] = { rows: prev.rows || [], fetchedAt: prev.fetchedAt || null, error: String(e.message || e).slice(0, 200) };
-    }
-  };
+export function refreshCache({ stateDir, claudeLimits, agyBin, force = false, now = Date.now(), codexHome, codexLive = true }) {
+  const initial = loadCache(stateDir);
+  const updates = {};
   if (claudeLimits) {
-    set("claude", () => {
+    try {
       const rows = claudeRows(claudeLimits, now);
-      // 5h 窗口重置后、新窗口第一次请求前，Claude Code 不报这个窗口：沿用上次的读数，
-      // 状态计算时已过重置点的窗口按 100% 处理，面板显示"已重置"
-      const got = new Set(rows.map((r) => r.window_key));
-      const kept = (cache.sources.claude?.rows || []).filter((r) => !got.has(r.window_key));
-      return [...rows, ...kept];
-    });
-  }
-  set("codex", () => {
-    // 实时接口和官方界面同一份额度。接口不可用时才退回本机会话日志，日志按记录时间取最新一条
-    const rows = codexLiveRows(now);
-    const fallback = rows.length ? rows : codexRows();
-    if (!fallback.length) throw new Error("本机没有找到 Codex 的会话记录（用过一次 Codex 后才有）");
-    return fallback.map((r) => ({ ...r, updated_at: now }));
-  });
-  if (agyBin) {
-    const last = cache.sources.agy?.fetchedAt || 0;
-    // agy 每次要起进程，5 分钟内不重复查
-    if (force || now - last >= AGY_MIN_INTERVAL_MS || cache.sources.agy?.error) {
-      fs.mkdirSync(path.join(stateDir, "probe"), { recursive: true });
-      set("agy", () => agyRows(agyBin, path.join(stateDir, "probe"), now));
+      if (rows !== null) updates.claude = { ok: true, rows };
+    } catch (e) {
+      updates.claude = { ok: false, error: String(e.message || e).slice(0, 200) };
     }
   }
-  fs.writeFileSync(cachePath(stateDir), JSON.stringify(cache, null, 2));
-  return cache;
+  try {
+    // 实时接口和官方界面同一份额度。接口不可用时才退回本机会话日志，日志按记录时间取最新一条且保留原快照的 updated_at
+    const liveRows = codexLive !== false && !codexHome ? codexLiveRows(now) : [];
+    const fallback = liveRows.length ? liveRows : codexRows(codexHome);
+    if (!fallback.length) throw new Error("本机没有找到 Codex 的会话记录（用过一次 Codex 后才有）");
+    updates.codex = { ok: true, rows: liveRows.length ? liveRows.map((r) => ({ ...r, updated_at: now })) : fallback };
+  } catch (e) {
+    updates.codex = { ok: false, error: String(e.message || e).slice(0, 200) };
+  }
+  if (agyBin) {
+    const last = initial.sources?.agy?.fetchedAt || 0;
+    // agy 每次要起进程，5 分钟内不重复查
+    if (force || now - last >= AGY_MIN_INTERVAL_MS || initial.sources?.agy?.error) {
+      fs.mkdirSync(path.join(stateDir, "probe"), { recursive: true });
+      try {
+        const rows = agyRows(agyBin, path.join(stateDir, "probe"), now);
+        if (rows !== null) updates.agy = { ok: true, rows };
+      } catch (e) {
+        updates.agy = { ok: false, error: String(e.message || e).slice(0, 200) };
+      }
+    }
+  }
+  fs.mkdirSync(stateDir, { recursive: true });
+  const file = cachePath(stateDir);
+  return withFileLock(file, () => {
+    const cache = loadCache(stateDir);
+    if (!cache.sources || typeof cache.sources !== "object") cache.sources = {};
+    for (const [name, u] of Object.entries(updates)) {
+      const prev = cache.sources[name] || {};
+      if (u.ok) {
+        let rows = u.rows;
+        if (name === "claude") {
+          // 5h 窗口重置后、新窗口第一次请求前，Claude Code 不报这个窗口：沿用上次的读数，
+          // 状态计算时已过重置点的窗口按 100% 处理，面板显示"已重置"
+          const got = new Set(rows.map((r) => r.window_key));
+          const kept = (prev.rows || []).filter((r) => !got.has(r.window_key));
+          rows = [...rows, ...kept];
+        }
+        cache.sources[name] = { rows, fetchedAt: now, error: null };
+      } else {
+        cache.sources[name] = { rows: prev.rows || [], fetchedAt: prev.fetchedAt || null, error: u.error };
+      }
+    }
+    writeFileAtomic(file, JSON.stringify(cache, null, 2));
+    return cache;
+  });
 }
 
 // 缓存中的所有额度行
@@ -348,6 +367,9 @@ const EXHAUSTED_PATTERNS = [
   /quota exceeded/i,
   /exceeded your current quota/i,
   /insufficient_quota/i,
+  /resource_exhausted/i,
+  /individual quota reached/i,
+  /quota reached/i,
   /额度已用完/i,
   /额度不足/i,
 ];
@@ -357,18 +379,35 @@ export function detectQuotaExhausted(text) {
   return EXHAUSTED_PATTERNS.some((re) => re.test(text));
 }
 
-// 员工命令行报额度耗尽时，把对应额度池在缓存中记为用完（默认 24 小时）
-export function markPoolExhausted(stateDir, provider, pool, now = Date.now(), hours = 24) {
-  const cache = loadCache(stateDir);
-  if (!cache.sources || typeof cache.sources !== "object") {
-    cache.sources = {};
-  }
-  cache.sources["cli-limit:" + provider + ":" + pool] = {
-    at: now,
-    rows: [row(provider, pool, "cli-limit", 0, now + hours * 3600000, now)],
-  };
+// 从「Resets in 3h52m10s」这类报错文本解析出重置时刻（毫秒时间戳），解析不到返回 null
+export function parseResetMs(text, now = Date.now()) {
+  if (!text || typeof text !== "string") return null;
+  const m = text.match(/resets?\s+in\s+(?=\d+\s*[dhms])(?:(\d+)\s*d\s*)?(?:(\d+)\s*h\s*)?(?:(\d+)\s*m\s*)?(?:(\d+)\s*s)?/i);
+  if (!m) return null;
+  const days = Number(m[1] || 0);
+  const hours = Number(m[2] || 0);
+  const mins = Number(m[3] || 0);
+  const secs = Number(m[4] || 0);
+  const deltaMs = (((days * 24 + hours) * 60 + mins) * 60 + secs) * 1000;
+  return deltaMs > 0 ? now + deltaMs : null;
+}
+
+// 员工命令行报额度耗尽时，把对应额度池在缓存中记为用完（给了 resetAt 就用它作为封禁到期，否则沿用 hours 默认 24 小时）
+export function markPoolExhausted(stateDir, provider, pool, now = Date.now(), hours = 24, resetAt = null) {
   fs.mkdirSync(stateDir, { recursive: true });
-  fs.writeFileSync(cachePath(stateDir), JSON.stringify(cache, null, 2));
+  const file = cachePath(stateDir);
+  const expireAt = typeof resetAt === "number" && Number.isFinite(resetAt) ? resetAt : now + hours * 3600000;
+  withFileLock(file, () => {
+    const cache = loadCache(stateDir);
+    if (!cache.sources || typeof cache.sources !== "object") {
+      cache.sources = {};
+    }
+    cache.sources["cli-limit:" + provider + ":" + pool] = {
+      at: now,
+      rows: [row(provider, pool, "cli-limit", 0, expireAt, now)],
+    };
+    writeFileAtomic(file, JSON.stringify(cache, null, 2));
+  });
 }
 
 // ---------- Grok：直接查 grok.com 的计费接口（官方 CLI 没有给程序用的额度命令） ----------
@@ -503,15 +542,29 @@ export async function grokRows(now = Date.now(), fetchImpl = fetch) {
 
 // 异步刷新 Grok（其他来源是同步的，Grok 要联网，单独一个函数）；5 分钟内不重复查
 export async function refreshGrok({ stateDir, force = false, now = Date.now() }) {
-  const cache = loadCache(stateDir);
-  const prev = cache.sources.grok || {};
-  if (!force && !prev.error && prev.fetchedAt && now - prev.fetchedAt < GROK_MIN_INTERVAL_MS) return cache;
+  const initial = loadCache(stateDir);
+  const initialPrev = initial.sources?.grok || {};
+  if (!force && !initialPrev.error && initialPrev.fetchedAt && now - initialPrev.fetchedAt < GROK_MIN_INTERVAL_MS) return initial;
+  let rows = null;
+  let errMsg = null;
   try {
-    cache.sources.grok = { rows: await grokRows(now), fetchedAt: now, error: null };
+    rows = await grokRows(now);
   } catch (e) {
     // 报错信息由本模块生成，不含令牌
-    cache.sources.grok = { rows: prev.rows || [], fetchedAt: prev.fetchedAt || null, error: String(e.message || e).slice(0, 200) };
+    errMsg = String(e.message || e).slice(0, 200);
   }
-  fs.writeFileSync(cachePath(stateDir), JSON.stringify(cache, null, 2));
-  return cache;
+  fs.mkdirSync(stateDir, { recursive: true });
+  const file = cachePath(stateDir);
+  return withFileLock(file, () => {
+    const cache = loadCache(stateDir);
+    if (!cache.sources || typeof cache.sources !== "object") cache.sources = {};
+    const prev = cache.sources.grok || {};
+    if (errMsg === null) {
+      cache.sources.grok = { rows, fetchedAt: now, error: null };
+    } else {
+      cache.sources.grok = { rows: prev.rows || [], fetchedAt: prev.fetchedAt || null, error: errMsg };
+    }
+    writeFileAtomic(file, JSON.stringify(cache, null, 2));
+    return cache;
+  });
 }

@@ -3,12 +3,23 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { detectQuotaExhausted, markPoolExhausted, cachedRows, loadCache, refreshCache } from "./quota.mjs";
+import { detectQuotaExhausted, parseResetMs, markPoolExhausted, cachedRows, loadCache, refreshCache } from "./quota.mjs";
 import { poolStatus } from "./lib.mjs";
 
 test("detectQuotaExhausted 正例：能够准确识别各种额度耗尽提示", () => {
   // Grok 原文
   assert.equal(detectQuotaExhausted("You've reached your free Grok Build usage limit"), true);
+
+  // agy 429 原文与各模式
+  assert.equal(
+    detectQuotaExhausted(
+      "RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 3h52m10s.",
+    ),
+    true,
+  );
+  assert.equal(detectQuotaExhausted("Error: resource_exhausted"), true);
+  assert.equal(detectQuotaExhausted("Individual quota reached"), true);
+  assert.equal(detectQuotaExhausted("Quota reached for this model"), true);
 
   // 正则各模式覆盖（大小写不敏感）
   assert.equal(detectQuotaExhausted("You have reached your daily usage limit"), true);
@@ -23,6 +34,23 @@ test("detectQuotaExhausted 正例：能够准确识别各种额度耗尽提示",
   assert.equal(detectQuotaExhausted("INSUFFICIENT_QUOTA"), true);
   assert.equal(detectQuotaExhausted("提示：额度已用完，请稍后再试"), true);
   assert.equal(detectQuotaExhausted("当前额度不足"), true);
+});
+
+test("parseResetMs：解析 Resets in 3h52m10s、Resets in 45m，无此字样返回 null", () => {
+  const now = 1700000000000;
+  assert.equal(
+    parseResetMs(
+      "RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 3h52m10s.",
+      now,
+    ),
+    now + (3 * 3600 + 52 * 60 + 10) * 1000,
+  );
+  assert.equal(parseResetMs("Resets in 45m", now), now + 45 * 60 * 1000);
+  assert.equal(parseResetMs("Resets in 2h", now), now + 2 * 3600 * 1000);
+  assert.equal(parseResetMs("Resets in 15s", now), now + 15 * 1000);
+  assert.equal(parseResetMs("HTTP 429: quota exceeded, please try again later", now), null);
+  assert.equal(parseResetMs("", now), null);
+  assert.equal(parseResetMs(null, now), null);
 });
 
 test("detectQuotaExhausted 反例：正常输出不误判，空值安全返回 false", () => {
@@ -58,6 +86,16 @@ test("markPoolExhausted 写入缓存后 cachedRows 能读到该行且 remaining_
     const cacheAfterRefresh = loadCache(tempDir);
     assert.ok(cacheAfterRefresh.sources["cli-limit:grok:supergrok-weekly"]);
     assert.equal(cachedRows(tempDir).some((row) => row.window_key === "cli-limit"), true);
+
+    // 传入第 6 个参数 resetAt 时使用该到期时间，传 null 时回退按 hours 计算
+    const customResetAt = parseResetMs("Resets in 3h52m10s", now);
+    markPoolExhausted(tempDir, "antigravity", "claude-gpt", now, 24, customResetAt);
+    const agyRow = cachedRows(tempDir).find((row) => row.provider === "antigravity" && row.pool_id === "claude-gpt");
+    assert.equal(agyRow.reset_at, customResetAt);
+
+    markPoolExhausted(tempDir, "antigravity", "gemini", now, 12, null);
+    const geminiRow = cachedRows(tempDir).find((row) => row.provider === "antigravity" && row.pool_id === "gemini");
+    assert.equal(geminiRow.reset_at, now + 12 * 3600000);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

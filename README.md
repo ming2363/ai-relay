@@ -14,7 +14,8 @@ Claude leads a team made of the AI memberships you already pay for. It scores ea
 ## ✨ Highlights
 
 - 🧠 **Claude is the lead.** The model you pick in Claude Code plans the work, checks the result, and still does the parts only it can do.
-- 👷 **Workers are official CLIs.** ChatGPT Plus (Codex), Antigravity (Gemini 3.8 Flash, Gemini 4 Argon, plus Claude and GPT on `agy`), and SuperGrok (`grok`).
+- 👷 **Workers are official CLIs.** ChatGPT Plus (Codex), Antigravity (Gemini 4 Neon, Argon, Hydrogen and Gemini 3.8 Flash, plus Claude and GPT on `agy`), and SuperGrok (`grok`).
+- 🆕 **New models onboard themselves.** The panel checks for new models on a schedule, assigns each to its official quota pool, researches its tier and best-fit roles online, and adds it to your routing. Every change can be undone.
 - 🎯 **Quality decides the route.** The score is a weighted geometric mean. Fit and reliability weigh the most. A worker under 15% quota is skipped.
 - 🛡️ **Each worker has a full-access switch.** Git stays read-only. Write scopes that overlap are refused, and edits outside the scope are flagged.
 - 📊 **A local panel shows quota, the conversation, and providers.** Config, logs, and transcripts stay on your machine.
@@ -134,7 +135,7 @@ While throttling or conserving, a turn in which the lead reads files more than 8
 
 ### Routing
 
-Every brief must state a difficulty, `难度：简单|中等|困难` (easy / medium / hard), or the run is refused. Models sit in three tiers (`modelTiers`): light (Gemini 3.8 Flash, Codex GPT-6-Luna and GPT-5.6), mid (Grok, Argon medium/low, Sonnet, Codex GPT-6.1-Terra and GPT-6-Sol) and strong (Codex GPT-6-Astra and GPT-6.1-Sol, Argon high, Opus). Codex models share one quota, and the reasoning effort follows the difficulty (`--effort low|medium|high`). Easy work may go to any tier and favours cheap models with spare quota. Medium work needs mid or strong. Hard work goes to strong models only; when none has quota, Claude does it or passes `--downgrade "<reason>"`.
+Every brief must state a difficulty, `难度：简单|中等|困难` (easy / medium / hard), or the run is refused. Models sit in three tiers (`modelTiers`): light (Gemini 4 Hydrogen, Gemini 3.8 Flash, Codex GPT-6-Luna and GPT-5.6), mid (Grok, Argon and Neon medium/low, Sonnet, Codex GPT-6.1-Terra and GPT-6-Sol) and strong (Codex GPT-6-Astra and GPT-6.1-Sol, Gemini 4 Neon high/xhigh, Argon high, Opus). Thinking always runs at the highest level the pool offers (Codex gets `--effort xhigh`). Easy work may go to any tier and favours cheap models with spare quota. Medium work needs mid or strong. Hard work goes to strong models only; when none has quota, Claude does it or passes `--downgrade "<reason>"`.
 
 `relay pick <role> --level <difficulty>` prints the first choice, the backups, and the models it skipped, each with a reason.
 
@@ -150,13 +151,15 @@ Default route order, which is the fit order. The live pick still applies the ful
 
 | Role | Default order |
 |---|---|
-| `implement` | Codex → Gemini 4 Argon → Grok → agy Claude Sonnet → Gemini 3.8 Flash |
-| `debug` | Codex → Grok → Gemini 4 Argon → agy Claude Opus → Gemini 3.8 Flash |
-| `review` | Grok → Gemini 4 Argon → Gemini 3.8 Flash → Codex |
-| `read` | Gemini 3.8 Flash → Gemini 4 Argon → Grok |
-| `deep` | Gemini 4 Argon → agy Claude Opus → Codex |
-| `quick` | Gemini 3.8 Flash → Grok |
-| `claude-backup` | agy Claude Opus → Gemini 4 Argon → Codex |
+| `implement` | Codex GPT-6.1-Sol → Codex GPT-6.1-Terra → Gemini 4 Argon → Gemini 4 Neon → Grok → agy Claude Sonnet → Codex GPT-6-Luna → Gemini 4 Hydrogen |
+| `debug` | Codex GPT-6.1-Sol → Codex GPT-6-Astra → Grok → Codex GPT-6.1-Terra → Gemini 4 Neon → Gemini 4 Argon → agy Claude Opus → Codex GPT-6-Luna → Gemini 4 Hydrogen |
+| `review` | Grok → Gemini 4 Argon → Gemini 4 Neon → Gemini 4 Hydrogen → Codex GPT-6.1-Sol |
+| `read` | Gemini 4 Hydrogen → Gemini 4 Argon → Gemini 4 Neon → Grok |
+| `deep` | Gemini 4 Argon → Gemini 4 Neon → Codex GPT-6-Astra → agy Claude Opus → Codex GPT-6.1-Sol |
+| `quick` | Gemini 4 Hydrogen → Grok |
+| `claude-backup` | agy Claude Opus → Gemini 4 Argon → Gemini 4 Neon → Codex GPT-6.1-Sol |
+
+Gemini 4 Neon, Hydrogen and 3.8 Flash share one Antigravity Gemini quota.
 
 A brief can declare `## 需要的能力` as web, shell, or none. The pick stays inside workers that have that capability. You can also pass `relay pick <role> --needs web,exec`.
 
@@ -198,13 +201,26 @@ AIQuota5h is an optional fallback for a window the built-in reader missed. A new
 
 The status plugin refreshes quota at the end of a turn. agy and Grok are queried at most every 5 minutes unless you run `relay quota --force`. The panel draws a 5-hour bar and a weekly bar, with the reset time. Under 30% is marked low. Under 15% is not assigned work.
 
+### New-model onboarding
+
+While the panel is open it asks `relay models discover --background` every 30 minutes; relay itself throttles real runs to once every 6 hours and never runs two at once. The first run only records the models you already have. After that, each new model goes through:
+
+1. **Pool.** The vendor's pool rules first; if none match, the official Antigravity quota groups (from AIQuota5h) decide the pool, and a pool rule is added. Models that fit no pool are skipped.
+2. **Research.** The thinking variants of one model count as one family and are researched once: a web-capable worker reports the tier, vision support and per-role fit as JSON. Anything that fails validation is dropped.
+3. **Config.** Add-only: the family's variants join the pool, tier and vision are recorded, and a route entry is appended for every role with fit ≥ 0.5. Your existing settings are never overwritten, and the config is backed up first.
+4. **Audit and undo.** Each onboarding is logged to `discover-log.jsonl`. The Providers page shows the result with an Undo button; `relay models discover --undo <id>` does the same and `relay models discover --list` shows the history.
+
+Metered custom endpoints are left out: their model lists often mix in image, embedding and rerank models, so enable those by hand on the Providers page.
+
 ### Panel
 
 Install `ai-relay-status` and open the panel with the `ai-relay · <mode>` button under the input, or with `/relay-bar`. Three pages:
 
 - **Quota.** A 5-hour bar and a weekly bar per pool, plus the reset time. Switch mode from this page.
 - **Conversation.** Every project and every session, grouped into turns: what the lead did and what each worker did. Open a turn for the task, why that worker was picked, and the verdict.
-- **Providers.** Enable or disable a vendor, toggle full access, run a connectivity test, and add or remove a vendor. Templates: Kimi, Qwen, and custom.
+- **Providers.** Enable or disable a vendor, toggle full access, run a connectivity test, and add or remove a vendor. Templates: Kimi, Qwen, and custom. The header shows new-model onboarding results, each with an Undo button.
+
+While work is out, a "⏳ N subtasks running" band appears above the input; View opens the Conversation page.
 
 ## 📦 Installation
 
@@ -396,6 +412,57 @@ From each product, on this machine. Claude reads the current session. Codex read
 **Why does `relay run auto` stop when Codex is the first choice?**
 
 Codex is not started by `relay run`. It goes through the official Codex plugin, so the lead hands over the brief with the Agent tool and `subagent_type` set to `codex:codex-rescue`. The first line of the prompt carries the run flags from `relay pick`, such as `--model gpt-6.1-sol --effort high`; when it is missing, the hook fills it in from the last pick and the difficulty. When `relay run auto` ranks Codex first, it stops and prints that instruction. The next worker is used only if you pass `--skip-codex`. A write target outside the current project skips Codex on its own, because the sandbox cannot write there.
+
+## 📝 Changelog
+
+Versions are listed as "ai-relay / panel ai-relay-status".
+
+### 0.27.0 / 0.28.0 · 2026-11-24
+
+**New**
+- New-model onboarding: `relay models discover`, triggered by the panel on a schedule. Pools by official quota group, researches tier and role fit online, writes the config add-only, and every change can be undone.
+- Gemini 4 Neon: joins the gemini pool, high thinking variants are strong tier, and it is routed for implement, debug, review, read, deep and claude-backup. Older configs migrate automatically.
+
+**Dispatch fixes**
+- When a worker reports an exhausted quota (including agy's `RESOURCE_EXHAUSTED` / `Individual quota reached`), the pool is blocked until the reset time in the error. Quota failures no longer lower a model's reliability.
+- Read-only tasks no longer count write-only full access as "can run commands"; for a named vendor, vision is judged on the model actually picked.
+- The old `read` route made `run` reject the model `pick` had just chosen; fixed and migrated.
+- Medium tasks with a step spec no longer prefer a light model over a qualified one; duplicate routes keep the higher fit; ranking uses unrounded scores.
+- "Save for hard tasks" applies only to pools that have a strong model and are under half full, and a saved subscription pool still ranks ahead of metered endpoints.
+- `--downgrade` without a reason no longer swallows the next flag; Codex dispatch reads the panel's default model, supports downgrade, and passes per-model vision; `--model` in the body is still tier-checked, except inside code blocks.
+
+**System fixes**
+- `relay cancel` stops the real worker process; a foreground relay that is killed takes its worker process group with it.
+- agy idle timeout identifies the session database by process group, so panel polling or other agy sessions on the machine no longer keep a stuck task alive.
+- With parallel dispatches, auto-review diffs, out-of-scope checks and changed-line counts cover only the task's own changes; running from a repo subdirectory works for change detection, scope checks and write locks.
+- `--write` inside a brief body no longer opens the edit gate; a rejected `relay run` does not count as a dispatch; reworks keep their session.
+- Parallel Bash calls keep separate line snapshots; Codex write records without a pid release their lock after the idle timeout; quota cache and metered usage use a file lock and atomic writes.
+- Job logs, Codex logs, verification output and connectivity tests are all masked for secrets.
+- Panel: View opens the Conversation page even when the pane is behind another tab; a failed connectivity test shows the reason; the lead's line count skips docs and denied edits; continued turns keep the self-work reason; Codex token totals no longer double-count or mix up parallel runs.
+
+### 0.25.0 / 0.27.1 · 2026-11-18
+- Thinking always at maximum; Gemini 4 Hydrogen in the default config; writable dispatches with 150+ changed lines get an automatic review from another vendor.
+
+### 0.23.0 / 0.26.0 · 2026-11-16 ~ 11-17
+- Custom endpoints for domestic models (metered, with a daily cap); dispatch paced by quota; tighter rules for the lead doing work itself.
+- Medium tasks with a step spec may drop one tier; verification commands run automatically; exhausted quotas are flagged automatically; collapsible vendor cards.
+
+### 0.19.0 ~ 0.20.0 / 0.25.x · 2026-11-09
+- Review each dispatch as it finishes and send failures back with `relay rework`; every brief must state a difficulty, which gates the tier.
+- Codex model and reasoning effort follow task difficulty.
+
+### 0.18.2 / 0.24.0 · 2026-11-08
+- Division-of-labor gate covers multiple repos; the "review every result" rule; Conversation filter defaults to the current window.
+
+### 0.17.x / 0.20.0 ~ 0.22.0 · 2026-11-06
+- Pick a default model per pool on the Providers page; Conversation groups by user message and shows token usage per model.
+- Panel master switch; fixed missing lead token data and false agy timeouts.
+
+### 0.12.0 ~ 0.13.1 · 2026-11-05
+- Quota weight lowered to the minimum and `relay run auto` no longer silently skips Codex; throttling by Claude quota with a quality floor.
+
+### 0.11.0 / 0.14.0 · 2026-11-05
+- First release.
 
 ## 🤝 Contributing
 

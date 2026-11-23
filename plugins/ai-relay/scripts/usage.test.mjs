@@ -9,6 +9,7 @@ import {
   readVarint,
   readProtoFields,
   readAgyGenMetadataUsage,
+  agyDbMatchState,
   grokUsageFor,
   agyUsageFor,
   backfill,
@@ -623,7 +624,7 @@ test("8. running 任务的 liveUsage 被算出且不写回 job json，且不持�
 });
 
 
-test("agy 活动识别：旧库、空元数据和仅 WAL 更新均保活，不缓存猜测", () => {
+test("agy 活动识别：拿不到进程信息时，旧库、空元数据、旧目录残留和仅 WAL/SHM 更新均保守保活，不缓存猜测", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-activity-"));
   try {
     const file = path.join(dir, "old.db");
@@ -634,23 +635,259 @@ test("agy 活动识别：旧库、空元数据和仅 WAL 更新均保活，不�
     const job = { provider: "agy", cwd: "/workspace/current", startedAt: new Date(now).toISOString() };
     const opts = { agyDir: dir, usedSources: new Set() };
     assert.ok(fs.statSync(file).birthtimeMs < now - 5000);
+    // 空元数据 + 仅 WAL 更新在时间窗内：允许保活，但不写入 _matchedAgyDb
     fs.writeFileSync(file + "-wal", "");
     fs.utimesSync(file + "-wal", now / 1000, now / 1000);
     assert.ok(Math.abs(getAgySessionActivityMtime(job, opts) - now) < 1);
     assert.equal(job._matchedAgyDb, undefined);
-    // 元数据可能残留旧 cwd；仍不能把近期 WAL 活动当作空闲。
+    // 无进程归属信息时，元数据残留旧 cwd 仍保守保活，不把复用库误判为空闲
     const writer = new DatabaseSync(file);
     writer.prepare("INSERT INTO trajectory_metadata_blob (data) VALUES (?)").run(Buffer.from("file:///workspace/previous"));
     writer.close();
     fs.writeFileSync(file + "-wal", "");
     fs.utimesSync(file + "-wal", (now + 1000) / 1000, (now + 1000) / 1000);
-    assert.ok(Math.abs(getAgySessionActivityMtime(job, opts) - now - 1000) < 1);
+    assert.ok(Math.abs(getAgySessionActivityMtime(job, opts) - (now + 1000)) < 1);
     assert.equal(job._matchedAgyDb, undefined);
+    // SHM 单独变化（如状态面板只读打开库刷新 -shm）不算员工活动，只有 WAL 更新才推进活动时间
     fs.writeFileSync(file + "-shm", "共享内存活动");
     fs.utimesSync(file + "-shm", (now + 2000) / 1000, (now + 2000) / 1000);
-    assert.ok(Math.abs(getAgySessionActivityMtime(job, opts) - now - 2000) < 1);
-    // 没有新的外部写入时，重复探测不能自行推进活动时间。
-    assert.ok(Math.abs(getAgySessionActivityMtime(job, opts) - now - 2000) < 1);
+    assert.ok(Math.abs(getAgySessionActivityMtime(job, opts) - (now + 1000)) < 1);
+    fs.writeFileSync(file + "-wal", "wal写入");
+    fs.utimesSync(file + "-wal", (now + 2000) / 1000, (now + 2000) / 1000);
+    assert.ok(Math.abs(getAgySessionActivityMtime(job, opts) - (now + 2000)) < 1);
+    assert.ok(Math.abs(getAgySessionActivityMtime(job, opts) - (now + 2000)) < 1);
+    assert.equal(job._matchedAgyDb, undefined);
+    // 显式注入 heldAgyDbs: null 或 lsof 查不到无效 childPid 时不抛错且走同样保守逻辑
+    assert.ok(Math.abs(getAgySessionActivityMtime(job, { ...opts, heldAgyDbs: null }) - (now + 2000)) < 1);
+    assert.ok(Math.abs(getAgySessionActivityMtime({ ...job, childPid: 99999999 }, opts) - (now + 2000)) < 1);
+    assert.equal(job._matchedAgyDb, undefined);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("agy 活动识别：拿到进程信息、别的目录库没被本组打开时返回 0", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-other-cwd-"));
+  try {
+    const now = Date.now();
+    // 1. trajectory_metadata_blob 明确指向别的目录
+    const otherTraj = path.join(dir, "other-traj.db");
+    const db1 = new DatabaseSync(otherTraj);
+    db1.exec("CREATE TABLE trajectory_metadata_blob (data BLOB)");
+    db1.prepare("INSERT INTO trajectory_metadata_blob (data) VALUES (?)").run(
+      encodeAgyTrajectoryBlob("/workspace/other-project"),
+    );
+    db1.close();
+    fs.utimesSync(otherTraj, (now + 1000) / 1000, (now + 1000) / 1000);
+
+    // 2. trajectory_metadata_blob 为空，但 executor_metadata 明确指向别的目录
+    const otherExec = path.join(dir, "other-exec.db");
+    const db2 = new DatabaseSync(otherExec);
+    db2.exec(`
+      CREATE TABLE trajectory_metadata_blob (data BLOB);
+      CREATE TABLE executor_metadata (idx INTEGER PRIMARY KEY, data BLOB);
+    `);
+    db2.prepare("INSERT INTO trajectory_metadata_blob (data) VALUES (?)").run(Buffer.alloc(0));
+    const execBlob = encodeBytesField(10, encodeBytesField(12, "file:///workspace/another-project"));
+    db2.prepare("INSERT INTO executor_metadata (idx, data) VALUES (?, ?)").run(0, execBlob);
+    db2.close();
+    fs.utimesSync(otherExec, (now + 2000) / 1000, (now + 2000) / 1000);
+    fs.writeFileSync(otherExec + "-wal", "x");
+    fs.utimesSync(otherExec + "-wal", (now + 3000) / 1000, (now + 3000) / 1000);
+
+    const job = { provider: "agy", cwd: "/workspace/current", startedAt: new Date(now).toISOString() };
+    const opts = { agyDir: dir, usedSources: new Set(), heldAgyDbs: new Set() };
+
+    assert.equal(getAgySessionActivityMtime(job, opts), 0);
+    assert.equal(job._matchedAgyDb, undefined);
+
+    // 其它目录会话持续写 WAL/SHM（且支持通过函数注入 heldAgyDbs），本任务仍必须返回 0，不能被续命
+    fs.utimesSync(otherTraj, (now + 5000) / 1000, (now + 5000) / 1000);
+    fs.writeFileSync(otherExec + "-shm", "活跃");
+    fs.utimesSync(otherExec + "-shm", (now + 6000) / 1000, (now + 6000) / 1000);
+    assert.equal(getAgySessionActivityMtime(job, { ...opts, heldAgyDbs: () => new Set() }), 0);
+    assert.equal(job._matchedAgyDb, undefined);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("agy 活动识别：被本组打开的库即使元数据指向别的目录也算本任务的库", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-held-db-"));
+  try {
+    const now = Date.now();
+    // 1. 复用的旧库：元数据仍指向别的目录，但正被本任务进程组打开
+    const reusedDb = path.join(dir, "reused.db");
+    const db1 = new DatabaseSync(reusedDb);
+    db1.exec("CREATE TABLE trajectory_metadata_blob (data BLOB)");
+    db1.prepare("INSERT INTO trajectory_metadata_blob (data) VALUES (?)").run(
+      encodeAgyTrajectoryBlob("/workspace/previous"),
+    );
+    db1.close();
+    fs.utimesSync(reusedDb, (now + 1000) / 1000, (now + 1000) / 1000);
+
+    // 2. 同目录并发任务的库（元数据 match，但未被本任务进程组打开）
+    const siblingDb = path.join(dir, "sibling-same-cwd.db");
+    const db2 = new DatabaseSync(siblingDb);
+    db2.exec("CREATE TABLE trajectory_metadata_blob (data BLOB)");
+    db2.prepare("INSERT INTO trajectory_metadata_blob (data) VALUES (?)").run(
+      encodeAgyTrajectoryBlob("/workspace/current"),
+    );
+    db2.close();
+    fs.utimesSync(siblingDb, (now + 4000) / 1000, (now + 4000) / 1000);
+
+    // 3. 其它目录活跃库（未被本组打开）
+    const otherDb = path.join(dir, "other-active.db");
+    const db3 = new DatabaseSync(otherDb);
+    db3.exec("CREATE TABLE trajectory_metadata_blob (data BLOB)");
+    db3.prepare("INSERT INTO trajectory_metadata_blob (data) VALUES (?)").run(
+      encodeAgyTrajectoryBlob("/workspace/other"),
+    );
+    db3.close();
+    fs.utimesSync(otherDb, (now + 8000) / 1000, (now + 8000) / 1000);
+
+    const job = { provider: "agy", cwd: "/workspace/current", startedAt: new Date(now).toISOString() };
+    const opts = { agyDir: dir, usedSources: new Set(), heldAgyDbs: new Set(["reused.db-wal"]) };
+
+    // 被本组打开的 reused.db 直接进 candidates 并优先于未被本组打开的同目录库，同时缓存到 _matchedAgyDb
+    assert.ok(Math.abs(getAgySessionActivityMtime(job, opts) - (now + 1000)) < 1);
+    assert.equal(job._matchedAgyDb, reusedDb);
+
+    // 之后其它库活跃不影响本任务；本库仅 SHM 更新不算活动，WAL 更新正常反映（覆盖 _matchedAgyDb 与 held 两条路径）
+    fs.utimesSync(otherDb, (now + 9000) / 1000, (now + 9000) / 1000);
+    assert.ok(Math.abs(getAgySessionActivityMtime(job, opts) - (now + 1000)) < 1);
+    fs.writeFileSync(reusedDb + "-shm", "只读面板触碰shm");
+    fs.utimesSync(reusedDb + "-shm", (now + 5000) / 1000, (now + 5000) / 1000);
+    // 1) _matchedAgyDb 路径：shm 单独变化不算活动
+    assert.ok(Math.abs(getAgySessionActivityMtime(job, opts) - (now + 1000)) < 1);
+    // 2) held 路径（清除 _matchedAgyDb 缓存）：shm 单独变化同样不算活动
+    delete job._matchedAgyDb;
+    assert.ok(Math.abs(getAgySessionActivityMtime(job, opts) - (now + 1000)) < 1);
+    assert.equal(job._matchedAgyDb, reusedDb);
+    // WAL 更新时，_matchedAgyDb 与 held 两条路径均正常计为活动
+    fs.writeFileSync(reusedDb + "-wal", "本库wal活动");
+    fs.utimesSync(reusedDb + "-wal", (now + 5000) / 1000, (now + 5000) / 1000);
+    assert.ok(Math.abs(getAgySessionActivityMtime(job, opts) - (now + 5000)) < 1);
+    delete job._matchedAgyDb;
+    assert.ok(Math.abs(getAgySessionActivityMtime(job, opts) - (now + 5000)) < 1);
+    assert.equal(job._matchedAgyDb, reusedDb);
+
+    // 被本组打开的空元数据库（unknown）同样直接进 candidates 并写入 _matchedAgyDb
+    const emptyHeldDb = path.join(dir, "empty-held.db");
+    const db4 = new DatabaseSync(emptyHeldDb);
+    db4.exec("CREATE TABLE trajectory_metadata_blob (data BLOB)");
+    db4.close();
+    fs.utimesSync(emptyHeldDb, (now + 1500) / 1000, (now + 1500) / 1000);
+    const job2 = { provider: "agy", cwd: "/workspace/current", startedAt: new Date(now).toISOString() };
+    assert.ok(
+      Math.abs(getAgySessionActivityMtime(job2, { agyDir: dir, usedSources: new Set(), heldAgyDbs: new Set(["empty-held.db"]) }) - (now + 1500)) < 1,
+    );
+    assert.equal(job2._matchedAgyDb, emptyHeldDb);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("agy 活动识别：尚未写入元数据的库仅在时间窗内保活，不借用其它目录库，元数据补齐后立刻切换状态", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-pending-meta-"));
+  try {
+    const now = Date.now();
+    // 早于时间窗（win.minMs = now - 30_000）的空库：即使有新 SHM 也不能参与保活
+    const staleEmpty = path.join(dir, "stale-empty.db");
+    const dbStale = new DatabaseSync(staleEmpty);
+    dbStale.exec("CREATE TABLE trajectory_metadata_blob (data BLOB)");
+    dbStale.close();
+    fs.utimesSync(staleEmpty, (now - 120_000) / 1000, (now - 120_000) / 1000);
+    fs.writeFileSync(staleEmpty + "-shm", "旧库shm");
+    fs.utimesSync(staleEmpty + "-shm", (now + 9000) / 1000, (now + 9000) / 1000);
+
+    // 明确属于别的目录且非常活跃的库：拿到进程信息且未被本组打开时绝不能被借用来保活
+    const otherDb = path.join(dir, "other.db");
+    const dbOther = new DatabaseSync(otherDb);
+    dbOther.exec("CREATE TABLE trajectory_metadata_blob (data BLOB)");
+    dbOther.prepare("INSERT INTO trajectory_metadata_blob (data) VALUES (?)").run(
+      encodeAgyTrajectoryBlob("/workspace/other"),
+    );
+    dbOther.close();
+    fs.utimesSync(otherDb, (now + 8000) / 1000, (now + 8000) / 1000);
+
+    const job = { provider: "agy", cwd: "/workspace/current", startedAt: new Date(now).toISOString() };
+    const opts = { agyDir: dir, usedSources: new Set(), heldAgyDbs: new Set() };
+
+    // 只有时间窗外空库和别的目录库时返回 0
+    assert.equal(getAgySessionActivityMtime(job, opts), 0);
+
+    // 新增时间窗内、尚未写工作区元数据的库（两张元数据表均无 file:///）
+    const pendingDb = path.join(dir, "pending.db");
+    const dbPending = new DatabaseSync(pendingDb);
+    dbPending.exec(`
+      CREATE TABLE trajectory_metadata_blob (data BLOB);
+      CREATE TABLE executor_metadata (idx INTEGER PRIMARY KEY, data BLOB);
+    `);
+    dbPending.prepare("INSERT INTO trajectory_metadata_blob (data) VALUES (?)").run(Buffer.from("no-uri-yet"));
+    dbPending.close();
+    fs.utimesSync(pendingDb, (now + 1000) / 1000, (now + 1000) / 1000);
+
+    // 仅取 pending.db 的活动时间（now + 1000），绝不取 other.db（now + 8000）或 stale-empty.db（now + 9000）
+    assert.ok(Math.abs(getAgySessionActivityMtime(job, opts) - (now + 1000)) < 1);
+    assert.equal(job._matchedAgyDb, undefined);
+
+    // 之后元数据写进来了，且即便 mtime 恰好仍为 now + 1000，也要立刻重查并识别为本任务库
+    const writer = new DatabaseSync(pendingDb);
+    writer.prepare("INSERT INTO trajectory_metadata_blob (data) VALUES (?)").run(
+      encodeAgyTrajectoryBlob("/workspace/current"),
+    );
+    writer.close();
+    fs.utimesSync(pendingDb, (now + 1000) / 1000, (now + 1000) / 1000);
+
+    assert.ok(Math.abs(getAgySessionActivityMtime(job, opts) - (now + 1000)) < 1);
+    assert.equal(job._matchedAgyDb, pendingDb);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("agy 活动识别与三态判定：匹配本任务库（含 executor_metadata 兜底）行为与原来一致", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-match-state-"));
+  try {
+    const now = Date.now();
+    const ownCwd = "/workspace/repo/sub";
+
+    // 验证 agyDbMatchState 三态返回值
+    const matchDbPath = path.join(dir, "match-exec.db");
+    const dbMatch = new DatabaseSync(matchDbPath);
+    dbMatch.exec(`
+      CREATE TABLE trajectory_metadata_blob (data BLOB);
+      CREATE TABLE executor_metadata (idx INTEGER PRIMARY KEY, data BLOB);
+    `);
+    dbMatch.prepare("INSERT INTO trajectory_metadata_blob (data) VALUES (?)").run(Buffer.alloc(0));
+    dbMatch.prepare("INSERT INTO executor_metadata (idx, data) VALUES (?, ?)").run(
+      0,
+      encodeBytesField(10, encodeBytesField(12, `file://${ownCwd}`)),
+    );
+    assert.equal(agyDbMatchState(dbMatch, ownCwd), "match");
+    assert.equal(agyDbMatchState(dbMatch, "/workspace/repo"), "other");
+    dbMatch.close();
+
+    const unknownDbPath = path.join(dir, "unknown.db");
+    const dbUnknown = new DatabaseSync(unknownDbPath);
+    dbUnknown.exec("CREATE TABLE trajectory_metadata_blob (data BLOB)");
+    assert.equal(agyDbMatchState(dbUnknown, ownCwd), "unknown");
+    dbUnknown.close();
+
+    fs.utimesSync(matchDbPath, (now + 500) / 1000, (now + 500) / 1000);
+    fs.utimesSync(unknownDbPath, (now + 4000) / 1000, (now + 4000) / 1000);
+
+    const job = { provider: "agy", cwd: ownCwd, startedAt: new Date(now).toISOString() };
+    const opts = { agyDir: dir, usedSources: new Set() };
+
+    // 已匹配到本任务库时直接采用本任务库时间，不采用无元数据库的更晚时间，并缓存 _matchedAgyDb
+    assert.ok(Math.abs(getAgySessionActivityMtime(job, opts) - (now + 500)) < 1);
+    assert.equal(job._matchedAgyDb, matchDbPath);
+
+    // 后续本任务库更新正常反映
+    fs.utimesSync(matchDbPath, (now + 1500) / 1000, (now + 1500) / 1000);
+    assert.ok(Math.abs(getAgySessionActivityMtime(job, opts) - (now + 1500)) < 1);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -677,6 +914,73 @@ test("agy 活动识别：匹配后不借用并发会话的活动，已占用来�
     fs.utimesSync(other, (now + 2000) / 1000, (now + 2000) / 1000);
     assert.ok(Math.abs(getAgySessionActivityMtime(job, opts) - now) < 1);
     assert.equal(getAgySessionActivityMtime({ ...job, cwd: "/unknown", _matchedAgyDb: undefined }, { ...opts, usedSources: new Set(["own.db", "other.db"]) }), 0);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("agyUsageFor：优先复用 job._matchedAgyDb 读取用量（含创建时间在时间窗外或元数据残留旧目录的复用库）", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-usage-matched-"));
+  try {
+    const cwd = "/workspace/current-proj";
+    // 1. 复用的旧库：创建时间远早于任务启动时间窗，且元数据仍指向旧目录
+    const reusedDb = path.join(dir, "reused-old.db");
+    const db1 = new DatabaseSync(reusedDb);
+    db1.exec(`
+      CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB);
+      CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);
+    `);
+    db1.prepare("INSERT INTO trajectory_metadata_blob (id, data) VALUES (?, ?)").run(
+      "main",
+      encodeAgyTrajectoryBlob("/workspace/old-proj"),
+    );
+    db1.prepare("INSERT INTO gen_metadata (idx, data) VALUES (?, ?)").run(0, encodeAgyGenRow({ input: 4200, output: 800 }));
+    db1.close();
+
+    // 2. 同目录下另一个在时间窗内的新库
+    const otherSameCwdDb = path.join(dir, "other-new.db");
+    const db2 = new DatabaseSync(otherSameCwdDb);
+    db2.exec(`
+      CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB);
+      CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);
+    `);
+    db2.prepare("INSERT INTO trajectory_metadata_blob (id, data) VALUES (?, ?)").run(
+      "main",
+      encodeAgyTrajectoryBlob(cwd),
+    );
+    db2.prepare("INSERT INTO gen_metadata (idx, data) VALUES (?, ?)").run(0, encodeAgyGenRow({ input: 9999, output: 1111 }));
+    db2.close();
+
+    const birthMs = fs.statSync(otherSameCwdDb).birthtimeMs;
+    const futureStart = birthMs + 120_000;
+    const job = {
+      id: "job-reused-db",
+      provider: "agy",
+      cwd,
+      startedAt: new Date(futureStart).toISOString(),
+      finishedAt: new Date(futureStart + 10_000).toISOString(),
+      _matchedAgyDb: reusedDb,
+    };
+
+    // 未绑定 _matchedAgyDb 时因两个库都在 futureStart 时间窗外而返回 null
+    assert.equal(agyUsageFor({ ...job, _matchedAgyDb: undefined }, { agyDir: dir }), null);
+
+    // 绑定 _matchedAgyDb 后优先读取 reused-old.db 的用量，即使时间窗内有同目录新库也优先用 _matchedAgyDb
+    const jobInWindow = {
+      ...job,
+      startedAt: new Date(birthMs - 1000).toISOString(),
+      finishedAt: new Date(birthMs + 5000).toISOString(),
+    };
+    const usedSources = new Set();
+    const usage = agyUsageFor(jobInWindow, { agyDir: dir, usedSources });
+    assert.deepEqual(usage, {
+      input: 4200,
+      output: 800,
+      cacheRead: 0,
+      total: 5000,
+      source: "reused-old.db",
+    });
+    assert.equal(usedSources.has("reused-old.db"), true);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

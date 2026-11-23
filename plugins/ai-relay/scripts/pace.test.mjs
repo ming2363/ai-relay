@@ -135,7 +135,7 @@ test("4. 近似同分按配速排：分数差 3% 按配速高到低排，差 10%
   assert.equal(res10pct.alternatives[0].provider, "provB");
 });
 
-test("5. 中等任务分组排序：会员中档 -> 会员强档 -> 按量中档 -> 保留池；demoted 文字正确", () => {
+test("5. 中等任务分组排序：会员中档 -> 会员强档 -> 保留池 -> 按量计费；demoted 文字写入字段与 reason", () => {
   const cfg = {
     minRemaining: 0.15,
     lowRemaining: 0.3,
@@ -144,19 +144,21 @@ test("5. 中等任务分组排序：会员中档 -> 会员强档 -> 按量中档
       "midProv:midModel": "mid",
       "meteredProv:meteredMid": "mid",
       "reservedProv:reservedMid": "mid",
+      "reservedProv:reservedStrong": "strong",
     },
     providers: {
-      strongProv: { via: "relay", quota: { provider: "strongProv" } },
-      midProv: { via: "relay", quota: { provider: "midProv" } },
-      meteredProv: { via: "relay", billing: "metered", quota: { provider: "meteredProv" } },
-      reservedProv: { via: "relay", quota: { provider: "reservedProv" } },
+      strongProv: { via: "relay", quota: { provider: "strongProv" }, pools: { pStrong: ["strongModel"] } },
+      midProv: { via: "relay", quota: { provider: "midProv" }, pools: { pMid: ["midModel"] } },
+      meteredProv: { via: "relay", billing: "metered", quota: { provider: "meteredProv" }, pools: { pMeter: ["meteredMid"] } },
+      // 保留池里存在强档模型（reservedStrong），才触发「留给困难任务」
+      reservedProv: { via: "relay", quota: { provider: "reservedProv" }, pools: { pRes: ["reservedStrong", "reservedMid"] } },
     },
     routes: {
       implement: [
         "strongProv:pStrong:strongModel:1.0", // 会员强档（擅长度最高 1.0）
         "midProv:pMid:midModel:0.8",          // 会员中档（擅长度 0.8）
         "meteredProv:pMeter:meteredMid:0.95", // 按量中档（擅长度 0.95）
-        "reservedProv:pRes:reservedMid:0.95", // 保留会员中档（擅长度 0.95，但配速 -0.5 < -0.15）
+        "reservedProv:pRes:reservedMid:0.95", // 保留会员中档（剩余 0.3 < 0.5 且配速 -0.5 < -0.15）
       ],
     },
   };
@@ -167,16 +169,18 @@ test("5. 中等任务分组排序：会员中档 -> 会员强档 -> 按量中档
     { provider: "reservedProv", pool_id: "pRes", window_key: "5h", remaining_fraction: 0.3, reset_at: NOW + 4.0 * HOUR, allowance: "available", updated_at: NOW },
   ];
 
-  // 1) 会员中档和强档都可用时：首选会员中档，接着会员强档、按量中档、保留池
+  // 1) 会员中档和强档都可用时：会员中档 -> 会员强档 -> 保留会员池 -> 按量计费
   const res1 = scoreRoute(cfg, baseRows, "implement", { now: NOW, level: "medium" });
   const order1 = [res1.choice, ...res1.alternatives].map((c) => c.provider);
-  assert.deepEqual(order1, ["midProv", "strongProv", "meteredProv", "reservedProv"]);
+  assert.deepEqual(order1, ["midProv", "strongProv", "reservedProv", "meteredProv"]);
   assert.equal(res1.choice.demoted, undefined);
   assert.equal(res1.alternatives[0].demoted, undefined);
-  assert.equal(res1.alternatives[1].demoted, "按量计费，会员候选优先");
-  assert.equal(res1.alternatives[2].demoted, "用得比进度快，留给困难任务");
+  assert.equal(res1.alternatives[1].demoted, "用得比进度快，留给困难任务");
+  assert.match(res1.alternatives[1].reason, /；用得比进度快，留给困难任务$/);
+  assert.equal(res1.alternatives[2].demoted, "按量计费，会员候选优先");
+  assert.match(res1.alternatives[2].reason, /；按量计费，会员候选优先$/);
 
-  // 2) 会员中档不可用（blocked）时：首选会员强档
+  // 2) 会员中档不可用（blocked）时：首选会员强档，接着保留会员池、按量计费
   const rowsNoMid = [
     baseRows[0],
     { ...baseRows[1], remaining_fraction: 0.05 }, // midProv 耗尽
@@ -184,28 +188,29 @@ test("5. 中等任务分组排序：会员中档 -> 会员强档 -> 按量中档
   ];
   const res2 = scoreRoute(cfg, rowsNoMid, "implement", { now: NOW, level: "medium" });
   const order2 = [res2.choice, ...res2.alternatives].map((c) => c.provider);
-  assert.deepEqual(order2, ["strongProv", "meteredProv", "reservedProv"]);
+  assert.deepEqual(order2, ["strongProv", "reservedProv", "meteredProv"]);
   assert.equal(res2.choice.provider, "strongProv");
 
-  // 3) 未进保留的会员都不可用时：首选按量中档；按量也停用时才选保留池
+  // 3) 未进保留的会员都不可用时：被保留的会员池仍排在按量计费之前
   const rowsOnlyMeteredAndReserved = [
     { ...baseRows[0], remaining_fraction: 0.05 }, // strongProv 耗尽
     { ...baseRows[1], remaining_fraction: 0.05 }, // midProv 耗尽
     baseRows[2],
   ];
   const res3 = scoreRoute(cfg, rowsOnlyMeteredAndReserved, "implement", { now: NOW, level: "medium" });
-  assert.equal(res3.choice.provider, "meteredProv");
-  assert.equal(res3.choice.demoted, "按量计费，会员候选优先");
-  assert.equal(res3.alternatives[0].provider, "reservedProv");
-  assert.equal(res3.alternatives[0].demoted, "用得比进度快，留给困难任务");
+  assert.equal(res3.choice.provider, "reservedProv");
+  assert.equal(res3.choice.demoted, "用得比进度快，留给困难任务");
+  assert.match(res3.choice.reason, /；用得比进度快，留给困难任务$/);
+  assert.equal(res3.alternatives[0].provider, "meteredProv");
+  assert.equal(res3.alternatives[0].demoted, "按量计费，会员候选优先");
+  assert.match(res3.alternatives[0].reason, /；按量计费，会员候选优先$/);
 
-  // 4) 简单任务分组顺序：①会员 ②按量 ③配速低于保留线的会员
+  // 4) 简单任务分组顺序：①会员 ②保留会员 ③按量计费
   const resEasy = scoreRoute(cfg, baseRows, "implement", { now: NOW, level: "easy" });
   const orderEasy = [resEasy.choice, ...resEasy.alternatives].map((c) => c.provider);
-  // midProv 和 strongProv 同在组 0（会员），midProv 因 cost 更高排在 strongProv 前面；然后 meteredProv（组 1），最后 reservedProv（组 2）
-  assert.deepEqual(orderEasy, ["midProv", "strongProv", "meteredProv", "reservedProv"]);
-  assert.equal(resEasy.alternatives[1].demoted, "按量计费，会员候选优先");
-  assert.equal(resEasy.alternatives[2].demoted, "用得比进度快，留给困难任务");
+  assert.deepEqual(orderEasy, ["midProv", "strongProv", "reservedProv", "meteredProv"]);
+  assert.equal(resEasy.alternatives[1].demoted, "用得比进度快，留给困难任务");
+  assert.equal(resEasy.alternatives[2].demoted, "按量计费，会员候选优先");
 });
 
 test("6. 配速为 null 的池打分与改动前完全一致", () => {
@@ -240,4 +245,82 @@ test("6. 配速为 null 的池打分与改动前完全一致", () => {
   assert.equal(grok.pace, null);
   // 旧公式：(0.6 + 0.4 * 0.25 + 0) * 0.7 = 0.49
   assert.equal(grok.parts.quota, 0.49);
+});
+
+test("7. reserved 仅在池存在强档模型且剩余 < 0.5 时触发：纯中档池与剩余 ≥ 0.5 均不被保留，保留池排在 maas 前", () => {
+  const cfg = {
+    minRemaining: 0.15,
+    lowRemaining: 0.3,
+    providers: {
+      grok: {
+        via: "relay",
+        quota: { provider: "grok" },
+        pools: { "supergrok-weekly": ["grok-4.7"] },
+      },
+      agy: {
+        via: "relay",
+        quota: { provider: "antigravity" },
+        pools: {
+          "claude-gpt": ["claude-opus-5-5-high", "claude-sonnet-5-5-high"],
+          "gemini-argon": ["gemini-4-argon-high"],
+        },
+      },
+      maas: {
+        via: "relay",
+        billing: "metered",
+        quota: { provider: "maas" },
+        pools: { maas: ["qwen4-max"] },
+      },
+    },
+    routes: {
+      implement: [
+        "grok:supergrok-weekly:grok-4.7:0.85",        // 纯中档池
+        "agy:claude-gpt:claude-sonnet-5-5-high:0.8",  // 含强档池里的中档模型
+        "agy:gemini-argon:gemini-4-argon-high:0.9",   // 强档池
+        "maas:maas:qwen4-max:0.95",                   // 按量计费
+      ],
+    },
+  };
+
+  // 1) 纯中档池 grok 剩余 0.30（<0.5）且配速 -0.60（<-0.15）：无强档模型，不被保留
+  // 2) 含强档池 claude-gpt 剩余 0.50（>=0.5，边界值）且配速 -0.40（<-0.15）：剩余未低于 0.5，不被保留
+  // 3) 含强档池 gemini-argon 剩余 0.40（<0.5）且配速 -0.50（<-0.15）：触发保留，但仍排在按量 maas 前
+  const rows = [
+    { provider: "grok", pool_id: "supergrok-weekly", window_key: "weekly", remaining_fraction: 0.30, reset_at: NOW + 151.2 * HOUR, allowance: "available", updated_at: NOW },
+    { provider: "antigravity", pool_id: "claude-gpt", window_key: "5h", remaining_fraction: 0.50, reset_at: NOW + 4.5 * HOUR, allowance: "available", updated_at: NOW },
+    { provider: "antigravity", pool_id: "gemini-argon", window_key: "5h", remaining_fraction: 0.40, reset_at: NOW + 4.5 * HOUR, allowance: "available", updated_at: NOW },
+  ];
+
+  const res = scoreRoute(cfg, rows, "implement", { now: NOW, level: "medium" });
+  const all = [res.choice, ...res.alternatives];
+  const grok = all.find((c) => c.provider === "grok");
+  const sonnet = all.find((c) => c.pool === "claude-gpt");
+  const argon = all.find((c) => c.pool === "gemini-argon");
+  const maas = all.find((c) => c.provider === "maas");
+
+  assert.equal(grok.demoted, undefined);
+  assert.doesNotMatch(grok.reason, /留给困难任务/);
+  assert.equal(sonnet.demoted, undefined);
+  assert.doesNotMatch(sonnet.reason, /留给困难任务/);
+
+  assert.equal(argon.demoted, "用得比进度快，留给困难任务");
+  assert.match(argon.reason, /用得比进度快，留给困难任务/);
+  assert.equal(maas.demoted, "按量计费，会员候选优先");
+  assert.match(maas.reason, /按量计费，会员候选优先/);
+
+  // 顺序：两个未保留中档（grok / sonnet，彼此按分数排）在前，接着保留池 argon，最后按量 maas
+  const order = all.map((c) => `${c.provider}/${c.pool}`);
+  assert.deepEqual(order.slice(0, 2).sort(), ["agy/claude-gpt", "grok/supergrok-weekly"]);
+  assert.deepEqual(order.slice(2), ["agy/gemini-argon", "maas/maas"]);
+
+  // 再测剩余 0.64（模拟 5h 64%、刚起步配速 -0.173）：同样不被保留
+  const rows64 = [
+    { provider: "grok", pool_id: "supergrok-weekly", window_key: "weekly", remaining_fraction: 0.05, reset_at: NOW + 151.2 * HOUR, allowance: "available", updated_at: NOW },
+    { provider: "antigravity", pool_id: "claude-gpt", window_key: "5h", remaining_fraction: 0.64, reset_at: NOW + 4.065 * HOUR, allowance: "available", updated_at: NOW },
+    { provider: "antigravity", pool_id: "gemini-argon", window_key: "5h", remaining_fraction: 0.40, reset_at: NOW + 4.5 * HOUR, allowance: "available", updated_at: NOW },
+  ];
+  const res64 = scoreRoute(cfg, rows64, "implement", { now: NOW, level: "medium" });
+  assert.equal(res64.choice.pool, "claude-gpt");
+  assert.equal(res64.choice.demoted, undefined);
+  assert.ok(res64.choice.pace < -0.15);
 });

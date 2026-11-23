@@ -287,6 +287,13 @@ export type WorkStats = {
 }
 
 /** 面板上的工作量统计状态 */
+/** 新模型自动发现：最近一次自动接入的家族、没接入的家族 */
+export type DiscoverView = {
+  at: string
+  added: { id: string; provider: string; family: string; tier?: string; roles?: string[] }[]
+  missed: { provider: string; family: string; reason?: string }[]
+} | null
+
 export type WorkStatsView = {
   data: WorkStats | null
   /** idle 未读，loading 读取中，ready 已读到，error 失败 */
@@ -379,6 +386,8 @@ declare module 'claude-code' {
       relayEnabled: boolean
       /** 总开关切换状态 */
       relayToggle: { busy: boolean; error?: string; text?: string } | null
+      /** 新模型自动发现的最近一次结果 */
+      discoverView: Shaped<DiscoverView>
     }
   }
 }

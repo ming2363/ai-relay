@@ -14,7 +14,8 @@
 ## ✨ 亮点
 
 - 🧠 **Claude 是主管。** 它负责拆活、验收，也亲自做只有它能做的部分。主管就是你在 Claude Code 里选中的那个模型。
-- 👷 **员工是各家官方 CLI。** ChatGPT Plus 的 Codex，Antigravity 上的 Gemini 3.8 Flash、Gemini 4 Argon，以及 agy 里的 Claude / GPT，还有 SuperGrok 的 Grok。
+- 👷 **员工是各家官方 CLI。** ChatGPT Plus 的 Codex，Antigravity 上的 Gemini 4 Neon、Argon、Hydrogen 和 Gemini 3.8 Flash，以及 agy 里的 Claude / GPT，还有 SuperGrok 的 Grok。
+- 🆕 **新模型自动接入。** 各家发布新模型后，面板定时探测，按官方额度分组归池、联网调研它的档位和擅长的角色，自动写进派单配置，随时可以撤销。
 - 🎯 **按质量选人。** 分数是加权几何平均，擅长度和可靠度最重。额度低于 15% 的直接跳过。
 - 🛡️ **每家有独立的最高权限开关。** 员工的 git 只读。写入范围重叠就拒绝启动，跑完还会检查有没有改到范围外面。
 - 📊 **本机面板看额度、对话和厂商。** 配置、外派日志和对话记录都留在你的电脑上。
@@ -148,13 +149,15 @@ Codex 插件的启停要新会话才完全生效。当前会话里，钩子会�
 
 | 角色 | 默认顺序 |
 |---|---|
-| `implement` | Codex → Gemini 4 Argon → Grok → agy 上的 Claude Sonnet → Gemini 3.8 Flash |
-| `debug` | Codex → Grok → Gemini 4 Argon → agy 上的 Claude Opus → Gemini 3.8 Flash |
-| `review` | Grok → Gemini 4 Argon → Gemini 3.8 Flash → Codex |
-| `read` | Gemini 3.8 Flash → Gemini 4 Argon → Grok |
-| `deep` | Gemini 4 Argon → agy 上的 Claude Opus → Codex |
-| `quick` | Gemini 3.8 Flash → Grok |
-| `claude-backup` | agy 上的 Claude Opus → Gemini 4 Argon → Codex |
+| `implement` | Codex GPT-6.1-Sol → Codex GPT-6.1-Terra → Gemini 4 Argon → Gemini 4 Neon → Grok → agy 上的 Claude Sonnet → Codex GPT-6-Luna → Gemini 4 Hydrogen |
+| `debug` | Codex GPT-6.1-Sol → Codex GPT-6-Astra → Grok → Codex GPT-6.1-Terra → Gemini 4 Neon → Gemini 4 Argon → agy 上的 Claude Opus → Codex GPT-6-Luna → Gemini 4 Hydrogen |
+| `review` | Grok → Gemini 4 Argon → Gemini 4 Neon → Gemini 4 Hydrogen → Codex GPT-6.1-Sol |
+| `read` | Gemini 4 Hydrogen → Gemini 4 Argon → Gemini 4 Neon → Grok |
+| `deep` | Gemini 4 Argon → Gemini 4 Neon → Codex GPT-6-Astra → agy 上的 Claude Opus → Codex GPT-6.1-Sol |
+| `quick` | Gemini 4 Hydrogen → Grok |
+| `claude-backup` | agy 上的 Claude Opus → Gemini 4 Argon → Gemini 4 Neon → Codex GPT-6.1-Sol |
+
+先按难度过档位：简单任务三档都能接、轻档优先；中等任务要中档以上；困难任务只派强档（Codex GPT-6-Astra / GPT-6.1-Sol、Gemini 4 Neon、Gemini 4 Argon high、agy 上的 Claude Opus）。Gemini 4 Neon、Hydrogen 和 3.8 Flash 共用 Antigravity 的同一份 Gemini 额度。
 
 派单可以写 `## 需要的能力`：联网、执行命令，或无。挑选只在具备这项能力的员工里进行。也可以直接运行 `relay pick <角色> --needs web,exec`。
 
@@ -196,13 +199,26 @@ Codex 通过官方 Codex 插件启动，钩子会给那份 prompt 补上同样�
 
 状态插件在每轮结束时刷新额度。agy 和 Grok 默认至少隔 5 分钟才查一次，要立刻更新就运行 `relay quota --force`。面板上每家有 5 小时和周两条额度条，并显示重置时间。低于 30% 标为偏低，低于 15% 不再派活。
 
+### 新模型自动接入
+
+面板开着时每 30 分钟请求一次 `relay models discover --background`，relay 自己按 6 小时节流，同一时间只跑一个。第一次运行只把现有模型记为「已知」，之后出现的新模型这样接入：
+
+1. **归池。** 先用厂商的归池规则；匹配不上时，按 Antigravity 官方的额度分组（来自 AIQuota5h）找到它属于哪个额度池，并补一条归池规则。归不进额度池的不接入。
+2. **调研。** 同一模型的几个思考档算一个家族，只调研一次：派一个能联网的员工查它的档位、能不能看图、适合哪些角色，结果必须是校验得过的 JSON，否则放弃。
+3. **写配置。** 只增不改：家族的各思考档进额度池，写档位和看图能力，擅长度不低于 0.5 的角色追加一条路由。你已有的配置一律不覆盖，写之前先备份。
+4. **留痕和撤销。** 每次接入记在 `discover-log.jsonl`，厂商页首显示结果并带「撤销」按钮，也可以用 `relay models discover --undo <记录id>`。`relay models discover --list` 查看历史。
+
+按量计费的自定义接口不参与自动接入：它们的模型清单里常混着生图、向量、重排模型，要接入请在厂商页手动启用。
+
 ### 面板
 
 装上 `ai-relay-status` 之后，点输入框下方的 `ai-relay · <模式>` 按钮，或输入 `/relay-bar`。面板有三页：
 
 - **额度。** 每个额度池的 5 小时条和周条，以及重置时间。这一页也可以切换模式。
 - **对话。** 所有项目、所有会话按轮次列出主管和员工的分工。点进一轮，可以看到任务、为什么选它，以及验收结论。
-- **厂商。** 启用或停用、切换最高权限、试运行、增加或删除厂商。模板有 Kimi、Qwen 和自定义。
+- **厂商。** 启用或停用、切换最高权限、试运行、增加或删除厂商。模板有 Kimi、Qwen 和自定义。页首显示新模型自动接入的结果，可以一键撤销。
+
+有外派在跑时，输入框上方会出现「⏳ N 个子任务进行中」提示条，点「查看」打开面板的对话页。
 
 ## 📦 安装
 
@@ -394,6 +410,57 @@ Codex 由官方插件固定在沙箱里，只能写当前项目。目录在项�
 **为什么 Codex 首选时 `relay run auto` 会停下？**
 
 Codex 不由 `relay run` 启动，而是走官方 Codex 插件。主管要用 Agent 工具把派单交给它，`subagent_type` 设为 `codex:codex-rescue`。`relay run auto` 算出首选是 Codex 时会停下来并打印这段提示。确有理由不用 Codex 时，加上 `--skip-codex`，才会改派第二名。要写的目录在当前项目以外时，Codex 受沙箱限制写不进去，挑选时会被自动跳过。
+
+## 📝 版本记录
+
+版本号格式为「ai-relay / 面板 ai-relay-status」。
+
+### 0.27.0 / 0.28.0 · 2026-11-24
+
+**新增**
+- 新模型自动接入：`relay models discover`，面板定时触发，按官方额度分组归池、联网调研档位与擅长角色，只增不改地写进配置，可撤销。
+- 接入 Gemini 4 Neon：归入 gemini 额度池，高思考档定为强档，进入实现、排查、审查、阅读、深度推理、替 Claude 六个角色的路由；旧配置自动迁移。
+
+**派单修复**
+- 员工报额度用完（含 agy 的 `RESOURCE_EXHAUSTED` / `Individual quota reached`）时按报错里的重置时间封池；额度失败不再拉低模型可靠度。
+- 只读任务不再把「仅可写时才开的最高权限」算成能执行命令；点名厂商时，看图能力按选出的具体模型判断。
+- `read` 路由的旧写法会让 `pick` 选出的模型在 `run` 时被自己拒掉，已改并自动迁移。
+- 中等任务带步骤规格时，有够档位的候选就不再反选轻档；路由去重保留擅长度高的条目；排序用未取整的原始分。
+- 「留给困难任务」只在池里有强档且剩余低于一半时触发，被保留的会员池仍排在按量计费前面。
+- `--downgrade` 缺原因时不再吞掉后面的参数；派给 Codex 时读取面板设的默认模型、支持降级、传对看图能力；正文里的 `--model` 照常检查档位，代码块里的不算。
+
+**系统修复**
+- `relay cancel` 能结束真正的员工进程；relay 前台进程被结束时连带结束员工进程组。
+- agy 空闲超时按进程组认库，不再被面板轮询或本机其他 agy 会话续命。
+- 并行外派时，初审 diff、越界检查、改动行数只算本任务的改动；仓库子目录作工作目录时，改动检测、越界检查和写锁都按仓库根换算。
+- 派单正文里写的 `--write` 不再误开编辑闸门；被退回的 `relay run` 不算定了分工；返工任务归入原会话。
+- 并行 Bash 的行数快照互不覆盖；没有进程号的 Codex 可写记录超时后自动释放写锁；额度缓存和按量用量加文件锁、原子写入。
+- 外派日志、Codex 日志、验证输出和试运行输出统一脱敏。
+- 面板：「查看」按钮在面板被挡住时也能打开对话页；试运行失败显示原因；主管行数不计文档和被拦下的编辑；续跑轮次保留「自己做的原因」；Codex Token 统计不重复累加、并发不串账。
+
+### 0.25.0 / 0.27.1 · 2026-11-18
+- 思考一律开到最高；Gemini 4 Hydrogen 进入默认配置；改动不少于 150 行的可写外派自动派另一家初审。
+
+### 0.23.0 / 0.26.0 · 2026-11-16 ~ 11-17
+- 接入国产模型的自定义接口（按量计费、每日用量上限）；派单按额度配速，收紧主管自己做的范围。
+- 中等任务带步骤规格可降一档；可写外派自动跑验证命令；员工报额度用完自动标记；厂商页卡片折叠。
+
+### 0.19.0 ~ 0.20.0 / 0.25.x · 2026-11-09
+- 外派完成一个验收一个，不通过用 `relay rework` 退回返工；派单必须写难度，按难度过档位。
+- Codex 按任务难度选模型和推理强度。
+
+### 0.18.2 / 0.24.0 · 2026-11-08
+- 分工闸门覆盖多仓库；新增「复核铁令」；对话页项目筛选默认当前窗口。
+
+### 0.17.x / 0.20.0 ~ 0.22.0 · 2026-11-06
+- 厂商页可选各额度池默认模型；对话页按用户消息归并，显示各模型 Token 用量。
+- 面板加 ai-relay 总开关；修复主模型 Token 无数据和 agy 误判超时。
+
+### 0.12.0 ~ 0.13.1 · 2026-11-05
+- 额度权重降到最低，`relay run auto` 不再悄悄绕开 Codex；按 Claude 额度分档节流，并守住质量底线。
+
+### 0.11.0 / 0.14.0 · 2026-11-05
+- 首次发布。
 
 ## 🤝 参与贡献
 
