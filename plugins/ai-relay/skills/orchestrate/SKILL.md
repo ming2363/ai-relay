@@ -179,7 +179,7 @@ relay pick <角色> --level 简单|中等|困难
 
 ### 默认模型
 
-- 路由条目 `provider:pool:model[:fit]` 中 `model` 为 `default` 时，取该额度池的默认模型；写了具体模型 id 的条目固定不变（如 `implement` 的 `claude-sonnet-5-5-high`、`read` 的 `gemini-4-argon-medium`、`quick` 的 `gemini-3.8-flash-medium`）。
+- 路由条目 `provider:pool:model[:fit]` 中 `model` 为 `default` 时，取该额度池的默认模型；写了具体模型 id 的条目固定不变（如 `implement` 的 `claude-sonnet-5-5-high`、`quick` 的 `gemini-4-neon-xhigh`）。
 - 默认模型存在 `~/.claude/ai-relay/providers.json` 的 `providers.<名称>.defaultModels.<额度池>`。单池厂商（Codex、Grok）未设时跟随 CLI 默认；多池厂商（agy）每个池必须设具体默认模型。
 - 新模型自动接入：面板开着时每 30 分钟请求一次 `relay models discover --background`（relay 按 6 小时节流）。发现新模型后按官方额度分组归池、派能联网的员工调研档位与擅长角色，只增不改地写进配置；面板厂商页首显示结果，可一键撤销（`relay models discover --undo <记录id>`）。自动接入的模型照样要靠验收记录积累可靠度。
 - 查看与切换：`relay models [--refresh]` 从各家官方 CLI 拉取最新模型清单（缓存 24 小时，`models-cache.json`）；`relay provider model <厂商> <额度池> <模型id|default>` 设置默认模型（单池厂商写 `default` 恢复跟随 CLI 默认）。

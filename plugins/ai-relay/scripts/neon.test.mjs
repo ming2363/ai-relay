@@ -39,11 +39,12 @@ test("Neon 高思考档是强档，低档是中档；派单时换成 xhigh", () 
   assert.equal(maxVariant(DEF, "agy", "gemini", "gemini-4-neon-low"), "gemini-4-neon-xhigh");
 });
 
-test("默认路由：实现、排查、审查、阅读、深度推理、替 Claude 都有 Neon，快问没有", () => {
+test("默认路由：七个角色都有 Neon，快问里它排在轻档之后", () => {
   for (const role of ["implement", "debug", "review", "read", "deep", "claude-backup"]) {
     assert.ok(DEF.routes[role].some((e) => e.startsWith("agy:gemini:gemini-4-neon-xhigh:")), role);
   }
-  assert.ok(!DEF.routes.quick.some((e) => /neon/.test(e)));
+  assert.equal(DEF.routes.quick[0], "agy:gemini:default");
+  assert.ok(DEF.routes.quick.includes("agy:gemini:gemini-4-neon-xhigh:0.7"));
   // gemini 池默认模型仍是 Hydrogen（便宜的轻档留给简单活）
   assert.equal(DEF.providers.agy.defaultModels.gemini, "gemini-4-hydrogen-xhigh");
 });
@@ -60,7 +61,7 @@ test("旧配置升级：补 Neon 模型、归池规则（在 flash 之前）、�
   assert.ok(cfg.routes.implement.includes("agy:gemini:gemini-4-neon-xhigh:0.9"));
   assert.ok(cfg.routes.implement.includes("maas:maas:glm-5.3:0.75"));
   assert.ok(cfg.routes.deep.includes("agy:gemini:gemini-4-neon-xhigh:0.95"));
-  assert.deepEqual(cfg.migrated, ["max-thinking", "gemini-hydrogen", "gemini-neon", "read-route-0.27"]);
+  assert.deepEqual(cfg.migrated, ["max-thinking", "gemini-hydrogen", "gemini-neon", "read-route-0.27", "quick-route-0.28"]);
 });
 
 test("升级只做一次：用户删掉的 Neon 路由不加回；已有 Neon 路由（擅长度不同）不重复加", () => {

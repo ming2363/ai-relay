@@ -257,7 +257,9 @@
     ],
     "quick": [
       "agy:gemini:default",
-      "grok:supergrok-weekly:default"
+      "grok:supergrok-weekly:default",
+      "agy:gemini:gemini-4-neon-xhigh:0.7",
+      "agy:gemini-argon:default:0.7"
     ],
     "claude-backup": [
       "agy:claude-gpt:default",

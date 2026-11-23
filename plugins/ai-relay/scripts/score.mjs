@@ -58,7 +58,8 @@ export const LEVELS = ["easy", "medium", "hard"];
 export const LEVEL_TEXT = { easy: "简单", medium: "中等", hard: "困难" };
 // 每档难度：最低模型档位、打分权重（覆盖默认值）。思考档位不跟难度走，一律最高（见 maxVariant、CODEX_EFFORT）
 const LEVEL_RULES = {
-  easy: { minTier: "light", weights: { fit: 1, reliability: 2, quota: 2, speed: 0.5, load: 0.5, cost: 2 }, note: "优先额度充足、便宜的模型" },
+  // 擅长度权重略高于经济性：擅长度差得不多（如 0.8 对 1.0）时轻档胜出，差一大截（如 0.4 对 0.9）时擅长的模型胜出
+  easy: { minTier: "light", weights: { fit: 2, reliability: 2, quota: 2, speed: 0.5, load: 0.5, cost: 1.5 }, note: "优先额度充足、便宜的模型" },
   medium: { minTier: "mid", preferTier: "mid", weights: null, note: "中档以上按综合分" },
   hard: { minTier: "strong", weights: { fit: 3, reliability: 3, quota: 0.1, speed: 0.25, load: 0.25 }, note: "只派强档，看擅长和可靠" },
 };
@@ -212,6 +213,8 @@ function calcReliability(history, provider, model, role) {
     if (r.provider !== provider || modelFamily(r.model) !== modelFamily(model) || r.status === "running") continue;
     // 额度耗尽属于配额问题，不计入模型质量可靠度
     if (r.quotaExhausted === true) continue;
+    // 卡住无产出（超时或取消、没输出也没改动）属于服务问题，同样不计
+    if (r.stalled === true) continue;
     const w = (r.role && r.role === role) ? 1 : 0.5;
     if (r.verdict === "pass") {
       sum += w * 1;

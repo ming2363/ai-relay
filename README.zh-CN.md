@@ -154,7 +154,7 @@ Codex 插件的启停要新会话才完全生效。当前会话里，钩子会�
 | `review` | Grok → Gemini 4 Argon → Gemini 4 Neon → Gemini 4 Hydrogen → Codex GPT-6.1-Sol |
 | `read` | Gemini 4 Hydrogen → Gemini 4 Argon → Gemini 4 Neon → Grok |
 | `deep` | Gemini 4 Argon → Gemini 4 Neon → Codex GPT-6-Astra → agy 上的 Claude Opus → Codex GPT-6.1-Sol |
-| `quick` | Gemini 4 Hydrogen → Grok |
+| `quick` | Gemini 4 Hydrogen → Grok → Gemini 4 Neon → Gemini 4 Argon |
 | `claude-backup` | agy 上的 Claude Opus → Gemini 4 Argon → Gemini 4 Neon → Codex GPT-6.1-Sol |
 
 先按难度过档位：简单任务三档都能接、轻档优先；中等任务要中档以上；困难任务只派强档（Codex GPT-6-Astra / GPT-6.1-Sol、Gemini 4 Neon、Gemini 4 Argon high、agy 上的 Claude Opus）。Gemini 4 Neon、Hydrogen 和 3.8 Flash 共用 Antigravity 的同一份 Gemini 额度。
@@ -414,6 +414,13 @@ Codex 不由 `relay run` 启动，而是走官方 Codex 插件。主管要用 Ag
 ## 📝 版本记录
 
 版本号格式为「ai-relay / 面板 ai-relay-status」。
+
+### 0.28.0 / 0.28.0 · 2026-11-24
+
+**派单调整**
+- `quick` 路由补上 Neon 和 Argon：Grok 停用后，中等以上的问答也有人可派；简单问答仍首选轻档。旧配置自动迁移。
+- 简单任务的擅长度权重调高、经济性调低：擅长度差得不多时仍派轻档，差一大截（如 0.4 对 0.9）时派更擅长的模型。
+- 卡住无产出的任务（超时或被取消、没有任何输出、工作区也没改动）属于员工 CLI 或服务卡住，不再拉低模型可靠度。
 
 ### 0.27.0 / 0.28.0 · 2026-11-24
 

@@ -86,7 +86,7 @@
 | review 审查 | Grok → Gemini Argon → Gemini Neon → Gemini Hydrogen → Codex GPT-6.1-Sol |
 | read 大量阅读 | Gemini Hydrogen → Gemini Argon → Gemini Neon → Grok |
 | deep 深度推理 | Gemini Argon → Gemini Neon → Codex GPT-6-Astra → agy·Claude Opus → Codex GPT-6.1-Sol |
-| quick 简单问答 | Gemini Hydrogen → Grok |
+| quick 简单问答 | Gemini Hydrogen → Grok → Gemini Neon → Gemini Argon |
 | claude-backup 替 Claude | agy·Claude Opus → Gemini Argon → Gemini Neon → Codex GPT-6.1-Sol |
 
 新模型会自动接入：面板定时探测，发现后按官方额度分组归池、联网调研档位和擅长角色，只增不改地写进路由，厂商页可以撤销。详见仓库根目录 README 的「新模型自动接入」。
@@ -95,7 +95,7 @@
 
 ### 默认模型
 
-- 路由条目 `provider:pool:model[:fit]` 中 `model` 为 `default` 时，取该额度池的默认模型；写了具体模型 id 的条目不受影响（如 `implement` 的 `claude-sonnet-5-5-high`、`read` 的 `gemini-4-argon-medium`、`quick` 的 `gemini-3.8-flash-medium`）。
+- 路由条目 `provider:pool:model[:fit]` 中 `model` 为 `default` 时，取该额度池的默认模型；写了具体模型 id 的条目不受影响（如 `implement` 的 `claude-sonnet-5-5-high`、`quick` 的 `gemini-4-neon-xhigh`）。
 - 默认模型存在 `~/.claude/ai-relay/providers.json` 的 `providers.<名称>.defaultModels.<额度池>`。单池厂商（Codex、Grok）未设时不传模型参数、跟随 CLI 默认；多池厂商（agy）每个额度池必须指定默认模型。
 - 命令与面板：可在面板「厂商」页切换，或用 `relay models [--refresh]` 从官方 CLI 拉取最新模型清单（缓存 6 小时，过期自动重新拉取；7 天内新出现的模型标「新」）、`relay provider model <厂商> <额度池> <模型id|default>` 设置默认模型。多额度池厂商出了没归池的新模型时，面板厂商页可直接选额度池，或 `relay provider pool-rule <厂商> <模型id> <额度池>`。
 

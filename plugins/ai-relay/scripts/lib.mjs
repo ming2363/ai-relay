@@ -433,6 +433,15 @@ function migrateReadRoute(cfg) {
   });
 }
 
+// quick 路由（0.28）：原来只有轻档和 grok，grok 停用后中等、困难的问答没人可派；补上 Neon 和 Argon 两个强档
+const QUICK_STRONG = ["agy:gemini:gemini-4-neon-xhigh:0.7", "agy:gemini-argon:default:0.7"];
+function migrateQuickRoute(cfg) {
+  if (!Array.isArray(cfg.routes?.quick)) return false;
+  return migrateOnce(cfg, "quick-route-0.28", () => {
+    for (const e of QUICK_STRONG) if (!cfg.routes.quick.includes(e)) cfg.routes.quick.push(e);
+  });
+}
+
 export function migrateModelFields(cfg, def) {
   if (!def) {
     try {
@@ -446,6 +455,7 @@ export function migrateModelFields(cfg, def) {
   if (migrateHydrogen(cfg, def)) changed = true;
   if (migrateNeon(cfg, def)) changed = true;
   if (migrateReadRoute(cfg)) changed = true;
+  if (migrateQuickRoute(cfg)) changed = true;
   const freshDefaults = new Set();
   for (const [name, dp] of Object.entries(def.providers || {})) {
     const p = cfg.providers?.[name];
@@ -936,6 +946,18 @@ export const MENTION_RE = /(codex|grok|agy|antigravity|gemini|多模型|外派|�
 
 // ---------- 外派台账：记录、验收结论、分派理由 ----------
 
+// 卡住无产出：超时或被取消、没交回任何输出、工作区也没改动。这是员工 CLI 或服务卡住，不是模型能力问题，打分算可靠度时跳过
+export function isStalledJob(j, jobsDir = JOBS_DIR) {
+  if (j.status !== "timeout" && j.status !== "cancelled") return false;
+  if (String(j.result || "").trim()) return false;
+  if (Array.isArray(j.changedFiles) && j.changedFiles.length) return false;
+  let log = "";
+  try { log = fs.readFileSync(path.join(jobsDir, `${j.id}.log`), "utf8"); } catch {}
+  // 日志是「标准输出 + \n[stderr]\n + 标准错误」，只看标准输出
+  const stdout = log.split("\n[stderr]\n")[0];
+  return !stdout.trim();
+}
+
 // 所有外派记录：relay 调用的（agy、Grok、新增厂商）+ 钩子记下的 Codex 子代理，按开始时间倒序
 export function allJobRecords(limit = Infinity) {
   ensureStateDir();
@@ -964,6 +986,7 @@ export function allJobRecords(limit = Infinity) {
           ...(j.autoReviewOf ? { autoReviewOf: j.autoReviewOf } : {}),
           // 员工报额度用完的失败不是能力问题，打分算可靠度时跳过
           ...(j.quotaExhausted ? { quotaExhausted: true } : {}),
+          ...(isStalledJob(j) ? { stalled: true } : {}),
         };
       } catch {
         return null;

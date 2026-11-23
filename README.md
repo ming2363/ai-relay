@@ -156,7 +156,7 @@ Default route order, which is the fit order. The live pick still applies the ful
 | `review` | Grok → Gemini 4 Argon → Gemini 4 Neon → Gemini 4 Hydrogen → Codex GPT-6.1-Sol |
 | `read` | Gemini 4 Hydrogen → Gemini 4 Argon → Gemini 4 Neon → Grok |
 | `deep` | Gemini 4 Argon → Gemini 4 Neon → Codex GPT-6-Astra → agy Claude Opus → Codex GPT-6.1-Sol |
-| `quick` | Gemini 4 Hydrogen → Grok |
+| `quick` | Gemini 4 Hydrogen → Grok → Gemini 4 Neon → Gemini 4 Argon |
 | `claude-backup` | agy Claude Opus → Gemini 4 Argon → Gemini 4 Neon → Codex GPT-6.1-Sol |
 
 Gemini 4 Neon, Hydrogen and 3.8 Flash share one Antigravity Gemini quota.
@@ -416,6 +416,13 @@ Codex is not started by `relay run`. It goes through the official Codex plugin, 
 ## 📝 Changelog
 
 Versions are listed as "ai-relay / panel ai-relay-status".
+
+### 0.28.0 / 0.28.0 · 2026-11-24
+
+**Dispatch tuning**
+- The `quick` route now includes Neon and Argon, so medium and hard questions still have a worker after Grok was disabled; simple questions still go to the light model first. Older configs migrate automatically.
+- Simple tasks weigh role fit more and economy less: a light model still wins when its fit is close, but a much better-suited model wins when the gap is large (e.g. 0.4 vs 0.9).
+- Stalled jobs (timed out or cancelled with no output and no workspace changes) are treated as a CLI or service hang and no longer lower a model's reliability.
 
 ### 0.27.0 / 0.28.0 · 2026-11-24
 

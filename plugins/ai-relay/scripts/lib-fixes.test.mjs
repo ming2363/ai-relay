@@ -108,3 +108,45 @@ test("--downgrade 缺原因：pick 不吞掉后面的 --json，run 报错要求�
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("卡住无产出的任务不计可靠度：超时或取消、没输出没改动才算，有改动或有输出照常计", async () => {
+  const { isStalledJob } = await import("./lib.mjs");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "stall-"));
+  try {
+    fs.writeFileSync(path.join(dir, "a.log"), "\n[stderr]\nerror: interrupted\n");
+    fs.writeFileSync(path.join(dir, "b.log"), "做了一半的汇报\n[stderr]\nx");
+    assert.equal(isStalledJob({ id: "a", status: "timeout" }, dir), true);
+    assert.equal(isStalledJob({ id: "none", status: "cancelled" }, dir), true);
+    assert.equal(isStalledJob({ id: "b", status: "timeout" }, dir), false);
+    assert.equal(isStalledJob({ id: "a", status: "timeout", changedFiles: [" M x.js"] }, dir), false);
+    assert.equal(isStalledJob({ id: "a", status: "failed" }, dir), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  const { scoreRoute } = await import("./score.mjs");
+  const NOW = Date.UTC(2026, 10, 24);
+  const cfg = { minRemaining: 0.15, lowRemaining: 0.3, providers: { p: { via: "relay", quota: { provider: "q" }, pools: { x: ["m"] } } }, modelTiers: { "p:*": "strong" }, routes: { deep: ["p:x:m"] } };
+  const rows = [{ provider: "q", pool_id: "x", window_key: "weekly", remaining_fraction: 0.9, reset_at: NOW + 5 * 86400000, allowance: "available", updated_at: NOW }];
+  const fails = Array.from({ length: 3 }, () => ({ provider: "p", model: "m", role: "deep", status: "cancelled", verdict: "fail" }));
+  const rel = (history) => scoreRoute(cfg, rows, "deep", { now: NOW, level: "hard", history }).choice.parts.reliability;
+  assert.equal(rel(fails.map((r) => ({ ...r, stalled: true }))), rel([]));
+  assert.ok(rel(fails) < rel([]));
+});
+
+test("简单任务：擅长度差一大截（0.4 对 0.9）时强档胜出，quick 中等任务有强档可派", async () => {
+  const { scoreRoute } = await import("./score.mjs");
+  const NOW = Date.UTC(2026, 10, 24);
+  const cfg = {
+    minRemaining: 0.15, lowRemaining: 0.3,
+    providers: { agy: { via: "relay", quota: { provider: "antigravity" }, defaultModels: { gemini: "gemini-4-hydrogen-xhigh", "gemini-argon": "gemini-4-argon-high" }, pools: { gemini: ["gemini-4-hydrogen-xhigh", "gemini-4-neon-xhigh"], "gemini-argon": ["gemini-4-argon-high"] } } },
+    routes: {
+      implement: ["agy:gemini-argon:default:0.9", "agy:gemini:default:0.4"],
+      quick: ["agy:gemini:default", "agy:gemini:gemini-4-neon-xhigh:0.7", "agy:gemini-argon:default:0.7"],
+    },
+  };
+  const row = (pool) => ({ provider: "antigravity", pool_id: pool, window_key: "weekly", remaining_fraction: 0.9, reset_at: NOW + 5 * 86400000, allowance: "available", updated_at: NOW });
+  const rows = [row("gemini"), row("gemini-argon")];
+  assert.equal(scoreRoute(cfg, rows, "implement", { now: NOW, level: "easy" }).choice.model, "gemini-4-argon-high");
+  assert.equal(scoreRoute(cfg, rows, "quick", { now: NOW, level: "easy" }).choice.model, "gemini-4-hydrogen-xhigh");
+  assert.equal(scoreRoute(cfg, rows, "quick", { now: NOW, level: "medium" }).choice.tier, "strong");
+});

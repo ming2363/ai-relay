@@ -42,7 +42,7 @@ test("旧配置升级：Grok 补 --reasoning-effort xhigh，自定义接口补�
   assert.equal(agy.defaultModels.gemini, "gemini-4-hydrogen-xhigh");
   assert.equal(agy.poolLabels.gemini, "Gemini Neon / Hydrogen / Flash");
   assert.ok(cfg.routes.quick.includes("agy:gemini:default"));
-  assert.deepEqual(cfg.migrated, ["max-thinking", "gemini-hydrogen", "gemini-neon", "read-route-0.27"]);
+  assert.deepEqual(cfg.migrated, ["max-thinking", "gemini-hydrogen", "gemini-neon", "read-route-0.27", "quick-route-0.28"]);
 });
 
 test("旧配置升级只做一次：用户改过的默认模型不覆盖，升级后删掉的不再加回", () => {
@@ -51,12 +51,15 @@ test("旧配置升级只做一次：用户改过的默认模型不覆盖，升�
   cfg.routes.quick = ["agy:gemini:gemini-3.8-flash-low"];
   migrateModelFields(cfg, DEF);
   assert.equal(cfg.providers.agy.defaultModels.gemini, "gemini-3.8-flash-low");
-  assert.deepEqual(cfg.routes.quick, ["agy:gemini:gemini-3.8-flash-low"]);
+  // 用户自己的条目不动；quick 路由只在末尾补上强档（中等以上的问答才有人接）
+  assert.deepEqual(cfg.routes.quick, ["agy:gemini:gemini-3.8-flash-low", "agy:gemini:gemini-4-neon-xhigh:0.7", "agy:gemini-argon:default:0.7"]);
 
   cfg.providers.agy.pools.gemini = cfg.providers.agy.pools.gemini.filter((m) => !/hydrogen/.test(m));
   cfg.providers.grok.cli.alwaysArgs = [];
   delete cfg.providers.maas.env.MAX_THINKING_TOKENS;
+  cfg.routes.quick = ["agy:gemini:gemini-3.8-flash-low"];
   assert.equal(migrateModelFields(cfg, DEF), false);
+  assert.deepEqual(cfg.routes.quick, ["agy:gemini:gemini-3.8-flash-low"]);
   assert.ok(!cfg.providers.agy.pools.gemini.some((m) => /hydrogen/.test(m)));
   assert.deepEqual(cfg.providers.grok.cli.alwaysArgs, []);
   assert.equal(cfg.providers.maas.env.MAX_THINKING_TOKENS, undefined);

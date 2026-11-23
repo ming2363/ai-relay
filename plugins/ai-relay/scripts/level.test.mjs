@@ -84,12 +84,18 @@ test("换到最高档后同一模型只留一条候选（read 路由里 Argon me
   assert.ok([exact.choice, ...exact.alternatives].some((c) => c.model === "gemini-4-argon-medium"));
 });
 
-test("简单任务：额度充足的轻档 Flash 排第一，强档 Codex 不再因为排名靠前胜出", () => {
+test("简单任务：轻档 Flash 压过擅长度相近的强档 Argon；擅长度差一大截时让最擅长的 Codex 接", () => {
   const r = scoreRoute(CFG, ALL_FULL, "implement", { now: NOW, level: "easy" });
-  assert.equal(r.choice.provider, "agy");
-  assert.equal(r.choice.model, "gemini-3.8-flash-high");
-  assert.equal(r.choice.tier, "light");
-  assert.match(r.choice.reason, /^难度简单：优先额度充足、便宜的模型，它是轻档；.*经济 1\.00/);
+  // Codex 擅长 1.00、Flash 只有 0.55：差一大截，质量优先
+  assert.equal(r.choice.provider, "codex");
+  const order = [r.choice, ...r.alternatives].map((c) => c.model);
+  assert.ok(order.indexOf("gemini-3.8-flash-high") < order.indexOf("gemini-4-argon-high"), order.join(","));
+  const flash = r.alternatives.find((c) => c.model === "gemini-3.8-flash-high");
+  assert.equal(flash.tier, "light");
+  assert.match(flash.reason, /^难度简单：优先额度充足、便宜的模型，它是轻档；.*经济 1\.00/);
+  // 擅长度只差一点时轻档胜出：把 Codex 去掉，Flash（0.55）压过 Argon（0.90）和 Grok（0.85）
+  const noCodex = scoreRoute(CFG, ALL_FULL.filter((x) => x.provider !== "codex"), "implement", { now: NOW, level: "easy" });
+  assert.equal(noCodex.choice.model, "gemini-3.8-flash-high");
   // 不写难度时保持旧规则：Codex 排第一
   assert.equal(scoreRoute(CFG, ALL_FULL, "implement", { now: NOW }).choice.provider, "codex");
 });
@@ -226,7 +232,7 @@ test("pick 降级选出的模型，打印的派单命令带上同样的 --downgr
   cfg.providers.codex.enabled = false;
   cfg.routes.implement = cfg.routes.implement.filter((e) => !e.startsWith("agy:"));
   // 已升级过的配置：加载时不再补回 Neon 路由
-  cfg.migrated = ["max-thinking", "gemini-hydrogen", "gemini-neon", "read-route-0.27"];
+  cfg.migrated = ["max-thinking", "gemini-hydrogen", "gemini-neon", "read-route-0.27", "quick-route-0.28"];
   fs.writeFileSync(path.join(home, "providers.json"), JSON.stringify(cfg));
   const r = spawnSync(process.execPath, [path.join(DIR, "relay.mjs"), "pick", "implement", "--level", "困难", "--downgrade", "强档停用，Grok 做得了"], {
     encoding: "utf8", env: { ...process.env, AI_RELAY_HOME: home, CLAUDE_PROJECT_DIR: "" },
