@@ -10,6 +10,7 @@ import {
   ROLE_TEXT,
   isEnabled,
   loadConfig,
+  poolOfModel,
   providerPools,
   resolveModel,
   fmtTime,
@@ -20,6 +21,8 @@ import { assignPool, getModels } from "./models.mjs";
 import { TIER_TEXT } from "./score.mjs";
 
 export const DISCOVER_INTERVAL_MS = 6 * 3600_000;
+// 调研失败或校验未通过的家族冷却时长：默认 24 小时内不反复调研同一家族
+export const DISCOVER_FAIL_COOLDOWN_MS = 24 * 3600_000;
 const DISCOVER_LOCK_STALE_MS = 15 * 60_000;
 export const DEFAULT_ROLES = ["implement", "debug", "review", "read", "deep", "quick", "claude-backup"];
 export const VALID_TIERS = ["light", "mid", "strong"];
@@ -27,6 +30,9 @@ export const VALID_TIERS = ["light", "mid", "strong"];
 // 思考档位后缀从高到低，与 score.mjs 保持一致
 const EFFORT_ORDER = ["xhigh", "high", "medium", "low"];
 const EFFORT_SUFFIX_RE = /-(xhigh|high|medium|low)$/i;
+
+// 非独立对话模型家族的排除规则（例如 Antigravity 的 gemini-pro-orchestrator* / Orchestrator (...) 编排器）
+const EXCLUDED_MODEL_PATTERNS = [/(?:^|[^a-z0-9])orchestrator(?:$|[^a-z0-9])/i];
 
 // Antigravity 官方分组名到额度池的已知映射（与 quota.mjs 保持一致）
 const KNOWN_GROUP_POOLS = {
@@ -225,6 +231,57 @@ export function saveConfigWithBackup(cfg, configFile) {
 // 提取模型家族前缀（去掉 -low/-medium/-high/-xhigh 后缀）
 export function modelFamily(modelId) {
   return String(modelId || "").replace(EFFORT_SUFFIX_RE, "");
+}
+
+// 统一生成「厂商:家族」小写键，用于撤销记录与失败冷却索引
+function familyKey(provider, family) {
+  return `${String(provider || "").trim()}:${String(family || "").trim().toLowerCase()}`;
+}
+
+// 判断清单条目是否应排除在自动发现之外（非独立模型家族，如编排器 orchestrator）
+export function isExcludedDiscoverModel(model) {
+  const id = typeof model === "string" ? model : String(model?.id || "");
+  const label = typeof model === "string" ? "" : String(model?.label || "");
+  return EXCLUDED_MODEL_PATTERNS.some((re) => re.test(id) || (label && re.test(label)));
+}
+
+// 判断某模型在当前厂商配置下是否已归入任一有效额度池（配置 pools 显式收录，或命中单池/poolRules）
+export function isModelPooled(prov, modelId) {
+  if (!prov || !modelId) return false;
+  const validPools = providerPools(prov);
+  if (!validPools.length) return false;
+  const validSet = new Set(validPools);
+  const inPools = poolOfModel(prov, modelId);
+  if (inPools && validSet.has(inPools)) return true;
+  const byRule = assignPool(prov, modelId);
+  if (byRule && validSet.has(byRule)) return true;
+  return false;
+}
+
+// 从 discover-log.jsonl 收集被用户 --undo 撤销过的家族键，避免自动重新接入
+function collectUndoneFamilyKeys(stateDir) {
+  const keys = new Set();
+  for (const rec of readDiscoverLog(stateDir)) {
+    if (rec?.undone && rec.provider && rec.family) {
+      keys.add(familyKey(rec.provider, rec.family));
+    }
+  }
+  return keys;
+}
+
+// 读取仍处于失败冷却期内的家族记录，自动丢弃已过期或格式异常的条目
+function loadActiveFailedFamilies(state, now, cooldownMs) {
+  const raw = state?.failedFamilies;
+  const active = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return active;
+  for (const [key, item] of Object.entries(raw)) {
+    const ts = item?.at ? Date.parse(item.at) : NaN;
+    if (!Number.isFinite(ts)) continue;
+    if (cooldownMs > 0 && now - ts < cooldownMs) {
+      active[key] = { at: item.at, reason: String(item.reason || "") };
+    }
+  }
+  return active;
 }
 
 // 思考档位排序权重：xhigh(0) > high(1) > medium(2) > low(3) > 无后缀(4)
@@ -482,6 +539,14 @@ export async function resolveFamilyPool(prov, provName, family, variants, cfg, o
     const matched = matchPoolFromGroups(variants, family, groups, validPools);
     if (matched) {
       return { pool: matched, source: "aiquota" };
+    }
+  }
+
+  // 3. 兜底：若同家族已有变体被手动加入某个有效额度池，沿用该池
+  for (const v of variants) {
+    const p = poolOfModel(prov, v.id);
+    if (p && validPools.includes(p)) {
+      return { pool: p, source: "existingPool" };
     }
   }
 
@@ -1115,11 +1180,15 @@ async function runDiscoverWithLock({ stateDir, now, isoNow, state, opts }) {
     return result;
   }
 
-  // 非首次运行：按厂商找出新模型，按家族去重
+  // 非首次运行：按厂商找出新模型与未归池模型，按家族去重
   const known = {};
   for (const [k, list] of Object.entries(state.known || {})) {
     known[k] = Array.isArray(list) ? [...new Set(list.filter((x) => typeof x === "string"))] : [];
   }
+
+  const failCooldownMs = opts.failCooldownMs ?? DISCOVER_FAIL_COOLDOWN_MS;
+  const failedFamilies = loadActiveFailedFamilies(state, now, failCooldownMs);
+  const undoneFamilyKeys = collectUndoneFamilyKeys(stateDir);
 
   const unpooled = [];
   const failed = [];
@@ -1144,25 +1213,37 @@ async function runDiscoverWithLock({ stateDir, now, isoNow, state, opts }) {
       continue;
     }
 
+    // 过滤非模型家族条目（如 orchestrator 编排器），避免当作家族去归池或调研
+    const discoverableModels = allModels.filter((m) => !isExcludedDiscoverModel(m));
     const knownSet = new Set(known[provName]);
-    const newModels = allModels.filter((m) => !knownSet.has(m.id));
-    if (!newModels.length) continue;
+    const hasValidPools = providerPools(prov).length > 0;
+    // 候选条件：不在 known 里的新模型，或尚未归入任何额度池的模型（即使已在 known 里）
+    const candidateModels = discoverableModels.filter(
+      (m) => !knownSet.has(m.id) || (hasValidPools && !isModelPooled(prov, m.id)),
+    );
+    if (!candidateModels.length) continue;
 
     // 按家族去重：同一个家族只归池和调研一次
     const familyOrder = [];
-    const familyNewMap = new Map();
-    for (const m of newModels) {
+    const familyCandidateMap = new Map();
+    for (const m of candidateModels) {
       const fam = modelFamily(m.id);
-      if (!familyNewMap.has(fam)) {
+      if (!familyCandidateMap.has(fam)) {
         familyOrder.push(fam);
-        familyNewMap.set(fam, []);
+        familyCandidateMap.set(fam, []);
       }
-      familyNewMap.get(fam).push(m);
+      familyCandidateMap.get(fam).push(m);
     }
 
     for (const family of familyOrder) {
-      const familyVariants = sortVariantsDesc(allModels.filter((m) => modelFamily(m.id) === family));
-      const newIds = familyNewMap.get(family).map((m) => m.id);
+      const famKey = familyKey(provName, family);
+      // 已被用户 --undo 撤销的家族不再自动重新接入
+      if (undoneFamilyKeys.has(famKey)) continue;
+      // 调研失败或校验未通过且仍在冷却期内的家族，不反复调研
+      if (Object.prototype.hasOwnProperty.call(failedFamilies, famKey)) continue;
+
+      const familyVariants = sortVariantsDesc(discoverableModels.filter((m) => modelFamily(m.id) === family));
+      const variantIds = familyVariants.map((m) => m.id);
       const bestModel = pickHighestVariant(familyVariants);
 
       // 1. 归池
@@ -1171,7 +1252,7 @@ async function runDiscoverWithLock({ stateDir, now, isoNow, state, opts }) {
         unpooled.push({
           provider: provName,
           family,
-          variants: familyVariants.map((m) => m.id),
+          variants: variantIds,
           reason: "poolRules 与 AIQuota5h 分组均未匹配到额度池",
         });
         continue;
@@ -1191,36 +1272,41 @@ async function runDiscoverWithLock({ stateDir, now, isoNow, state, opts }) {
           timeoutMs: opts.researchTimeoutMs,
         });
       } catch (e) {
+        const reason = `调研执行失败：${String(e.message || e).slice(0, 200)}`;
         failed.push({
           provider: provName,
           family,
           pool,
-          variants: familyVariants.map((m) => m.id),
-          reason: `调研执行失败：${String(e.message || e).slice(0, 200)}`,
+          variants: variantIds,
+          reason,
         });
+        failedFamilies[famKey] = { at: isoNow, reason };
         continue;
       }
 
       // 3. 严格校验调研 JSON
       const validated = validateResearchResult(rawResearch, { expectedFamily: family, requiredRoles });
       if (!validated.ok) {
+        const reason = `调研结果非法：${validated.error}`;
         failed.push({
           provider: provName,
           family,
           pool,
-          variants: familyVariants.map((m) => m.id),
-          reason: `调研结果非法：${validated.error}`,
+          variants: variantIds,
+          reason,
         });
+        failedFamilies[famKey] = { at: isoNow, reason };
         continue;
       }
 
       pendingApply.push({
         provider: provName,
         family,
+        famKey,
         pool,
         poolSource,
         variants: familyVariants,
-        newIds,
+        newIds: variantIds,
         bestModel,
         research: validated.value,
       });
@@ -1238,6 +1324,7 @@ async function runDiscoverWithLock({ stateDir, now, isoNow, state, opts }) {
         const set = new Set(known[item.provider] || []);
         for (const id of item.newIds) set.add(id);
         known[item.provider] = [...set];
+        delete failedFamilies[item.famKey];
         if (!hasChanges) continue;
         dirty = true;
         const id = makeRecordId(item.provider, now);
@@ -1310,13 +1397,15 @@ async function runDiscoverWithLock({ stateDir, now, isoNow, state, opts }) {
   };
   result.summary = formatDiscoverSummary(result);
 
-  saveDiscoverState(stateDir, {
+  const nextState = {
     version: 1,
     initialized: true,
     lastRunAt: isoNow,
     known,
+    ...(Object.keys(failedFamilies).length ? { failedFamilies } : {}),
     lastResult: result,
-  });
+  };
+  saveDiscoverState(stateDir, nextState);
 
   return result;
 }

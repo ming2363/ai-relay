@@ -54,7 +54,7 @@ test("旧配置升级：Grok 删固定 --reasoning-effort xhigh 并补 cli.effor
   assert.equal(agy.defaultModels.gemini, "gemini-4-hydrogen-xhigh");
   assert.equal(agy.poolLabels.gemini, "Gemini Neon / Hydrogen / Flash");
   assert.ok(cfg.routes.quick.includes("agy:gemini:default"));
-  assert.deepEqual(cfg.migrated, ["max-thinking", "gemini-hydrogen", "gemini-neon", "read-route-0.27", "quick-route-0.28", "effort-args-0.29"]);
+  assert.deepEqual(cfg.migrated, ["max-thinking", "gemini-hydrogen", "gemini-neon", "read-route-0.27", "quick-route-0.28", "effort-args-0.29", "gemini-carbon-0.30"]);
 });
 
 test("旧配置升级只做一次：用户改过的默认模型不覆盖，升级后删掉的不再加回", () => {
@@ -321,7 +321,7 @@ function makeRelayHome(mutateCfg) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "relay-effort-cli-"));
   const cfg = structuredClone(DEF);
   cfg.quotaDb = "";
-  cfg.migrated = ["max-thinking", "gemini-hydrogen", "gemini-neon", "read-route-0.27", "quick-route-0.28", "effort-args-0.29"];
+  cfg.migrated = ["max-thinking", "gemini-hydrogen", "gemini-neon", "read-route-0.27", "quick-route-0.28", "effort-args-0.29", "gemini-carbon-0.30"];
   if (mutateCfg) mutateCfg(cfg, home);
   fs.writeFileSync(path.join(home, "providers.json"), JSON.stringify(cfg, null, 2) + "\n");
   fs.writeFileSync(path.join(home, "mode"), "auto\n");
@@ -352,7 +352,7 @@ test("relay pick：默认选档、--effort 覆盖、困难下限、--write 上�
     assert.match(implMed.stdout, /gemini-4-neon-xhigh/);
     const implJson = JSON.parse(runRelay(home, ["pick", "implement", "--level", "中等", "--json"]).stdout);
     assert.equal(implJson.effort, "xhigh");
-    const neonCand = [implJson.choice, ...implJson.alternatives].find((c) => c.pool === "gemini");
+    const neonCand = [implJson.choice, ...implJson.alternatives].find((c) => c.pool === "gemini" && /neon/.test(c.model));
     assert.equal(neonCand.model, "gemini-4-neon-xhigh");
 
     // 2. read + 简单 → 默认中档（gemini-4-hydrogen-medium），输出「思考：中」
@@ -379,7 +379,7 @@ test("relay pick：默认选档、--effort 覆盖、困难下限、--write 上�
     assert.match(hardLow.stdout, /思考：高/);
     const hardJson = JSON.parse(runRelay(home, ["pick", "implement", "--level", "困难", "--effort", "低", "--json"]).stdout);
     assert.equal(hardJson.effort, "high");
-    const hardNeon = [hardJson.choice, ...hardJson.alternatives].find((c) => c.pool === "gemini");
+    const hardNeon = [hardJson.choice, ...hardJson.alternatives].find((c) => c.pool === "gemini" && /neon/.test(c.model));
     assert.equal(hardNeon.model, "gemini-4-neon-high");
 
     // 6. 非法 --effort 报错退出码 2

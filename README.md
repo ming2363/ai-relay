@@ -417,6 +417,13 @@ Codex is not started by `relay run`. It goes through the official Codex plugin, 
 
 Versions are listed as "ai-relay / panel ai-relay-status".
 
+### 0.30.0 / 0.29.0 · 2026-11-24
+
+**Gemini 4 Carbon, panel and discovery fixes**
+- Gemini 4 Carbon joins the gemini pool (high is strong tier, low / medium mid) and is routed for implement, debug, review, read, deep and claude-backup. Older configs migrate automatically.
+- Model discovery now onboards models that were already listed but never pooled; failed families wait 24 hours before another attempt, undone ones stay out, and orchestrator entries are ignored.
+- The panel's View button brings the pane to the front even when it was already open behind another tab or collapsed.
+
 ### 0.29.0 / 0.28.0 · 2026-11-24
 
 **Thinking effort per task**

@@ -42,6 +42,10 @@ export const DEFAULT_MODEL_TIERS = {
   "agy:gemini-4-neon*": "strong",
   "agy:gemini-4-neon-low": "mid",
   "agy:gemini-4-neon-medium": "mid",
+  // Gemini 4 Carbon：旗舰深度推理模型，和 Neon / Hydrogen / Flash 同池；高思考档按强档，中低档按中档
+  "agy:gemini-4-carbon*": "strong",
+  "agy:gemini-4-carbon-low": "mid",
+  "agy:gemini-4-carbon-medium": "mid",
   "agy:gpt-oss*": "light",
   "agy:gemini-4-argon-low": "mid",
   "agy:gemini-4-argon-medium": "mid",

@@ -12,6 +12,7 @@ import { assignPool } from "./models.mjs";
 import { modelTier } from "./score.mjs";
 import {
   DISCOVER_INTERVAL_MS,
+  DISCOVER_FAIL_COOLDOWN_MS,
   discoverModels,
   undoDiscover,
   listDiscoverRecords,
@@ -22,6 +23,8 @@ import {
   validateResearchResult,
   extractJsonObject,
   buildResearchBrief,
+  isExcludedDiscoverModel,
+  isModelPooled,
 } from "./discover.mjs";
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -266,7 +269,7 @@ test("3. poolRules 不中时按 AIQuota5h 分组归池（含真实多行全量 g
       groups: [
         {
           displayName: "Gemini Models",
-          description: "Models within this group: Gemini 5 Krypton, Orchestrator (Krypton), Gemini 3.8 Flash",
+          description: "Models within this group: Gemini 5 Krypton, Gemini 5 Lite (Preview), Orchestrator (Krypton), Gemini 3.8 Flash",
           buckets: [{ bucketId: "gemini-weekly" }, { bucketId: "gemini-5h" }],
         },
         {
@@ -292,6 +295,7 @@ test("3. poolRules 不中时按 AIQuota5h 分组归池（含真实多行全量 g
     const geminiGroup = parsedGroups.find((g) => g.pool === "gemini");
     const claudeGroup = parsedGroups.find((g) => g.pool === "claude-gpt");
     assert.ok(geminiGroup.models.includes("gemini 5 krypton"));
+    assert.ok(geminiGroup.models.includes("gemini 5 lite (preview)"));
     assert.ok(geminiGroup.models.includes("orchestrator (krypton)"));
     assert.ok(!claudeGroup.models.includes("gemini 5 krypton"));
 
@@ -304,7 +308,7 @@ test("3. poolRules 不中时按 AIQuota5h 分组归池（含真实多行全量 g
           ...base,
           { id: "gemini-5-krypton-xhigh", label: "Gemini 5 Krypton (XHigh)" },
           { id: "gemini-5-krypton-low", label: "Gemini 5 Krypton (Low)" },
-          { id: "gemini-orch-krypton", label: "Orchestrator (Krypton)" },
+          { id: "gemini-5-lite-preview", label: "Gemini 5 Lite (Preview)" },
         ],
       }),
       readQuotaPools: async () => fakeSnapshots,
@@ -313,17 +317,17 @@ test("3. poolRules 不中时按 AIQuota5h 分组归池（含真实多行全量 g
 
     assert.equal(res.added.length, 2);
     const krypton = res.added.find((a) => a.family === "gemini-5-krypton");
-    const orch = res.added.find((a) => a.family === "gemini-orch-krypton");
+    const litePreview = res.added.find((a) => a.family === "gemini-5-lite-preview");
     assert.equal(krypton.pool, "gemini");
     assert.equal(krypton.poolSource, "aiquota");
-    assert.equal(orch.pool, "gemini");
-    assert.equal(orch.poolSource, "aiquota");
+    assert.equal(litePreview.pool, "gemini");
+    assert.equal(litePreview.poolSource, "aiquota");
 
     const cfg = env.readCfg();
     // 补了 poolRules 规则，之后 assignPool 可直接命中
     assert.equal(assignPool(cfg.providers.agy, "gemini-5-krypton-xhigh"), "gemini");
     assert.equal(assignPool(cfg.providers.agy, "gemini-5-krypton-low"), "gemini");
-    assert.equal(assignPool(cfg.providers.agy, "gemini-orch-krypton"), "gemini");
+    assert.equal(assignPool(cfg.providers.agy, "gemini-5-lite-preview"), "gemini");
     assert.ok(cfg.providers.agy.pools.gemini.includes("gemini-5-krypton-xhigh"));
     assert.ok(cfg.providers.agy.pools.gemini.includes("gemini-5-krypton-low"));
     assert.equal(cfg.modelTiers["agy:gemini-5-krypton*"], "strong");
@@ -759,6 +763,351 @@ test("11. 调研派单通过 brief.mjs 全部校验，且运行中锁防重入�
     assert.equal(res.skipped, true);
     assert.equal(res.reason, "running");
     assert.equal(getModelsCalled, false);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("12. known 里已有但未归池的模型家族会成为候选并自动接入；已归池的不重复处理", async () => {
+  const env = makeEnv();
+  try {
+    const t0 = Date.parse("2026-11-20T00:00:00.000Z");
+    const agyModels = [
+      { id: "gemini-4-argon-high", label: "Gemini 4 Argon (High)" },
+      { id: "gemini-3.8-flash-high", label: "Gemini 3.8 Flash (High)" },
+      { id: "gemini-4-carbon-low", label: "Gemini 4 Carbon (Low)" },
+      { id: "gemini-4-carbon-medium", label: "Gemini 4 Carbon (Medium)" },
+      { id: "gemini-4-carbon-high", label: "Gemini 4 Carbon (High)" },
+    ];
+    const grokModels = [{ id: "grok-4.7", label: "grok-4.7" }];
+
+    // 先验证 isModelPooled：已归池和单池厂商为 true，未归池的 carbon 为 false
+    const initCfg = env.readCfg();
+    assert.equal(isModelPooled(initCfg.providers.agy, "gemini-4-argon-high"), true);
+    assert.equal(isModelPooled(initCfg.providers.agy, "gemini-4-carbon-high"), false);
+    assert.equal(isModelPooled(initCfg.providers.grok, "grok-4.7"), true);
+
+    // 首次初始化：Carbon 已在清单里，会被写进 known.agy，但仍未归池
+    const r0 = await discoverModels({
+      stateDir: env.stateDir,
+      configFile: env.configFile,
+      now: t0,
+      getModels: async () => makeCache({ agy: agyModels, grok: grokModels }),
+    });
+    assert.equal(r0.initial, true);
+    const state0 = loadDiscoverState(env.stateDir);
+    assert.ok(state0.known.agy.includes("gemini-4-carbon-high"));
+    assert.ok(state0.known.agy.includes("gemini-4-carbon-medium"));
+    assert.ok(state0.known.agy.includes("gemini-4-carbon-low"));
+
+    // 非首次运行（即使 Carbon 已在 known.agy）：未归池的 Carbon 仍成为候选并自动接入；已归池模型不重复处理
+    const researched = [];
+    const r1 = await discoverModels({
+      stateDir: env.stateDir,
+      configFile: env.configFile,
+      now: t0 + 1000,
+      force: true,
+      getModels: async () => makeCache({ agy: agyModels, grok: grokModels }),
+      readQuotaPools: async () => [{ pool: "gemini", models: ["Gemini 4 Carbon"] }],
+      research: async ({ provider, family, variants }) => {
+        researched.push({ provider, family, count: variants.length });
+        return makeValidResearch(family, { tier: "mid", vision: true });
+      },
+    });
+
+    assert.deepEqual(researched, [{ provider: "agy", family: "gemini-4-carbon", count: 3 }]);
+    assert.equal(r1.added.length, 1);
+    assert.equal(r1.added[0].family, "gemini-4-carbon");
+    assert.equal(r1.added[0].pool, "gemini");
+    assert.equal(r1.added[0].poolSource, "aiquota");
+    assert.equal(r1.added[0].bestModel, "gemini-4-carbon-high");
+
+    const cfgAfter = env.readCfg();
+    assert.equal(isModelPooled(cfgAfter.providers.agy, "gemini-4-carbon-high"), true);
+    assert.ok(cfgAfter.providers.agy.pools.gemini.includes("gemini-4-carbon-high"));
+    assert.ok(cfgAfter.providers.agy.pools.gemini.includes("gemini-4-carbon-medium"));
+    assert.ok(cfgAfter.providers.agy.pools.gemini.includes("gemini-4-carbon-low"));
+    assert.equal(cfgAfter.modelTiers["agy:gemini-4-carbon*"], "mid");
+
+    // 归池完成后再次探测：已归池模型不会重复调研或接入
+    const r2 = await discoverModels({
+      stateDir: env.stateDir,
+      configFile: env.configFile,
+      now: t0 + 2000,
+      force: true,
+      getModels: async () => makeCache({ agy: agyModels, grok: grokModels }),
+      readQuotaPools: async () => [{ pool: "gemini", models: ["Gemini 4 Carbon"] }],
+      research: async ({ provider, family }) => {
+        researched.push({ provider, family });
+        return makeValidResearch(family);
+      },
+    });
+    assert.equal(researched.length, 1);
+    assert.equal(r2.added.length, 0);
+    assert.equal(r2.unpooled.length, 0);
+    assert.equal(r2.failed.length, 0);
+    assert.equal(r2.summary, "未发现新模型");
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("13. --undo 撤销过的未归池家族不会被重新接入", async () => {
+  const env = makeEnv();
+  try {
+    const t0 = Date.parse("2026-11-20T00:00:00.000Z");
+    const agyModels = [
+      { id: "gemini-4-argon-high", label: "Gemini 4 Argon (High)" },
+      { id: "gemini-4-carbon-low", label: "Gemini 4 Carbon (Low)" },
+      { id: "gemini-4-carbon-high", label: "Gemini 4 Carbon (High)" },
+    ];
+
+    await discoverModels({
+      stateDir: env.stateDir,
+      configFile: env.configFile,
+      now: t0,
+      getModels: async () => makeCache({ agy: agyModels }),
+    });
+
+    let researchCalls = 0;
+    const r1 = await discoverModels({
+      stateDir: env.stateDir,
+      configFile: env.configFile,
+      now: t0 + 1000,
+      force: true,
+      getModels: async () => makeCache({ agy: agyModels }),
+      readQuotaPools: async () => [{ pool: "gemini", models: ["Gemini 4 Carbon"] }],
+      research: async ({ family }) => {
+        researchCalls += 1;
+        return makeValidResearch(family);
+      },
+    });
+    assert.equal(r1.added.length, 1);
+    assert.equal(researchCalls, 1);
+
+    // 撤销后，poolRule 和 pools 都回滚，Carbon 重新变成未归池状态
+    undoDiscover(r1.added[0].id, {
+      stateDir: env.stateDir,
+      configFile: env.configFile,
+      now: t0 + 2000,
+    });
+    const cfgUndoneRaw = fs.readFileSync(env.configFile, "utf8");
+    assert.equal(isModelPooled(env.readCfg().providers.agy, "gemini-4-carbon-high"), false);
+
+    // 即使加 --force、过了冷却期、且同家族新增了 xhigh 档位，也不会再次调研或重新接入
+    const r2 = await discoverModels({
+      stateDir: env.stateDir,
+      configFile: env.configFile,
+      now: t0 + DISCOVER_FAIL_COOLDOWN_MS + 10_000,
+      force: true,
+      getModels: async () => makeCache({
+        agy: [
+          ...agyModels,
+          { id: "gemini-4-carbon-xhigh", label: "Gemini 4 Carbon (XHigh)" },
+        ],
+      }),
+      readQuotaPools: async () => [{ pool: "gemini", models: ["Gemini 4 Carbon"] }],
+      research: async ({ family }) => {
+        researchCalls += 1;
+        return makeValidResearch(family);
+      },
+    });
+
+    assert.equal(researchCalls, 1);
+    assert.equal(r2.added.length, 0);
+    assert.equal(r2.unpooled.length, 0);
+    assert.equal(r2.failed.length, 0);
+    assert.equal(fs.readFileSync(env.configFile, "utf8"), cfgUndoneRaw);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("14. 调研失败或校验未通过的家族在节流期内不反复调研，超冷却期后恢复重试", async () => {
+  const env = makeEnv();
+  try {
+    const t0 = Date.parse("2026-11-20T00:00:00.000Z");
+    const agyModels = [
+      { id: "gemini-4-argon-high", label: "Gemini 4 Argon (High)" },
+      { id: "gemini-4-carbon-high", label: "Gemini 4 Carbon (High)" },
+      { id: "gemini-4-carbon-low", label: "Gemini 4 Carbon (Low)" },
+    ];
+    await discoverModels({
+      stateDir: env.stateDir,
+      configFile: env.configFile,
+      now: t0,
+      getModels: async () => makeCache({ agy: agyModels, grok: [{ id: "grok-4.7", label: "grok-4.7" }] }),
+    });
+
+    const researched = [];
+    let shouldFail = true;
+    const researchMock = async ({ provider, family }) => {
+      researched.push(`${provider}:${family}`);
+      if (shouldFail) {
+        if (family === "gemini-4-carbon") throw new Error("网络超时");
+        if (family === "grok-5") return JSON.stringify({ family: "grok-5", tier: "invalid", vision: true, fits: makeFits(), evidence: ["https://x.ai"], reason: "bad" });
+      }
+      return makeValidResearch(family, { tier: "mid", vision: true });
+    };
+
+    const t1 = t0 + DISCOVER_INTERVAL_MS;
+    const rFail = await discoverModels({
+      stateDir: env.stateDir,
+      configFile: env.configFile,
+      now: t1,
+      getModels: async () => makeCache({
+        agy: agyModels,
+        grok: [{ id: "grok-4.7", label: "grok-4.7" }, { id: "grok-5", label: "grok-5" }],
+      }),
+      readQuotaPools: async () => [{ pool: "gemini", models: ["Gemini 4 Carbon"] }],
+      research: researchMock,
+    });
+    assert.equal(rFail.added.length, 0);
+    assert.equal(rFail.failed.length, 2);
+    assert.deepEqual(researched, ["agy:gemini-4-carbon", "grok:grok-5"]);
+
+    const stateAfterFail = loadDiscoverState(env.stateDir);
+    assert.ok(stateAfterFail.failedFamilies["agy:gemini-4-carbon"]);
+    assert.ok(stateAfterFail.failedFamilies["grok:grok-5"]);
+
+    // 下一个正常探测周期（6 小时后，仍在 24 小时失败冷却期内）：不重复调研失败家族，但新出现的 grok-5.1 照常接入
+    const rCooldown = await discoverModels({
+      stateDir: env.stateDir,
+      configFile: env.configFile,
+      now: t1 + DISCOVER_INTERVAL_MS,
+      getModels: async () => makeCache({
+        agy: agyModels,
+        grok: [
+          { id: "grok-4.7", label: "grok-4.7" },
+          { id: "grok-5", label: "grok-5" },
+          { id: "grok-5.1", label: "grok-5.1" },
+        ],
+      }),
+      readQuotaPools: async () => [{ pool: "gemini", models: ["Gemini 4 Carbon"] }],
+      research: researchMock,
+    });
+    assert.deepEqual(researched, ["agy:gemini-4-carbon", "grok:grok-5", "grok:grok-5.1"]);
+    assert.equal(rCooldown.added.length, 1);
+    assert.equal(rCooldown.added[0].family, "grok-5.1");
+    assert.equal(rCooldown.failed.length, 0);
+
+    // 冷却期内即使带 --force 也不重复骚扰失败家族
+    const rForceCooldown = await discoverModels({
+      stateDir: env.stateDir,
+      configFile: env.configFile,
+      now: t1 + 12 * 3600_000,
+      force: true,
+      getModels: async () => makeCache({
+        agy: agyModels,
+        grok: [
+          { id: "grok-4.7", label: "grok-4.7" },
+          { id: "grok-5", label: "grok-5" },
+          { id: "grok-5.1", label: "grok-5.1" },
+        ],
+      }),
+      readQuotaPools: async () => [{ pool: "gemini", models: ["Gemini 4 Carbon"] }],
+      research: researchMock,
+    });
+    assert.equal(researched.length, 3);
+    assert.equal(rForceCooldown.added.length, 0);
+    assert.equal(rForceCooldown.failed.length, 0);
+
+    // 超过失败冷却期后恢复重试并成功接入，同时清理 failedFamilies 记录
+    shouldFail = false;
+    const rRetry = await discoverModels({
+      stateDir: env.stateDir,
+      configFile: env.configFile,
+      now: t1 + DISCOVER_FAIL_COOLDOWN_MS + 1000,
+      getModels: async () => makeCache({
+        agy: agyModels,
+        grok: [
+          { id: "grok-4.7", label: "grok-4.7" },
+          { id: "grok-5", label: "grok-5" },
+          { id: "grok-5.1", label: "grok-5.1" },
+        ],
+      }),
+      readQuotaPools: async () => [{ pool: "gemini", models: ["Gemini 4 Carbon"] }],
+      research: researchMock,
+    });
+    assert.equal(rRetry.added.length, 2);
+    assert.deepEqual(rRetry.added.map((x) => x.family).sort(), ["gemini-4-carbon", "grok-5"]);
+    assert.equal(loadDiscoverState(env.stateDir).failedFamilies, undefined);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test("15. orchestrator 类条目（按 id 或 label）不当成模型家族去归池或调研", async () => {
+  // 单元测试排除判定
+  assert.equal(isExcludedDiscoverModel({ id: "gemini-pro-orchestrator", label: "Orchestrator (Carbon)" }), true);
+  assert.equal(isExcludedDiscoverModel({ id: "gemini-pro-orchestrator-neon", label: "Orchestrator (Neon)" }), true);
+  assert.equal(isExcludedDiscoverModel({ id: "gemini-pro-orchestrator-argon", label: "Orchestrator (Argon)" }), true);
+  assert.equal(isExcludedDiscoverModel({ id: "gemini-orch-preview", label: "Orchestrator (Preview)" }), true);
+  assert.equal(isExcludedDiscoverModel({ id: "gemini-4-carbon-high", label: "Gemini 4 Carbon (High)" }), false);
+
+  const env = makeEnv();
+  try {
+    const t0 = Date.parse("2026-11-20T00:00:00.000Z");
+    await discoverModels({
+      stateDir: env.stateDir,
+      configFile: env.configFile,
+      now: t0,
+      getModels: async () => makeCache({
+        agy: [
+          { id: "gemini-4-argon-high", label: "Gemini 4 Argon (High)" },
+          { id: "gemini-4-carbon-high", label: "Gemini 4 Carbon (High)" },
+          { id: "gemini-4-carbon-low", label: "Gemini 4 Carbon (Low)" },
+          { id: "gemini-pro-orchestrator", label: "Orchestrator (Carbon)" },
+        ],
+      }),
+    });
+
+    const researchedFamilies = [];
+    const res = await discoverModels({
+      stateDir: env.stateDir,
+      configFile: env.configFile,
+      now: t0 + 1000,
+      force: true,
+      getModels: async () => makeCache({
+        agy: [
+          { id: "gemini-4-argon-high", label: "Gemini 4 Argon (High)" },
+          { id: "gemini-4-carbon-high", label: "Gemini 4 Carbon (High)" },
+          { id: "gemini-4-carbon-low", label: "Gemini 4 Carbon (Low)" },
+          // known 里已有且未归池的 orchestrator
+          { id: "gemini-pro-orchestrator", label: "Orchestrator (Carbon)" },
+          // 新出现且未归池的 orchestrator
+          { id: "gemini-pro-orchestrator-krypton", label: "Orchestrator (Krypton)" },
+          // 仅 label 为 Orchestrator 的新条目
+          { id: "gemini-orch-preview", label: "Orchestrator (Preview)" },
+          // 命中 poolRules（argon）的新编排器
+          { id: "gemini-pro-orchestrator-argon", label: "Orchestrator (Argon)" },
+        ],
+      }),
+      readQuotaPools: async () => [
+        {
+          pool: "gemini",
+          models: ["Gemini 4 Carbon", "Orchestrator (Carbon)", "Orchestrator (Krypton)", "Orchestrator (Preview)"],
+        },
+      ],
+      research: async ({ family }) => {
+        researchedFamilies.push(family);
+        return makeValidResearch(family);
+      },
+    });
+
+    assert.deepEqual(researchedFamilies, ["gemini-4-carbon"]);
+    assert.equal(res.added.length, 1);
+    assert.equal(res.added[0].family, "gemini-4-carbon");
+    assert.equal(res.unpooled.length, 0);
+    assert.equal(res.failed.length, 0);
+
+    const cfg = env.readCfg();
+    const allPoolModels = Object.values(cfg.providers.agy.pools).flat();
+    assert.ok(!allPoolModels.some((id) => /orchestrator|orch-preview/i.test(id)));
+    assert.ok(!cfg.providers.agy.poolRules.some((r) => /orchestrator|orch-preview/i.test(r[0])));
+    for (const entries of Object.values(cfg.routes)) {
+      assert.ok(!entries.some((e) => /orchestrator|orch-preview/i.test(e)));
+    }
   } finally {
     env.cleanup();
   }

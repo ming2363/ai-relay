@@ -468,6 +468,30 @@ function migrateQuickRoute(cfg) {
   });
 }
 
+// Gemini Carbon（0.30）：Carbon 模型进 gemini 池（与 Neon / Hydrogen / Flash 同组）、补归池规则和各角色的 Carbon 路由。
+// 兼容自动探测已写入的规则（如 gemini-4-carbon）和路由（同一角色已有 :gemini-4-carbon 条目不重复加）；只做一次，用户删掉的不再加回
+function migrateCarbon(cfg, def) {
+  const dp = def.providers?.agy;
+  const p = cfg.providers?.agy;
+  if (!dp || !p?.pools?.gemini) return false;
+  return migrateOnce(cfg, "gemini-carbon-0.30", () => {
+    const carbon = (dp.pools?.gemini || []).filter((m) => /carbon/i.test(m));
+    p.pools.gemini = [...carbon.filter((m) => !p.pools.gemini.includes(m)), ...p.pools.gemini];
+    const rule = (dp.poolRules || []).find((r) => Array.isArray(r) && r[0] === "carbon");
+    if (rule && Array.isArray(p.poolRules) && !p.poolRules.some((r) => Array.isArray(r) && /carbon/i.test(String(r[0])))) {
+      const at = p.poolRules.findIndex((r) => Array.isArray(r) && r[0] === "flash");
+      p.poolRules.splice(at < 0 ? p.poolRules.length : at, 0, [...rule]);
+    }
+    for (const [role, fresh] of Object.entries(def.routes || {})) {
+      const route = cfg.routes?.[role];
+      if (!Array.isArray(route) || !Array.isArray(fresh)) continue;
+      for (const e of fresh) {
+        if (/:gemini-4-carbon/.test(e) && !route.some((x) => /:gemini-4-carbon/i.test(String(x)))) route.push(e);
+      }
+    }
+  });
+}
+
 export function migrateModelFields(cfg, def) {
   if (!def) {
     try {
@@ -483,6 +507,7 @@ export function migrateModelFields(cfg, def) {
   if (migrateReadRoute(cfg)) changed = true;
   if (migrateQuickRoute(cfg)) changed = true;
   if (migrateEffortArgs(cfg, def)) changed = true;
+  if (migrateCarbon(cfg, def)) changed = true;
   const freshDefaults = new Set();
   for (const [name, dp] of Object.entries(def.providers || {})) {
     const p = cfg.providers?.[name];

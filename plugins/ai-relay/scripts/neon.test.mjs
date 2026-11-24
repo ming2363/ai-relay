@@ -61,7 +61,7 @@ test("旧配置升级：补 Neon 模型、归池规则（在 flash 之前）、�
   assert.ok(cfg.routes.implement.includes("agy:gemini:gemini-4-neon-xhigh:0.9"));
   assert.ok(cfg.routes.implement.includes("maas:maas:glm-5.3:0.75"));
   assert.ok(cfg.routes.deep.includes("agy:gemini:gemini-4-neon-xhigh:0.95"));
-  assert.deepEqual(cfg.migrated, ["max-thinking", "gemini-hydrogen", "gemini-neon", "read-route-0.27", "quick-route-0.28", "effort-args-0.29"]);
+  assert.deepEqual(cfg.migrated, ["max-thinking", "gemini-hydrogen", "gemini-neon", "read-route-0.27", "quick-route-0.28", "effort-args-0.29", "gemini-carbon-0.30"]);
 });
 
 test("升级只做一次：用户删掉的 Neon 路由不加回；已有 Neon 路由（擅长度不同）不重复加", () => {

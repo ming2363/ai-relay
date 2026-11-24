@@ -1815,6 +1815,9 @@ async function openConversation($: Engine) {
   try {
     await update($, tab, () => 'jobs')
     const wasOpen = (await $.ui.panes()).some(p => p.id === PANE)
+    // 已开着的面板再 open 只会改标题，不会把它调到前面（收起或在别的标签后面时点了像没反应）；
+    // 从按钮发起的 focus 也会被拒。所以先关再开：这次 open 由用户的点击发起，界面会把它放到前面
+    if (wasOpen) await $.ui.close({ id: PANE })
     const placed = await $.ui.open({ id: PANE, title: PANE_TITLE })
     // 引擎没把面板放下（窗口太窄、没有能放面板的界面）时给个结果提示，不能点了没反应
     if (placed && placed.isPlaced === false) $.ui.toast('面板暂未显示')
