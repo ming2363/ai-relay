@@ -701,7 +701,7 @@ test("25. 路由去重遇到同一 厂商|池|模型 时保留 fit 更高的条�
         "agy:gemini-argon:default:0.85",
         "agy:gemini:gemini-4-neon-xhigh:0.9",
       ],
-      // 思考档换到最高档后同为 gemini-4-argon-high：低 fit 在前、高 fit 在后应留高 fit；同 fit 留先出现的
+      // 思考档换到目标档后同为 gemini-4-argon-high：低 fit 在前、高 fit 在后应留高 fit；同 fit 留先出现的
       review: [
         "agy:gemini-argon:gemini-4-argon-medium:0.6",
         "agy:gemini-argon:gemini-4-argon-high:0.9",

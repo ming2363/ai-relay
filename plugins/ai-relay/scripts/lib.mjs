@@ -354,8 +354,8 @@ function migrateOnce(cfg, name, fn) {
   return true;
 }
 
-// 思考一律最高（0.24）：默认配置里给命令行加的固定参数（如 Grok 的 --reasoning-effort xhigh）补到旧配置；
-// 用 claude 命令行的自定义接口补上思考预算 MAX_THINKING_TOKENS
+// 历史思考配置迁移（0.24，已被 0.29 按任务选思考强度替代）：保留标记避免旧配置重复跑；
+// 用 claude 命令行的自定义接口补上兜底的 MAX_THINKING_TOKENS（运行时按思考强度覆盖）
 function migrateMaxThinking(cfg, def) {
   return migrateOnce(cfg, "max-thinking", () => {
     for (const [name, dp] of Object.entries(def.providers || {})) {
@@ -365,6 +365,32 @@ function migrateMaxThinking(cfg, def) {
     for (const p of Object.values(cfg.providers || {})) {
       if (p?.endpoint && p.cli?.bin === "claude" && p.env && typeof p.env === "object" && p.env.MAX_THINKING_TOKENS === undefined) {
         p.env.MAX_THINKING_TOKENS = "32000";
+      }
+    }
+  });
+}
+
+// 按任务选思考强度（0.29）：把旧配置 alwaysArgs 里固定写死的 --reasoning-effort xhigh 这一对删掉、补上 cli.effort；
+// 用户自己加的其他 alwaysArgs 不动
+function migrateEffortArgs(cfg, def) {
+  return migrateOnce(cfg, "effort-args-0.29", () => {
+    for (const [name, dp] of Object.entries(def.providers || {})) {
+      const p = cfg.providers?.[name];
+      if (!p?.cli) continue;
+      if (Array.isArray(p.cli.alwaysArgs)) {
+        const next = [];
+        for (let i = 0; i < p.cli.alwaysArgs.length; i++) {
+          if (p.cli.alwaysArgs[i] === "--reasoning-effort" && p.cli.alwaysArgs[i + 1] === "xhigh") {
+            i++;
+            continue;
+          }
+          next.push(p.cli.alwaysArgs[i]);
+        }
+        if (next.length) p.cli.alwaysArgs = next;
+        else delete p.cli.alwaysArgs;
+      }
+      if (Array.isArray(dp.cli?.effort) && p.cli.effort === undefined) {
+        p.cli.effort = [...dp.cli.effort];
       }
     }
   });
@@ -456,6 +482,7 @@ export function migrateModelFields(cfg, def) {
   if (migrateNeon(cfg, def)) changed = true;
   if (migrateReadRoute(cfg)) changed = true;
   if (migrateQuickRoute(cfg)) changed = true;
+  if (migrateEffortArgs(cfg, def)) changed = true;
   const freshDefaults = new Set();
   for (const [name, dp] of Object.entries(def.providers || {})) {
     const p = cfg.providers?.[name];
@@ -974,6 +1001,7 @@ export function allJobRecords(limit = Infinity) {
           pid: j.pid ?? null,
           helpRequest: j.helpRequest || "",
           ...(j.level ? { level: j.level } : {}),
+          ...(j.effort ? { effort: j.effort } : {}),
           ...(j.reworkOf ? { reworkOf: j.reworkOf, reworkRound: j.reworkRound || 1 } : {}),
           // 发起这次外派的 Claude 会话；旧任务没有，jobs --json 就不带这个字段
           ...(typeof j.sessionId === "string" && j.sessionId.trim() ? { sessionId: j.sessionId.trim() } : {}),
@@ -1422,6 +1450,7 @@ export function recordPick(role, pick) {
     provider: pick.choice?.provider || null,
     model: pick.choice?.model || null,
     level: pick.level || null,
+    effort: pick.effort || null,
     reason: pick.choice?.reason || "",
     skipped: (pick.skipped || []).map((s) => `${s.provider}/${s.model}：${s.why}`),
   };

@@ -30,7 +30,7 @@ test("Neon 和 Orchestrator (Neon) 归入 gemini 池（官方与 Hydrogen / Flas
   assert.equal(assignPool(agy, "gemini-4-argon-high"), "gemini-argon");
 });
 
-test("Neon 高思考档是强档，低档是中档；派单时换成 xhigh", () => {
+test("Neon 高思考档是强档，低档是中档；maxVariant 返回最高档 xhigh", () => {
   assert.equal(modelTier(DEF, "agy", "gemini-4-neon-xhigh"), "strong");
   assert.equal(modelTier(DEF, "agy", "gemini-4-neon-high"), "strong");
   assert.equal(modelTier(DEF, "agy", "gemini-4-neon-medium"), "mid");
@@ -61,7 +61,7 @@ test("旧配置升级：补 Neon 模型、归池规则（在 flash 之前）、�
   assert.ok(cfg.routes.implement.includes("agy:gemini:gemini-4-neon-xhigh:0.9"));
   assert.ok(cfg.routes.implement.includes("maas:maas:glm-5.3:0.75"));
   assert.ok(cfg.routes.deep.includes("agy:gemini:gemini-4-neon-xhigh:0.95"));
-  assert.deepEqual(cfg.migrated, ["max-thinking", "gemini-hydrogen", "gemini-neon", "read-route-0.27", "quick-route-0.28"]);
+  assert.deepEqual(cfg.migrated, ["max-thinking", "gemini-hydrogen", "gemini-neon", "read-route-0.27", "quick-route-0.28", "effort-args-0.29"]);
 });
 
 test("升级只做一次：用户删掉的 Neon 路由不加回；已有 Neon 路由（擅长度不同）不重复加", () => {

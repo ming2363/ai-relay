@@ -56,7 +56,7 @@ const TIER_COST = { light: 1, mid: 0.7, strong: 0.45 };
 
 export const LEVELS = ["easy", "medium", "hard"];
 export const LEVEL_TEXT = { easy: "简单", medium: "中等", hard: "困难" };
-// 每档难度：最低模型档位、打分权重（覆盖默认值）。思考档位不跟难度走，一律最高（见 maxVariant、CODEX_EFFORT）
+// 每档难度：最低模型档位、打分权重（覆盖默认值）。思考强度按难度和任务类型决定（见 defaultEffort / resolveEffort）
 const LEVEL_RULES = {
   // 擅长度权重略高于经济性：擅长度差得不多（如 0.8 对 1.0）时轻档胜出，差一大截（如 0.4 对 0.9）时擅长的模型胜出
   easy: { minTier: "light", weights: { fit: 2, reliability: 2, quota: 2, speed: 0.5, load: 0.5, cost: 1.5 }, note: "优先额度充足、便宜的模型" },
@@ -64,12 +64,47 @@ const LEVEL_RULES = {
   hard: { minTier: "strong", weights: { fit: 3, reliability: 3, quota: 0.1, speed: 0.25, load: 0.25 }, note: "只派强档，看擅长和可靠" },
 };
 
-// 思考一律开到最高（用户 2026-11-17 定的，不分难度）。
-// Codex：codex-companion 最高只收 xhigh（Codex 模型本身支持到 max/ultra，但插件会拒绝）
-export const CODEX_EFFORT = "xhigh";
+// 思考强度四档（从低到高）：支持点名；未点名时按难度决定（简单→中、中等→高、困难→最高），
+// 写代码/写文档任务（implement 或可写）再上调一档（封顶最高）；困难任务不低于高。
+// Codex：codex-companion 最高收 xhigh；Grok：--reasoning-effort；自定义 claude 接口：MAX_THINKING_TOKENS
+export const EFFORTS = ["low", "medium", "high", "xhigh"];
+export const EFFORT_TEXT = { low: "低", medium: "中", high: "高", xhigh: "最高" };
+const EFFORT_RANK = { low: 0, medium: 1, high: 2, xhigh: 3 };
+const LEVEL_DEFAULT_EFFORT = { easy: "medium", medium: "high", hard: "xhigh" };
+export const THINKING_TOKENS = { low: "4000", medium: "10000", high: "20000", xhigh: "32000" };
 
-// 模型名后缀表示思考档位，从高到低
+// 模型名后缀表示思考档位，从高到低（供 maxVariant 找额度池里最高一档用）
 const EFFORT_ORDER = ["xhigh", "high", "medium", "low"];
+
+// 「低 / 中 / 高 / 最高」或 low / medium / high / xhigh，认不出返回 null
+export function parseEffort(raw) {
+  const v = String(raw ?? "").trim().toLowerCase();
+  if (!v) return null;
+  if (v === "low" || v === "低") return "low";
+  if (v === "medium" || v === "中") return "medium";
+  if (v === "high" || v === "高") return "high";
+  if (v === "xhigh" || v === "最高") return "xhigh";
+  return null;
+}
+
+// 未点名时的默认思考强度：简单→中、中等→高、困难→最高；
+// 写代码或写文档（角色为 implement 或可写任务）上调一档，封顶最高。不传难度时基线按「高」
+export function defaultEffort(level, { role, write } = {}) {
+  const base = LEVEL_DEFAULT_EFFORT[level] || "high";
+  const rank = EFFORT_RANK[base];
+  const bumped = (role === "implement" || !!write) ? Math.min(EFFORTS.length - 1, rank + 1) : rank;
+  return EFFORTS[bumped];
+}
+
+// 最终思考强度：显式点名优先于默认值；困难任务不低于「高」（点名低于高的按高处理）
+export function resolveEffort({ level, role, write, effort } = {}) {
+  const parsed = effort ? parseEffort(effort) : null;
+  let chosen = parsed || defaultEffort(level, { role, write });
+  if (level === "hard" && EFFORT_RANK[chosen] < EFFORT_RANK.high) {
+    chosen = "high";
+  }
+  return chosen;
+}
 
 // 这个档位的模型能不能接这个难度的活；downgrade 为真时门槛降一档；
 // steps 为真且难度为中等时，视同带步骤规格，门槛同样降一档（轻档可接）
@@ -115,6 +150,28 @@ export function maxVariant(cfg, provider, pool, model) {
   for (const effort of EFFORT_ORDER) {
     const want = `${m[1]}-${effort}`;
     if (want === model || list.includes(want)) return want;
+  }
+  return model;
+}
+
+// 同一模型有 -low/-medium/-high/-xhigh 几档时，按目标思考强度在额度池模型列表里选档：
+// 先找想要的那档；没有就取比它高的最近一档；再没有就取比它低的最近一档；没有后缀或池里一档都没有就不换
+export function pickVariant(cfg, provider, pool, model, effort) {
+  const m = String(model || "").match(/^(.*)-(xhigh|high|medium|low)$/);
+  if (!m) return model;
+  const targetIdx = EFFORTS.indexOf(effort);
+  if (targetIdx < 0) return model;
+  const list = cfg?.providers?.[provider]?.pools?.[pool] || [];
+  const base = m[1];
+  const exact = `${base}-${EFFORTS[targetIdx]}`;
+  if (list.includes(exact)) return exact;
+  for (let i = targetIdx + 1; i < EFFORTS.length; i++) {
+    const cand = `${base}-${EFFORTS[i]}`;
+    if (list.includes(cand)) return cand;
+  }
+  for (let i = targetIdx - 1; i >= 0; i--) {
+    const cand = `${base}-${EFFORTS[i]}`;
+    if (list.includes(cand)) return cand;
   }
   return model;
 }
@@ -383,9 +440,10 @@ function poolHasStrongModel(cfg, provName, pool, currentTier) {
 
 // level：任务难度（easy / medium / hard），不传按旧规则只看角色路由；downgrade 为真时档位门槛降一档，权重仍按原难度；
 // steps 为真且难度为中等时同样降一档（派单带合格的「## 步骤」规格，轻档可接），其他难度忽略；
-// exactModel：调用方点名了具体模型，不换成最高思考档
+// effort：显式点名的思考强度（low / medium / high / xhigh 或中文），未传时按难度和任务类型决定（困难不低于高）
+// exactModel：调用方点名了具体模型，不按思考强度换后缀档
 // excludeProviders：不考虑这些厂商（自动初审时排除实现者所在的厂商）
-export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now(), write, target, workspace, needs, level, downgrade, steps, exactModel, excludeProviders } = {}) {
+export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now(), write, target, workspace, needs, level, downgrade, steps, exactModel, excludeProviders, effort } = {}) {
   const route = cfg?.routes?.[role];
   if (!route) {
     const available = Object.keys(cfg?.routes || {}).join(", ");
@@ -396,11 +454,15 @@ export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now
   const skipped = [];
   const rule = level ? LEVEL_RULES[level] : null;
   if (level && !rule) throw new Error(`未知难度 ${level}，可选：简单 / 中等 / 困难`);
+  if (effort !== undefined && effort !== null && effort !== "" && !parseEffort(effort)) {
+    throw new Error(`未知思考强度 ${effort}，可选：低 / 中 / 高 / 最高`);
+  }
+  const resolvedEffort = resolveEffort({ level, role, write, effort });
   const hasSteps = level === "medium" && !!steps;
   const minRank = rule ? Math.max(0, TIER_RANK[rule.minTier] - (downgrade || hasSteps ? 1 : 0)) : 0;
   const weights = rule?.weights ? { ...cfg?.scoreWeights, ...rule.weights } : cfg?.scoreWeights;
 
-  // 同一模型的不同思考档换到最高档、或 defaultModels 切到同一模型后会重复：保留擅长度（fit）更高的条目
+  // 同一模型的不同思考档换到目标档、或 defaultModels 切到同一模型后会重复：保留擅长度（fit）更高的条目
   const deduped = [];
   const seen = new Map();
   for (let i = 0; i < route.length; i++) {
@@ -410,7 +472,7 @@ export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now
     if (Array.isArray(excludeProviders) && excludeProviders.includes(provName)) continue;
 
     const resolved = resolveModel(cfg, provName, pool, routeModel);
-    const model = exactModel ? resolved : maxVariant(cfg, provName, pool, resolved);
+    const model = exactModel ? resolved : pickVariant(cfg, provName, pool, resolved, resolvedEffort);
     const rawFit = calcFit(i, fitRaw);
     const seenKey = `${provName}|${pool}|${model}`;
     const item = { i, provName, pool, routeModel, model, rawFit };
@@ -633,6 +695,7 @@ export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now
   return {
     role,
     level: level || null,
+    effort: resolvedEffort,
     choice: ordered[0] || null,
     alternatives: ordered.slice(1),
     skipped,

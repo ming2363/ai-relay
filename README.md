@@ -135,7 +135,7 @@ While throttling or conserving, a turn in which the lead reads files more than 8
 
 ### Routing
 
-Every brief must state a difficulty, `难度：简单|中等|困难` (easy / medium / hard), or the run is refused. Models sit in three tiers (`modelTiers`): light (Gemini 4 Hydrogen, Gemini 3.8 Flash, Codex GPT-6-Luna and GPT-5.6), mid (Grok, Argon and Neon medium/low, Sonnet, Codex GPT-6.1-Terra and GPT-6-Sol) and strong (Codex GPT-6-Astra and GPT-6.1-Sol, Gemini 4 Neon high/xhigh, Argon high, Opus). Thinking always runs at the highest level the pool offers (Codex gets `--effort xhigh`). Easy work may go to any tier and favours cheap models with spare quota. Medium work needs mid or strong. Hard work goes to strong models only; when none has quota, Claude does it or passes `--downgrade "<reason>"`.
+Every brief must state a difficulty, `难度：简单|中等|困难` (easy / medium / hard), or the run is refused. Models sit in three tiers (`modelTiers`): light (Gemini 4 Hydrogen, Gemini 3.8 Flash, Codex GPT-6-Luna and GPT-5.6), mid (Grok, Argon and Neon medium/low, Sonnet, Codex GPT-6.1-Terra and GPT-6-Sol) and strong (Codex GPT-6-Astra and GPT-6.1-Sol, Gemini 4 Neon high/xhigh, Argon high, Opus). Thinking effort (low / medium / high / max) is chosen per task: the lead names it with `--effort` or a `思考：` line in the brief; otherwise easy → medium, medium → high, hard → max, and code or doc writing goes one level higher. Hard tasks never run below high. Easy work may go to any tier and favours cheap models with spare quota. Medium work needs mid or strong. Hard work goes to strong models only; when none has quota, Claude does it or passes `--downgrade "<reason>"`.
 
 `relay pick <role> --level <difficulty>` prints the first choice, the backups, and the models it skipped, each with a reason.
 
@@ -416,6 +416,12 @@ Codex is not started by `relay run`. It goes through the official Codex plugin, 
 ## 📝 Changelog
 
 Versions are listed as "ai-relay / panel ai-relay-status".
+
+### 0.29.0 / 0.28.0 · 2026-11-24
+
+**Thinking effort per task**
+- Workers no longer always run at maximum thinking. The lead picks low / medium / high / max with `--effort` or a `思考：` line; otherwise easy → medium, medium → high, hard → max, code and doc writing one level higher, and hard tasks never below high.
+- agy switches to the matching model variant; Codex `--effort`, Grok `--reasoning-effort` and the custom-endpoint thinking budget follow the chosen level. Grok's fixed xhigh in older configs is migrated away.
 
 ### 0.28.0 / 0.28.0 · 2026-11-24
 

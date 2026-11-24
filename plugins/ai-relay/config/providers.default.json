@@ -178,6 +178,10 @@
           "--model",
           "{model}"
         ],
+        "effort": [
+          "--reasoning-effort",
+          "{effort}"
+        ],
         "read": [
           "--permission-mode",
           "plan"
@@ -189,10 +193,6 @@
         ],
         "fullAccess": [
           "--always-approve"
-        ],
-        "alwaysArgs": [
-          "--reasoning-effort",
-          "xhigh"
         ]
       },
       "modelList": {

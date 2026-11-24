@@ -16,7 +16,7 @@ import {
   lineSnapshot, snapshotDelta, maskSecrets, withoutOtherWriters, scopeLineSnapshot,
 } from "./lib.mjs";
 import { refreshCache, refreshGrok, loadCache, detectQuotaExhausted, markPoolExhausted, parseResetMs } from "./quota.mjs";
-import { scoreRoute, parseLevel, modelTier, tierAllowed, CODEX_EFFORT, LEVEL_TEXT, TIER_TEXT } from "./score.mjs";
+import { scoreRoute, parseLevel, parseEffort, resolveEffort, modelTier, tierAllowed, LEVEL_TEXT, TIER_TEXT, EFFORT_TEXT, THINKING_TOKENS } from "./score.mjs";
 import {
   getModels, loadModelsCache, findModelPool, setProviderDefaultModel, buildModelPools,
 } from "./models.mjs";
@@ -24,19 +24,20 @@ import { cmdModelsDiscover } from "./discover.mjs";
 import { sampleQuotaHistory, lastCycles, workStats } from "./stats.mjs";
 import { usageForJob, usageFromOutputJson, parseClaudeOutput, backfill, attachLiveUsage, getSessionActivityMtime } from "./usage.mjs";
 import {
-  BRIEF_TEMPLATE, checkBrief, roleOfBrief, levelOfBrief, buildDispatchPrompt, readSharedContext, writeSharedContext, clearSharedContext,
+  BRIEF_TEMPLATE, checkBrief, roleOfBrief, levelOfBrief, effortOfBrief, buildDispatchPrompt, readSharedContext, writeSharedContext, clearSharedContext,
   attachJobs, gitDiff, projectContext, scopeOfBrief, needsWithImages, helpRequestOf, hasStepSpec, verifyOfBrief,
 } from "./brief.mjs";
 
 // 按打分选模型：擅长度 × 额度（含快到期加成）× 历史可靠度（含验收结论）× 速度
 // write / target / workspace 原样传给打分，缺了就不做沙箱检查
 // needs 是这次要的能力（web / exec），缺的厂商由打分跳过
-// level 是任务难度，决定候选模型的最低档位和打分侧重；downgrade 为真时门槛降一档；默认换成额度池里最高的思考档，exactModel（点名了模型）时不换
+// level 是任务难度，决定候选模型的最低档位和打分侧重；downgrade 为真时门槛降一档；
+// effort 为显式点名的思考强度（省略时按难度和任务类型决定），选出模型后缀按强度就近匹配，exactModel（点名了模型）时不换
 // steps 为真且难度中等时（派单带合格的「## 步骤」规格），门槛同样降一档，轻档可接
 // 按量计费厂商当天用量到上限后，自动选人把它从首选和备选移到跳过（点名厂商不拦）。
-function route(cfg, rows, role, only, { write, target, workspace, needs, level, downgrade, steps, exactModel, excludeProviders } = {}) {
-  if (only) return scoreRoute(cfg, rows, role, { only, history: allJobRecords(), write, target, workspace, needs, level, downgrade, steps, exactModel });
-  const r = scoreRoute(cfg, rows, role, { history: allJobRecords(), write, target, workspace, needs, level, downgrade, steps, exactModel, excludeProviders });
+function route(cfg, rows, role, only, { write, target, workspace, needs, level, downgrade, steps, exactModel, excludeProviders, effort } = {}) {
+  if (only) return scoreRoute(cfg, rows, role, { only, history: allJobRecords(), write, target, workspace, needs, level, downgrade, steps, exactModel, effort });
+  const r = scoreRoute(cfg, rows, role, { history: allJobRecords(), write, target, workspace, needs, level, downgrade, steps, exactModel, excludeProviders, effort });
   const capped = new Set();
   const keep = [];
   for (const cand of [r.choice, ...r.alternatives]) {
@@ -64,6 +65,7 @@ function route(cfg, rows, role, only, { write, target, workspace, needs, level, 
 }
 
 const LEVEL_HELP = "难度必填：派单里写一行「难度：简单|中等|困难」，或加 --level 简单|中等|困难。简单：照样子改、补注释、整理资料，派便宜、额度多的轻档；中等：常规实现和排查；困难：跨模块设计、疑难排查，只派强档";
+const EFFORT_HELP = "思考强度可选：低 / 中 / 高 / 最高（或 low / medium / high / xhigh）";
 
 // 没选出模型时的说明：先列每条跳过原因；只有够档位的模型全是因为额度被跳过时，才提示降级
 export function noModelText(role, level, skipped) {
@@ -99,7 +101,7 @@ const CODEX_PLUGIN_ID = "codex@openai-codex";
 
 function parseArgs(argv) {
   const opts = { _: [] };
-  const valueFlags = new Set(["--role", "--model", "--cwd", "--prompt-file", "--timeout", "--provider", "--json-spec", "--preset", "--claude-json", "--limit", "--with", "--scope", "--target", "--needs", "--idle-timeout", "--max-runtime", "--verdict", "--level", "--downgrade", "--add", "--remove", "--days", "--undo"]);
+  const valueFlags = new Set(["--role", "--model", "--cwd", "--prompt-file", "--timeout", "--provider", "--json-spec", "--preset", "--claude-json", "--limit", "--with", "--scope", "--target", "--needs", "--idle-timeout", "--max-runtime", "--verdict", "--level", "--effort", "--downgrade", "--add", "--remove", "--days", "--undo"]);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--") {
@@ -241,11 +243,12 @@ function resolveTarget(p) {
 function cmdPick(opts) {
   const role = opts._[1];
   const cfg = loadConfig();
-  // 只有传了 --target 才解析工作区并交给打分；status 不走这里
-  let extra = {};
+  // write 总是传入（影响默认思考强度）；只有传了 --target 才解析工作区做沙箱检查
+  const extra = { write: !!opts.write };
   if (opts.target) {
     const sessionDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
-    extra = { write: !!opts.write, target: resolveTarget(opts.target), workspace: workspaceRoot(sessionDir) };
+    extra.target = resolveTarget(opts.target);
+    extra.workspace = workspaceRoot(sessionDir);
   }
   const needs = parseNeedsFlag(opts.needs);
   if (needs.length) extra.needs = needs;
@@ -253,6 +256,15 @@ function cmdPick(opts) {
   if (!level) {
     console.error(`relay pick 需要 --level 简单|中等|困难。${LEVEL_HELP}`);
     process.exit(2);
+  }
+  let explicitEffort = null;
+  if (Object.prototype.hasOwnProperty.call(opts, "effort")) {
+    explicitEffort = parseEffort(opts.effort);
+    if (!explicitEffort) {
+      console.error(`relay pick：--effort 取值无效（${opts.effort ?? ""}）。${EFFORT_HELP}`);
+      process.exit(2);
+    }
+    extra.effort = explicitEffort;
   }
   extra.level = level;
   extra.downgrade = !!opts.downgrade;
@@ -269,15 +281,17 @@ function cmdPick(opts) {
     process.exit(3);
   }
   const c = r.choice;
-  console.log(`${role}（难度${LEVEL_TEXT[level]}）→ ${c.provider} / ${c.pool} / ${c.model}（${TIER_TEXT[c.tier]}）  [${quotaText(cfg, c.provider, c.status)}]`);
+  const effort = r.effort;
+  console.log(`${role}（难度${LEVEL_TEXT[level]}，思考：${EFFORT_TEXT[effort]}）→ ${c.provider} / ${c.pool} / ${c.model}（${TIER_TEXT[c.tier]}）  [${quotaText(cfg, c.provider, c.status)}]`);
   console.log(`  理由：${c.reason}`);
   if (c.via === "codex-plugin") {
-    const flags = [c.model && c.model !== "default" ? `--model ${c.model}` : "", `--effort ${CODEX_EFFORT}`].filter(Boolean).join(" ");
+    const flags = [c.model && c.model !== "default" ? `--model ${c.model}` : "", `--effort ${effort}`].filter(Boolean).join(" ");
     console.log(`→ 用 Codex 官方插件执行：Agent 工具 subagent_type=codex:codex-rescue，prompt 第一行写「${flags}」，下面按派单模板写（relay brief 查看，含「难度：${LEVEL_TEXT[level]}」）。第一行不写时，钩子会按这次 pick 的结果补上`);
   } else {
     // 降级选出来的，派的时候也要带上同样的 --downgrade，否则会被档位检查退回
     const down = opts.downgrade ? ` --downgrade "${String(opts.downgrade === true ? "<原因>" : opts.downgrade).replace(/"/g, '\\"')}"` : "";
-    console.log(`→ relay run ${c.provider} --role ${role} --model ${c.model}${down} --cwd <项目根> <<'RELAY_EOF' …派单（含「难度：${LEVEL_TEXT[level]}」）… RELAY_EOF`);
+    const effortFlag = explicitEffort ? ` --effort ${EFFORT_TEXT[effort]}` : "";
+    console.log(`→ relay run ${c.provider} --role ${role} --model ${c.model}${effortFlag}${down} --cwd <项目根> <<'RELAY_EOF' …派单（含「难度：${LEVEL_TEXT[level]}」）… RELAY_EOF`);
   }
   for (const a of r.alternatives) console.log(`  备选：${a.provider} / ${a.model}  [${quotaText(cfg, a.provider, a.status)}]  ${a.reason}`);
   for (const s of r.skipped) console.log(`  跳过：${s.provider} / ${s.model}  ${s.why}  [${quotaText(cfg, s.provider, s.status)}]`);
@@ -309,10 +323,13 @@ export function assembleArgs(cfg, job) {
   const actualModel = resolveModel(cfg, job.provider, job.pool || poolOfModel(prov, job.model), job.model);
   // 占位符只按整个参数匹配，避免任务文本里的 {model} 之类被误替换
   const vars = { "{prompt}": job.wrappedPrompt, "{model}": actualModel, "{cwd}": job.cwd };
+  if (job.effort) vars["{effort}"] = job.effort;
   const fill = (arr) => (arr || []).map((s) => (s in vars ? vars[s] : s));
   const args = [];
   if (actualModel && actualModel !== "default") args.push(...fill(cli.model));
-  // 每次都带的固定参数（如 Grok 的 --reasoning-effort xhigh：思考一律最高）
+  // 按思考强度传参数（如 Grok 的 --reasoning-effort {effort}）
+  if (job.effort && Array.isArray(cli.effort) && cli.effort.length) args.push(...fill(cli.effort));
+  // 每次都带的固定参数
   args.push(...fill(cli.alwaysArgs));
   if (cli.fullAccessWriteOnly) {
     if (job.write && fullAccessOn(cfg, prov)) args.push(...fill(cli.fullAccess));
@@ -345,6 +362,7 @@ function fillPlaceholder(text, vars) {
 }
 
 // 厂商配了 env / envUnset 时，在继承的环境上覆盖和删除。没配的厂商不传 env，行为和原来一样。
+// 用 claude 命令行的自定义接口还会按任务思考强度设置 MAX_THINKING_TOKENS（覆盖配置 env 里的值，只影响这次子进程）。
 // 返回的 secret 只用于打码，不能写进任务文件。
 export function resolveJobEnv(cfg, job, secrets) {
   const prov = cfg?.providers?.[job?.provider];
@@ -352,7 +370,10 @@ export function resolveJobEnv(cfg, job, secrets) {
   const unsetSpec = prov?.envUnset;
   const hasEnv = !!envSpec && typeof envSpec === "object" && !Array.isArray(envSpec) && Object.keys(envSpec).length > 0;
   const hasUnset = Array.isArray(unsetSpec) && unsetSpec.length > 0;
-  if (!hasEnv && !hasUnset) return { env: undefined, secret: "" };
+  const thinkingBudget = prov?.endpoint && prov?.cli?.bin === "claude" && job?.effort
+    ? (THINKING_TOKENS[job.effort] || null)
+    : null;
+  if (!hasEnv && !hasUnset && !thinkingBudget) return { env: undefined, secret: "" };
 
   let secret = "";
   if (hasEnv && Object.values(envSpec).some((value) => String(value).includes("{secret}"))) {
@@ -366,6 +387,9 @@ export function resolveJobEnv(cfg, job, secrets) {
     for (const [key, value] of Object.entries(envSpec)) {
       env[key] = fillPlaceholder(value, { "{baseUrl}": baseUrl, "{secret}": secret });
     }
+  }
+  if (thinkingBudget) {
+    env.MAX_THINKING_TOKENS = thinkingBudget;
   }
   if (hasUnset) {
     for (const key of unsetSpec) delete env[key];
@@ -488,7 +512,7 @@ export function autoReviewPlan(cfg, job, { mode = getMode(), rows } = {}) {
   // 只有 relay 能直接起的员工；Codex 要走 Agent 工具，relay 起不了
   const c = [r.choice, ...r.alternatives].find((x) => x && x.via === "relay" && x.provider !== job.provider);
   if (!c) return { skipped: "没有可用的审查员工（实现者以外的厂商都不可用或额度不足），未做初审" };
-  return { candidate: c };
+  return { candidate: c, effort: r.effort };
 }
 
 // 按计划建初审任务并后台启动。orig 要带 task（原派单）、output（原任务交回的结果）
@@ -526,7 +550,7 @@ ${files.length ? files.map((f) => `- ${f}`).join("\n") : "- 见后附 diff"}
   const st = c.status || poolStatus(cfg, readQuotaRows(cfg), prov.quota?.provider || c.provider, c.pool);
   const id = `${new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14)}-${c.provider}-${Math.random().toString(36).slice(2, 6)}`;
   const job = {
-    id, provider: c.provider, pool: c.pool, model: c.model, role: "review", level: "medium",
+    id, provider: c.provider, pool: c.pool, model: c.model, role: "review", level: "medium", effort: plan.effort,
     reason: `自动初审任务 ${orig.id}（改动 ${orig.changedLines} 行，排除实现者 ${orig.provider}）；${c.reason}`,
     write: false, cwd: orig.cwd, task, scope: null,
     withJobs: [orig.id],
@@ -870,8 +894,9 @@ export function printJob(job) {
     const reasonText = formatTimeoutReason(job);
     statusText = `timeout${reasonText ? `（${reasonText}）` : ""}`;
   }
+  const effortText = job.effort ? ` · 思考：${EFFORT_TEXT[job.effort] || job.effort}` : "";
   const head = [
-    `任务 ${job.id} · ${job.provider}${modelText} · ${job.role || "未注明角色"}${job.level ? ` · 难度${LEVEL_TEXT[job.level] || job.level}` : ""} · ${job.write ? "可写" : "只读"}${linesText} · 状态 ${statusText}${exitText}`,
+    `任务 ${job.id} · ${job.provider}${modelText} · ${job.role || "未注明角色"}${job.level ? ` · 难度${LEVEL_TEXT[job.level] || job.level}` : ""}${effortText} · ${job.write ? "可写" : "只读"}${linesText} · 状态 ${statusText}${exitText}`,
     `目录：${job.cwd}`,
   ];
   if (job.reworkOf) head.push(`返工第 ${job.reworkRound || 1} 次，原任务 ${job.reworkOf}`);
@@ -961,6 +986,16 @@ async function cmdRun(opts) {
     console.error(`ai-relay 错误：派单没写难度，已退回。${LEVEL_HELP}`);
     process.exit(2);
   }
+  let cliEffort = null;
+  if (Object.prototype.hasOwnProperty.call(opts, "effort")) {
+    cliEffort = parseEffort(opts.effort);
+    if (!cliEffort) {
+      console.error(`ai-relay 错误：--effort 取值无效（${opts.effort ?? ""}）。${EFFORT_HELP}`);
+      process.exit(2);
+    }
+  }
+  // 命令行 --effort 优先于派单正文里的「思考：」；都没写时按难度和任务类型决定，困难不低于高
+  const effort = resolveEffort({ level, role, write: !!opts.write, effort: cliEffort || effortOfBrief(task) });
   if (opts.downgrade === true) {
     console.error('ai-relay 错误：--downgrade 要写原因，例如 --downgrade "强档都没额度，这次改动只涉及单个文件"');
     process.exit(2);
@@ -981,12 +1016,12 @@ async function cmdRun(opts) {
     // 可写任务按目标目录判断沙箱：Codex 写不到项目外的目录时自动跳过
     const target = path.resolve(opts.cwd || process.cwd());
     const workspace = workspaceRoot(process.env.CLAUDE_PROJECT_DIR || process.cwd());
-    // 不传 exactModel：路由条目照常换到最高思考档参与选人；点名的模型按它自己的档位在后面过门槛
-    const r = route(cfg, rows, role, undefined, { needs, write: !!opts.write, target, workspace, level, downgrade: !!downgrade, steps });
+    // 不传 exactModel：路由条目按思考强度换后缀档参与选人；点名的模型按它自己的档位在后面过门槛
+    const r = route(cfg, rows, role, undefined, { needs, write: !!opts.write, target, workspace, level, downgrade: !!downgrade, steps, effort });
     // 首选是 Codex 时不悄悄改派：Codex 要走 Agent 工具（官方插件），交给主管去派
     if (!opts.model && !opts.skipCodex && r.choice?.via === "codex-plugin") {
       recordPick(role, r);
-      const modelHint = `（Agent prompt 第一行写「${[r.choice.model && r.choice.model !== "default" ? `--model ${r.choice.model}` : "", `--effort ${CODEX_EFFORT}`].filter(Boolean).join(" ")}」）`;
+      const modelHint = `（Agent prompt 第一行写「${[r.choice.model && r.choice.model !== "default" ? `--model ${r.choice.model}` : "", `--effort ${effort}`].filter(Boolean).join(" ")}」）`;
       console.error(`首选是 Codex（${r.choice.reason}）。请用 Agent 工具 subagent_type=codex:codex-rescue 把这张派单交给它${modelHint}；确有理由不用 Codex 时，加 --skip-codex 改派第二名。`);
       process.exit(3);
     }
@@ -1001,7 +1036,7 @@ async function cmdRun(opts) {
         process.exit(3);
       }
       const first = r.choice;
-      const modelHint = `（Agent prompt 第一行写「${[first?.model && first.model !== "default" ? `--model ${first.model}` : "", `--effort ${CODEX_EFFORT}`].filter(Boolean).join(" ")}」）`;
+      const modelHint = `（Agent prompt 第一行写「${[first?.model && first.model !== "default" ? `--model ${first.model}` : "", `--effort ${effort}`].filter(Boolean).join(" ")}」）`;
       console.error(first?.via === "codex-plugin"
         ? `首选是 Codex：请用 Agent 工具 subagent_type=codex:codex-rescue 执行${modelHint}`
         : noModelText(role, level, r.skipped));
@@ -1030,7 +1065,7 @@ async function cmdRun(opts) {
   if (prov.via === "codex-plugin") {
     const codexPool = providerPools(prov)[0];
     const codexModel = resolveModel(cfg, provName, codexPool, model || "default");
-    const modelHint = `（Agent prompt 第一行写「${[codexModel && codexModel !== "default" ? `--model ${codexModel}` : "", `--effort ${CODEX_EFFORT}`].filter(Boolean).join(" ")}」）`;
+    const modelHint = `（Agent prompt 第一行写「${[codexModel && codexModel !== "default" ? `--model ${codexModel}` : "", `--effort ${effort}`].filter(Boolean).join(" ")}」）`;
     console.error(`Codex 走官方插件：请用 Agent 工具 subagent_type=codex:codex-rescue（或 /codex:rescue）${modelHint}，审查用 /codex:review`);
     process.exit(3);
   }
@@ -1038,7 +1073,7 @@ async function cmdRun(opts) {
 
   if (!reason) {
     // 主模型点名了厂商：仍记下这个厂商在该角色下的打分，便于事后对照
-    const r = route(cfg, rows, role, provName, { needs, level, downgrade: !!downgrade, steps, exactModel: !!model });
+    const r = route(cfg, rows, role, provName, { needs, write: !!opts.write, level, downgrade: !!downgrade, steps, exactModel: !!model, effort });
     const same = [r.choice, ...r.alternatives].find((x) => x && (!model || x.model === model || x.routeModel === model));
     if (!model && r.choice) ({ model, pool } = r.choice);
     else if (same && !pool) ({ model, pool } = same);
@@ -1110,7 +1145,7 @@ async function cmdRun(opts) {
   ensureStateDir();
   const id = `${new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14)}-${provName}-${Math.random().toString(36).slice(2, 6)}`;
   const job = {
-    id, provider: provName, pool, model, role, level, ...(downgrade ? { downgrade } : {}), reason, write: !!opts.write, cwd, task,
+    id, provider: provName, pool, model, role, level, effort, ...(downgrade ? { downgrade } : {}), reason, write: !!opts.write, cwd, task,
     scope,
     idleTimeoutMin,
     maxRuntimeMin,
@@ -1160,7 +1195,7 @@ async function cmdRun(opts) {
     job.pid = child.pid;
     saveJob(job);
     child.unref();
-    console.log(`已后台启动任务 ${id}（${provName} / ${model}，${role}，${job.write ? "可写" : "只读"}）`);
+    console.log(`已后台启动任务 ${id}（${provName} / ${model}，${role}，思考：${EFFORT_TEXT[effort]}，${job.write ? "可写" : "只读"}）`);
     console.log(`分派理由：${reason}`);
     console.log(`等待结果：node "${RELAY_SCRIPT}" wait ${id}`);
     console.log(`查看结果：node "${RELAY_SCRIPT}" result ${id}`);
@@ -1189,6 +1224,13 @@ async function cmdRework(opts) {
   if (!["partial", "fail"].includes(verdict)) throw new Error("--verdict 只能是 partial 或 fail");
   const level = parseLevel(opts.level) || orig.level || levelOfBrief(orig.task);
   if (!level) throw new Error(`原任务 ${orig.id} 没写难度，返工时用 --level 简单|中等|困难 指定`);
+  let reworkEffort;
+  if (Object.prototype.hasOwnProperty.call(opts, "effort")) {
+    reworkEffort = parseEffort(opts.effort);
+    if (!reworkEffort) throw new Error(`--effort 取值无效（${opts.effort ?? ""}）。${EFFORT_HELP}`);
+  } else if (orig.effort && parseEffort(orig.effort)) {
+    reworkEffort = parseEffort(orig.effort);
+  }
   const round = (orig.reworkRound || 0) + 1;
   const task = `${orig.task.trimEnd()}
 
@@ -1210,6 +1252,7 @@ ${feedback.trim()}
     maxRuntime: opts.maxRuntime || orig.maxRuntimeMin,
     force: opts.force,
     level,
+    ...(reworkEffort ? { effort: reworkEffort } : {}),
     downgrade: opts.downgrade || orig.downgrade,
     sessionId: orig.sessionId,
     // 原任务没记结论的，等返工任务建好后记上：返工说明这一次没通过，计入这个员工的可靠度
@@ -2065,7 +2108,7 @@ function help() {
   console.log(`用法：node relay.mjs <命令>
   status [--json]                 查看模式、各家额度、各类任务首选
   mode [off|manual|auto]          查看或切换模式（off 会同时禁用 Codex 插件）
-  pick <角色> --level 简单|中等|困难 [--write --target 目录] [--needs web,exec] [--downgrade 原因] [--steps]
+  pick <角色> --level 简单|中等|困难 [--effort 低|中|高|最高] [--write --target 目录] [--needs web,exec] [--downgrade 原因] [--steps]
                                   按难度和打分挑选模型并给出理由：简单优先便宜、额度多的轻档，中等要中档以上，困难只派强档
                                   要写的目录在当前项目外时传 --target，写不到的厂商（如 Codex）会被跳过
                                   --needs 只在具备这些能力的厂商里选（web 联网，exec 执行命令，逗号分隔）
@@ -2090,7 +2133,7 @@ function help() {
   provider add <名称> --preset kimi|qwen|custom|endpoint   新增厂商（面板里用 --json-spec；endpoint 需要 baseUrl 和 models）
   provider remove <名称>           删除厂商并移出所有路由和档位（配置先备份为 .bak）
   provider test <名称>             只读试运行一句话，确认命令可用
-  run <厂商名|auto> --role r [--model m] [--write] [--scope 路径1,路径2] [--background] [--cwd 目录] [--with id1,id2] [--diff] [--force] [--needs web,exec] [--idle-timeout 分钟] [--max-runtime 分钟] [--level 难度] [--downgrade 原因] [-- 派单]
+  run <厂商名|auto> --role r [--model m] [--write] [--scope 路径1,路径2] [--background] [--cwd 目录] [--with id1,id2] [--diff] [--force] [--needs web,exec] [--idle-timeout 分钟] [--max-runtime 分钟] [--level 难度] [--effort 低|中|高|最高] [--downgrade 原因] [-- 派单]
                                   调用官方 CLI 执行任务；派单走标准输入或 --prompt-file，必须含「目标」「验收标准」和「难度：简单|中等|困难」（或 --level）
                                   档位不够难度的模型会被退回；确认降一档也能做好时加 --downgrade "<原因>"
                                   自动附上项目上下文和共享背景；--with 附前序结果，--diff 附当前改动
@@ -2101,7 +2144,7 @@ function help() {
   brief [--context --cwd 目录]     派单模板；--context 预览会自动附上的项目上下文和共享背景
   context set|show|clear [--cwd 目录]   本次任务的共享背景（同目录 6 小时内的派单自动附上）
   verdict <id|last> pass|partial|fail [-- 说明]   记录验收结论，影响以后的可靠度打分
-  rework <id|last> [--verdict partial|fail] [--level 难度] [--background] [-- 修改意见]
+  rework <id|last> [--verdict partial|fail] [--level 难度] [--effort 低|中|高|最高] [--background] [-- 修改意见]
                                   验收不通过时退回原员工返工：沿用原厂商、模型、角色、写入范围和目录，附上原派单、上次结果和修改意见
                                   原任务没记结论时自动记为 partial（或 --verdict 指定）
   self <原因>                     记下这一轮为什么自己改项目代码（自动模式第一次改代码前必须先定分工）

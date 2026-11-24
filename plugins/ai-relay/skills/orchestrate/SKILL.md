@@ -147,7 +147,7 @@ Claude 自己的 5h 额度低于 20% 时，连第 5 条也改为外派；低于 
 
 模型档位（配置 `modelTiers` 可改，按「厂商:模型」匹配，`*` 通配）：轻档是 Gemini 4 Hydrogen、Gemini 3.8 Flash、Codex GPT-6-Luna 和 GPT-5.6 系列；中档是 Grok、agy 上的 Claude Sonnet、Codex GPT-6.1-Terra（Codex 命令行默认）和 GPT-6-Sol；强档是 Codex GPT-6-Astra 和 GPT-6.1-Sol、Gemini 4 Neon（Gemini 4 里最强，和 Hydrogen、Flash 共用一份额度）、Gemini 4 Argon high、agy 上的 Claude Opus。没列到的模型按中档算。Codex 的几个模型共用一份额度，换成 Luna 只是少用一些，不像 Flash 那样有单独的额度。
 
-**思考一律开到最高**（用户定的，不分难度）：agy 的模型自动换成额度池里最高的一档（Neon、Hydrogen 用 xhigh，Argon、Flash、Claude 用 high），Codex 补 `--effort xhigh`，Grok 带 `--reasoning-effort xhigh`，自定义接口带 32000 的思考预算。点名了具体模型（`--model`）或写了 `--effort` 的照点名的来，所以不要点名低档。
+**思考强度按任务和模型定**：分低、中、高、最高四档。由你按任务判断，用 `--effort 低|中|高|最高`（pick 和 run 都认）或在派单里写一行「思考：高」点名；两处都写时以命令行为准。没点名时按难度给默认值：简单→中、中等→高、困难→最高；写代码、写文档的任务（implement 角色或 `--write` 可写任务）再上调一档，即简单→高、中等→最高。困难任务不低于「高」，点名低于高的按高算。落到各家：agy 换成额度池里对应的那档模型（没有就取最近的更高一档，再没有取更低一档），Codex 用 `--effort <对应值>`，Grok 用 `--reasoning-effort <对应值>`，自定义接口的思考预算按档 4000 / 10000 / 20000 / 32000。
 
 档位不够的模型会被跳过或退回（点名的也一样）。困难任务的强档都没额度时，**不会悄悄降级**：你自己做，或确认降一档也能做好时加 `--downgrade "<原因>"`，原因会记进分派理由。
 
@@ -173,7 +173,7 @@ relay pick <角色> --level 简单|中等|困难
 
 拿到选择后这样派：
 
-- **Codex**：用 Agent 工具，`subagent_type: "codex:codex-rescue"`。prompt **第一行**写 `relay pick` 给出的运行参数（如 `--model gpt-6.1-sol --effort xhigh`），下面按派单模板写。第一行不写时，钩子会按最近一次 `relay pick` 选中的 Codex 模型补上；没有 pick 记录就用 Codex 自己 `config.toml` 里的默认模型。推理强度一律补成最高的 `xhigh`（Codex 插件最高只收 xhigh）。最后用的模型和强度都钉在第一行；正文里任何位置写的 `--model` / `--effort` 也会被拿出来检查，档位不够难度、写了两个不同的值、强度不是 Codex 认的取值，都会退回。`relay run auto` 的首选是 Codex 时会直接停下提示你走这条路，不会悄悄改派；确有理由不用 Codex（比如目标目录在项目外）才加 `--skip-codex`。
+- **Codex**：用 Agent 工具，`subagent_type: "codex:codex-rescue"`。prompt **第一行**写 `relay pick` 给出的运行参数（如 `--model gpt-6.1-sol --effort high`），下面按派单模板写。第一行不写时，钩子会按最近一次 `relay pick` 选中的 Codex 模型补上；没有 pick 记录就用 Codex 自己 `config.toml` 里的默认模型。推理强度按派单里的「思考：」补，没写就按难度和角色算默认值（Codex 插件最高只收 xhigh）。最后用的模型和强度都钉在第一行；正文里任何位置写的 `--model` / `--effort` 也会被拿出来检查，档位不够难度、写了两个不同的值、强度不是 Codex 认的取值，都会退回。`relay run auto` 的首选是 Codex 时会直接停下提示你走这条路，不会悄悄改派；确有理由不用 Codex（比如目标目录在项目外）才加 `--skip-codex`。
 - **其他模型**：用 `relay run <厂商名> --role <角色> --model <模型>`，或者 `relay run auto --role <角色>` 让脚本自己选。
 - 想点名某个模型可以，脚本仍会记下它的打分，事后可以对照。
 

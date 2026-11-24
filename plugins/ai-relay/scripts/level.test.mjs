@@ -63,7 +63,7 @@ test("难度解析：派单行和中英文写法", () => {
   assert.equal(tierAllowed("medium", "light"), false);
 });
 
-test("同一模型有几档时一律换成池里最高的一档：xhigh > high > medium > low；池里没有更高的就不换", () => {
+test("maxVariant：同一模型有几档时取池里最高的一档（供判断池是否含强档用）；池里没有更高的就不换", () => {
   assert.equal(maxVariant(CFG, "agy", "gemini", "gemini-3.8-flash-low"), "gemini-3.8-flash-high");
   const hyd = { providers: { agy: { pools: { gemini: ["gemini-4-hydrogen-xhigh", "gemini-4-hydrogen-high", "gemini-4-hydrogen-medium"] } } } };
   assert.equal(maxVariant(hyd, "agy", "gemini", "gemini-4-hydrogen-medium"), "gemini-4-hydrogen-xhigh");
@@ -73,7 +73,7 @@ test("同一模型有几档时一律换成池里最高的一档：xhigh > high >
   assert.equal(maxVariant({ providers: { agy: { pools: { gemini: ["gemini-3.8-flash-low"] } } } }, "agy", "gemini", "gemini-3.8-flash-low"), "gemini-3.8-flash-low");
 });
 
-test("换到最高档后同一模型只留一条候选（read 路由里 Argon medium 换成 high 后不重复）", () => {
+test("按思考强度换档后同一模型只留一条候选（read 路由里 Argon medium 换成 high 后不重复）", () => {
   const cfg = structuredClone(CFG);
   cfg.routes.read = ["agy:gemini-argon:gemini-4-argon-high:0.9", "agy:gemini-argon:gemini-4-argon-medium:0.6"];
   const r = scoreRoute(cfg, ALL_FULL, "read", { now: NOW });
@@ -100,7 +100,7 @@ test("简单任务：轻档 Flash 压过擅长度相近的强档 Argon；擅长�
   assert.equal(scoreRoute(CFG, ALL_FULL, "implement", { now: NOW }).choice.provider, "codex");
 });
 
-test("中等任务：跳过轻档，Argon 一律用最高档 high 参与", () => {
+test("中等任务：跳过轻档，implement 默认最高思考强度（Argon 最高只有 high，就近取 high）", () => {
   const r = scoreRoute(CFG, ALL_FULL, "implement", { now: NOW, level: "medium" });
   const flash = r.skipped.find((s) => s.provider === "agy" && s.pool === "gemini");
   assert.ok(flash?.tierTooLow);
@@ -174,9 +174,9 @@ test("派给 Codex：没写难度退回；模型档位不够退回；--model / -
   const body = "\n\n## 目标\n重构调度\n\n## 验收标准\n测试通过";
 
   assert.match(call("角色：implement" + body).stdout, /没写难度，已退回/);
-  // 不写 --model：用 Codex 自己的默认模型（这里是轻档 Luna），并把它钉在第一行
+  // 不写 --model：用 Codex 自己的默认模型（这里是轻档 Luna），并把它钉在第一行；简单 + implement 默认上调一档到 high
   const easy = out("角色：implement\n难度：简单" + body);
-  assert.equal(firstLine(easy), "--model gpt-6-luna --effort xhigh");
+  assert.equal(firstLine(easy), "--model gpt-6-luna --effort high");
   assert.match(out("角色：implement\n难度：中等" + body).permissionDecisionReason, /gpt-6-luna 是轻档模型，接不了中等任务/);
   // 困难任务写了强档：参数放第一行，正文里不再出现 --model
   const hard = out("--model gpt-6.1-sol --background\n角色：implement\n难度：困难" + body);
@@ -232,7 +232,7 @@ test("pick 降级选出的模型，打印的派单命令带上同样的 --downgr
   cfg.providers.codex.enabled = false;
   cfg.routes.implement = cfg.routes.implement.filter((e) => !e.startsWith("agy:"));
   // 已升级过的配置：加载时不再补回 Neon 路由
-  cfg.migrated = ["max-thinking", "gemini-hydrogen", "gemini-neon", "read-route-0.27", "quick-route-0.28"];
+  cfg.migrated = ["max-thinking", "gemini-hydrogen", "gemini-neon", "read-route-0.27", "quick-route-0.28", "effort-args-0.29"];
   fs.writeFileSync(path.join(home, "providers.json"), JSON.stringify(cfg));
   const r = spawnSync(process.execPath, [path.join(DIR, "relay.mjs"), "pick", "implement", "--level", "困难", "--downgrade", "强档停用，Grok 做得了"], {
     encoding: "utf8", env: { ...process.env, AI_RELAY_HOME: home, CLAUDE_PROJECT_DIR: "" },

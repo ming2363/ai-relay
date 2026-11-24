@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { parseLevel } from "./score.mjs";
+import { parseLevel, parseEffort } from "./score.mjs";
 
 // 项目规则文件：小于上限的直接附原文（里面通常是"禁止 git commit"这类硬约束），大的只给路径
 const RULE_FILES = ["AGENTS.md", "CLAUDE.md", "GEMINI.md", "PROJECT_MEMORY.md"];
@@ -21,6 +21,7 @@ export const CONTEXT_TTL_MS = 6 * 3600_000;
 
 export const BRIEF_TEMPLATE = `角色：<implement|debug|review|read|deep|quick|claude-backup>
 难度：<简单|中等|困难>（必填。简单：照样子改、补注释、整理资料这类不用推理的活，优先派便宜、额度多的轻档模型；中等：常规实现和排查；困难：跨模块设计、疑难排查，只派强档模型）
+思考：<低|中|高|最高>（可选，省略按难度和任务类型决定）
 
 ## 目标
 <一句话说清要交付什么>
@@ -89,6 +90,17 @@ export function levelOfBrief(text) {
     const m = line.match(/^[ \t]*(?:#{1,6}[ \t]*)?难度\s*[:：]\s*([^\s（(，,。]+)/);
     const level = m ? parseLevel(m[1]) : null;
     if (level) return level;
+  }
+  return null;
+}
+
+// 派单里的「思考：低|中|高|最高」（或英文 low|medium|high|xhigh），返回 low / medium / high / xhigh；没写或认不出返回 null
+export function effortOfBrief(text) {
+  // 认不出的（比如没填的模板占位符）跳过，继续找后面的；也接受「## 思考：高」这种标题写法
+  for (const line of String(text || "").split(/\r?\n/)) {
+    const m = line.match(/^[ \t]*(?:#{1,6}[ \t]*)?思考\s*[:：]\s*([^\s（(，,。]+)/);
+    const effort = m ? parseEffort(m[1]) : null;
+    if (effort) return effort;
   }
   return null;
 }

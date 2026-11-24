@@ -170,11 +170,14 @@ test("只读只用 plan；可写按最高权限替换参数；grok 命令行保�
   assert.equal(writeOff.includes("--dangerously-skip-permissions"), false);
 
   const grok = { provider: "grok", pool: "supergrok-weekly", model: "grok-4.7", cwd: "/work", wrappedPrompt: "你好" };
-  assert.deepEqual(assembleArgs(defaultCfg, { ...grok, write: false }), [
-    "--model", "grok-4.7", "--reasoning-effort", "xhigh", "--permission-mode", "plan", "--cwd", "/work", "--always-approve", "-p", "你好",
+  assert.deepEqual(assembleArgs(defaultCfg, { ...grok, write: false, effort: "high" }), [
+    "--model", "grok-4.7", "--reasoning-effort", "high", "--permission-mode", "plan", "--cwd", "/work", "--always-approve", "-p", "你好",
   ]);
-  assert.deepEqual(assembleArgs(defaultCfg, { ...grok, write: true }), [
+  assert.deepEqual(assembleArgs(defaultCfg, { ...grok, write: true, effort: "xhigh" }), [
     "--model", "grok-4.7", "--reasoning-effort", "xhigh", "--cwd", "/work", "--always-approve", "-p", "你好",
+  ]);
+  assert.deepEqual(assembleArgs(defaultCfg, { ...grok, write: false }), [
+    "--model", "grok-4.7", "--permission-mode", "plan", "--cwd", "/work", "--always-approve", "-p", "你好",
   ]);
 });
 

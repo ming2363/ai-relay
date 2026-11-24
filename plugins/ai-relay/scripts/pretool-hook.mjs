@@ -11,8 +11,8 @@ import {
   readSelfEdits, writeSelfEdits, isScratchPath, isDocPath, blockReason, resolveRepos, lineSnapshot, writeBashSnap,
   isRelayRunCommand, capsOf, runningWriterIds,
 } from "./lib.mjs";
-import { BRIEF_TEMPLATE, checkBrief, roleOfBrief, levelOfBrief, buildDispatchPrompt, readSharedContext, scopeOfBrief, needsWithImages, codexFlagsOf, hasStepSpec } from "./brief.mjs";
-import { modelTier, tierAllowed, CODEX_EFFORT, LEVEL_TEXT, TIER_TEXT } from "./score.mjs";
+import { BRIEF_TEMPLATE, checkBrief, roleOfBrief, levelOfBrief, effortOfBrief, buildDispatchPrompt, readSharedContext, scopeOfBrief, needsWithImages, codexFlagsOf, hasStepSpec } from "./brief.mjs";
+import { modelTier, tierAllowed, resolveEffort, LEVEL_TEXT, TIER_TEXT } from "./score.mjs";
 import { loadModelsCache } from "./models.mjs";
 
 const EDIT_TOOLS = new Set(["Edit", "MultiEdit", "Write", "NotebookEdit"]);
@@ -158,11 +158,12 @@ async function main() {
     const fits = fitsFor();
     return deny(`[ai-relay] Codex 的 ${usedModel} 是${TIER_TEXT[tier]}模型，接不了${LEVEL_TEXT[level]}任务，已退回。在 prompt 第一行写 --model <模型>${fits.length ? `，可选：${fits.join("、")}` : ""}`);
   }
-  // 推理强度一律最高（xhigh）；派单里写了 --effort 就用写的，但取值要是 Codex 认的
+  // 派单里显式写了 --effort 的照写的（取值要是 Codex 认的）；
+  // 没写时先看派单里的「思考：」，再没有按难度和角色算默认值（困难任务不低于高）
   if (flags.effort && !CODEX_EFFORTS.has(flags.effort)) {
     return deny(`[ai-relay] --effort ${flags.effort} 不是 Codex 认的推理强度，可选：${[...CODEX_EFFORTS].join(" / ")}`);
   }
-  const effort = flags.effort || CODEX_EFFORT;
+  const effort = flags.effort || resolveEffort({ level, role, effort: effortOfBrief(brief) });
   // 派单写了 Codex 做不到的能力就退回，避免它在断网沙箱里硬做或臆测
   const needs = needsWithImages(brief);
   const codexCaps = capsOf(cfg, prov, usedModel);
