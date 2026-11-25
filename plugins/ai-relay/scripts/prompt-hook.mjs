@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import {
   RELAY_SCRIPT, ULW_RE, MENTION_RE, loadConfig, getMode, getModeSeen, setModeSeen, readQuotaRows, claudeThrottle,
-  compactStatus, savePrompt, isSystemPrompt, fmtPct, mentionsProvider,
+  compactStatus, savePrompt, isSystemPrompt, fmtPct, mentionsProvider, loginReminder,
 } from "./lib.mjs";
 
 function writeContext(additionalContext) {
@@ -35,15 +35,20 @@ function main() {
   const cfg = loadConfig();
   const ulw = ULW_RE.test(prompt);
   const mention = MENTION_RE.test(prompt) || mentionsProvider(cfg, prompt);
+  // 员工登录失效：每条消息都让主模型提醒用户去登录，直到恢复
+  const reminder = loginReminder(cfg);
   if (!ulw && !mention && mode !== "auto") {
+    const early = [];
     if (mode === "manual" && prev === "auto") {
-      writeContext("[ai-relay] 已从自动切到手动：只外派用户点名的部分，前面自动模式的外派要求不再适用。");
+      early.push("[ai-relay] 已从自动切到手动：只外派用户点名的部分，前面自动模式的外派要求不再适用。");
     }
+    if (reminder) early.push(reminder);
+    if (early.length) writeContext(early.join("\n"));
     return;
   }
 
   const rows = readQuotaRows(cfg);
-  const lines = [];
+  const lines = reminder ? [reminder] : [];
   if (mode === "auto" && (prev === "off" || prev === "manual")) {
     lines.push("[ai-relay] 已切换为自动模式：从这条消息起按主管 + 员工方式工作。");
   } else if (mode === "manual" && prev === "auto") {

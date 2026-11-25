@@ -16,7 +16,7 @@ const CODEX_TAIL_BYTES = 256 * 1024;
 const AGY_MIN_INTERVAL_MS = 5 * 60_000;
 // agy 登录失效时，每跑一次 /usage 它都会在浏览器里弹一个 Google 登录页。
 // 所以登录失效后不再自动重查，只有 `relay quota --force`（用户重新登录 agy 之后）才会再查
-const AGY_AUTH_RE = /authentication required|log ?in|oauth2|accounts\.google\.com/i;
+const AGY_AUTH_RE = /authentication required|not signed in|accounts\.google\.com\/o\/oauth2/i;
 
 export function isAgyAuthError(msg) {
   return AGY_AUTH_RE.test(String(msg || ""));
@@ -384,6 +384,27 @@ function claimAgyProbe(stateDir, now, force) {
   } catch {
     return false;
   }
+}
+
+// 登录失效的额度来源（目前只有 agy）：返回对应的额度厂商 id，选人和派单据此跳过
+export function loginRequiredProviders(stateDir) {
+  const src = loadCache(stateDir).sources?.agy;
+  const out = new Set();
+  if (src && (src.authRequired || (src.error && isAgyAuthError(src.error)))) out.add("antigravity");
+  return out;
+}
+
+// 派单时 agy 报登录失效：记下来，之后不再派给它，也不再自动查额度（每碰一次 agy 都会弹浏览器登录页）
+export function markAgyLoginRequired(stateDir, error, now = Date.now()) {
+  fs.mkdirSync(stateDir, { recursive: true });
+  const file = cachePath(stateDir);
+  withFileLock(file, () => {
+    const cache = loadCache(stateDir);
+    if (!cache.sources || typeof cache.sources !== "object") cache.sources = {};
+    const prev = cache.sources.agy || { rows: [], fetchedAt: null };
+    cache.sources.agy = { ...prev, error: String(error || "").slice(0, 200), authRequired: true, attemptAt: now };
+    writeFileAtomic(file, JSON.stringify(cache, null, 2));
+  });
 }
 
 // 缓存中的所有额度行

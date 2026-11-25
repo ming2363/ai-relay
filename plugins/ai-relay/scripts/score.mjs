@@ -1,5 +1,5 @@
 // ai-relay 模型打分路由：按擅长度、额度紧迫度、历史可靠度、执行速度、当前负载综合打分并排序
-import { capsOf, isEnabled, isInside, poolStatus, resolveModel } from "./lib.mjs";
+import { capsOf, isEnabled, isInside, loginBlocked, poolStatus, resolveModel } from "./lib.mjs";
 
 const WINDOW_TOTAL_HOURS = {
   "5h": 5,
@@ -497,6 +497,7 @@ export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now
     return poolStrongCache.get(key);
   };
 
+  const blockedByLogin = new Set();
   for (const { i, provName, pool, routeModel, model, rawFit } of deduped) {
     const tier = modelTier(cfg, provName, model);
     const prov = cfg.providers?.[provName];
@@ -513,6 +514,13 @@ export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now
         status: st,
         why: "已停用",
       });
+      continue;
+    }
+
+    // 登录失效：碰一次就弹浏览器登录页，当作不可用
+    if (blockedByLogin.has(provName) || loginBlocked(prov)) {
+      blockedByLogin.add(provName);
+      skipped.push({ provider: provName, pool, model, routeModel, via: prov?.via, status: st, why: "登录已失效" });
       continue;
     }
 

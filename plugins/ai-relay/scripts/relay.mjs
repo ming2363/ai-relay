@@ -6,7 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
 import {
-  RELAY_SCRIPT, JOBS_DIR, MODES, PLUGIN_ROOT, STATE_DIR, ROLE_TEXT, isEnabled, loadConfig, quotaSource, readHistory, getMode, setMode, readQuotaRows, poolStatus,
+  RELAY_SCRIPT, JOBS_DIR, MODES, PLUGIN_ROOT, STATE_DIR, ROLE_TEXT, isEnabled, loginBlocked, loadConfig, quotaSource, readHistory, getMode, setMode, readQuotaRows, poolStatus,
   providerPools, poolOfModel, resolveModel, fmtPool, fmtTime, resolveBin, ensureStateDir,
   hasProviderKey, loadSecrets, maskSecretValue, normalizeBaseUrl, saveSecrets, secretsPath,
   allJobRecords, setVerdict, VERDICTS, recordPick, pickReason, capsOf, fullAccessOn, fullAccessSupported, cleanup, storageUsage, RETENTION_DAYS,
@@ -15,7 +15,7 @@ import {
   getWorkspaceActivityMtime, recordMeteredUsage, meteredUsedToday, meteredCapReached,
   lineSnapshot, snapshotDelta, maskSecrets, withoutOtherWriters, scopeLineSnapshot,
 } from "./lib.mjs";
-import { refreshCache, refreshGrok, loadCache, detectQuotaExhausted, markPoolExhausted, parseResetMs } from "./quota.mjs";
+import { refreshCache, refreshGrok, loadCache, detectQuotaExhausted, markPoolExhausted, parseResetMs, isAgyAuthError, markAgyLoginRequired } from "./quota.mjs";
 import { scoreRoute, parseLevel, parseEffort, resolveEffort, modelTier, tierAllowed, LEVEL_TEXT, TIER_TEXT, EFFORT_TEXT, THINKING_TOKENS } from "./score.mjs";
 import {
   getModels, loadModelsCache, findModelPool, setProviderDefaultModel, buildModelPools,
@@ -155,6 +155,7 @@ function cmdStatus(opts) {
         label: prov.label,
         via: prov.via || (prov.self ? "self" : ""),
         enabled: isEnabled(prov),
+        ...(loginBlocked(prov) ? { loginRequired: true } : {}),
         source: quotaSource(cfg, prov.quota.provider, pool),
         ...(prov.billing === "metered" ? { billing: "metered" } : {}),
         ...poolStatus(cfg, rows, prov.quota.provider, pool),
@@ -187,8 +188,8 @@ function cmdStatus(opts) {
   if (!rows) console.log("⚠️ 暂无额度数据：运行 relay quota 刷新");
   console.log("\n额度：");
   for (const p of pools) {
-    const mark = p.enabled ? { ok: "🟢", low: "🟡", blocked: "🔴", unknown: "⚪" }[p.level] : "⏸";
-    console.log(`  ${mark} ${p.label} [${p.name}/${p.pool}]  ${p.enabled ? quotaText(cfg, p.name, p) : "已停用"}  （来源：${p.source}）`);
+    const mark = !p.enabled ? "⏸" : p.loginRequired ? "🔴" : { ok: "🟢", low: "🟡", blocked: "🔴", unknown: "⚪" }[p.level];
+    console.log(`  ${mark} ${p.label} [${p.name}/${p.pool}]  ${!p.enabled ? "已停用" : p.loginRequired ? "登录已失效" : quotaText(cfg, p.name, p)}  （来源：${p.source}）`);
   }
   console.log("\n当前各类任务的首选：");
   for (const r of picks) {
@@ -600,6 +601,8 @@ export async function executeJob(job, testOpts = {}) {
   let taskSecret = "";
   try {
     const prov = cfg.providers?.[job.provider];
+    // 兜底：排队中的任务在 agy 登录失效后才开跑，也不能去碰 agy（会弹浏览器登录页）
+    if (!testOpts.bin && loginBlocked(prov)) throw new Error(`${job.provider} 登录已失效，未执行。请提醒用户在终端运行 ${prov.cli?.bin || job.provider} 重新登录，登好后运行 relay quota --force`);
     const needsSecret = !!prov?.env && Object.values(prov.env).some((value) => String(value).includes("{secret}"));
     const secrets = testOpts.secrets || (needsSecret ? loadSecrets() : {});
     ({ env: spawnEnv, secret: taskSecret } = resolveJobEnv(cfg, job, secrets));
@@ -855,6 +858,14 @@ export async function executeJob(job, testOpts = {}) {
   }
   // 员工命令行报额度用完（额度接口可能还显示充足）：只在任务没成功时看标准错误和输出末尾，
   // 避免正常产出里碰巧写到 usage limit 之类的字样被误判。命中就把这个额度池临时记为用完 24 小时
+  // agy 报登录失效：记下来，之后不再派给它、不再自动查额度，提示钩子会让主模型提醒用户登录
+  const quotaProv = cfg.providers?.[job.provider]?.quota?.provider;
+  if (job.status !== "done" && quotaProv === "antigravity" && isAgyAuthError(`${stderrStr}\n${stdoutStr.slice(-2000)}`)) {
+    job.loginRequired = true;
+    try {
+      markAgyLoginRequired(testOpts.stateDir || STATE_DIR, `${stderrStr}\n${stdoutStr.slice(-2000)}`.trim());
+    } catch {}
+  }
   if (job.status !== "done" && detectQuotaExhausted(`${stderrStr}\n${stdoutStr.slice(-2000)}`)) {
     job.quotaExhausted = true;
     try {
@@ -1060,6 +1071,11 @@ async function cmdRun(opts) {
   }
   if (!isEnabled(prov)) {
     console.error(`${provName} 已在 ai-relay 面板中停用，不外派。需要时在面板「厂商」页启用，或执行 relay provider enable ${provName}`);
+    process.exit(3);
+  }
+  // 登录失效时碰一次 agy 就弹一个浏览器登录页：不派，让用户先登录
+  if (loginBlocked(prov)) {
+    console.error(`${provName} 登录已失效，不外派。请提醒用户在终端运行 ${prov.cli?.bin || provName} 重新登录，登好后运行 relay quota --force 恢复`);
     process.exit(3);
   }
   if (prov.via === "codex-plugin") {

@@ -65,3 +65,50 @@ test("旧缓存里已有登录失效报错时直接不查", () => {
   assert.equal(shouldProbeAgy({ fetchedAt: 1, error: err }, Date.now(), false), false);
   assert.equal(shouldProbeAgy({ fetchedAt: 1, error: "timeout" }, Date.now(), false), true);
 });
+
+test("登录失效后选人跳过 agy、状态摘要提示登录，派单失败的输出会标记失效", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-login-"));
+  process.env.AI_RELAY_HOME = dir;
+  const q = await import(`./quota.mjs?login=${Date.now()}`);
+  const lib = await import(`./lib.mjs?login=${Date.now()}`);
+  const cfg = {
+    providers: {
+      claude: { self: true, label: "Claude", quota: { provider: "anthropic", pools: ["claude"] } },
+      agy: { label: "Antigravity Pro", cli: { bin: "agy" }, quota: { provider: "antigravity", pools: ["gemini"] } },
+    },
+    routes: { read: ["agy:gemini:default"] },
+  };
+  // 正常时能选到 agy、没有提醒
+  assert.equal(lib.pickRoute(cfg, [], "read").choice?.provider, "agy");
+  assert.equal(lib.loginReminder(cfg), "");
+  // 派单时 agy 报登录失效
+  q.markAgyLoginRequired(dir, "Authentication required. Please visit the URL to log in:\n  https://accounts.google.com/o/oauth2/auth?x");
+  assert.equal(lib.pickRoute(cfg, [], "read").choice, null);
+  assert.match(lib.loginReminder(cfg), /Antigravity Pro.*登录已失效.*在终端运行 agy 重新登录/);
+  assert.match(lib.compactStatus(cfg, []), /agy：登录已失效（不要派给它）/);
+  // 额度查询也不再自动跑
+  assert.equal(shouldProbeAgy(q.loadCache(dir).sources.agy, Date.now() + 86400_000, false), false);
+  delete process.env.AI_RELAY_HOME;
+});
+
+test("派给 agy 的任务报登录失效：记为登录失效", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-run-"));
+  const { executeJob } = await import("./relay.mjs");
+  const q = await import("./quota.mjs");
+  fs.mkdirSync(path.join(dir, "jobs"), { recursive: true });
+  fs.mkdirSync(path.join(dir, "wt"), { recursive: true });
+  const cfg = { providers: { agy: { label: "Antigravity Pro", cli: { bin: "agy" }, quota: { provider: "antigravity", pools: ["gemini"] } } } };
+  const job = { id: "job-login", provider: "agy", cwd: path.join(dir, "wt"), task: "x", role: "read", write: false, startedAt: new Date().toISOString(), _jobsDir: path.join(dir, "jobs") };
+  const res = await executeJob(job, {
+    cfg,
+    bin: process.execPath,
+    args: ["-e", "process.stderr.write('Authentication required. Please visit the URL to log in:\\n  https://accounts.google.com/o/oauth2/auth?x'); process.exit(1)"],
+    stateDir: dir,
+    jobsDir: path.join(dir, "jobs"),
+    agyDir: path.join(dir, "conv"),
+    checkIntervalMs: 50,
+  });
+  assert.notEqual(res.status, "done");
+  assert.equal(res.loginRequired, true);
+  assert.deepEqual([...q.loginRequiredProviders(dir)], ["antigravity"]);
+});

@@ -11,7 +11,7 @@
     {
       "name": "ai-relay",
       "description": "Claude as the manager: dispatches work to Codex, Antigravity (Gemini) and Grok through their official CLIs, routed by quality and remaining quota",
-      "version": "0.30.3",
+      "version": "0.30.4",
       "author": {
         "name": "zhangming"
       },

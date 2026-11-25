@@ -5,7 +5,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { execFile, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { cachedRows } from "./quota.mjs";
+import { cachedRows, loginRequiredProviders } from "./quota.mjs";
 
 export const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const RELAY_SCRIPT = path.join(PLUGIN_ROOT, "scripts", "relay.mjs");
@@ -650,6 +650,20 @@ export function isEnabled(prov) {
   return !!prov && (prov.self || prov.enabled !== false);
 }
 
+// 登录失效的厂商（agy 登录失效时碰一次就弹一个浏览器登录页）：选人、派单都当作不可用
+export function loginBlocked(prov, blocked = loginRequiredProviders(STATE_DIR)) {
+  return !!prov?.quota?.provider && blocked.has(prov.quota.provider);
+}
+
+// 给主模型的登录提醒：有厂商登录失效时，每条消息都让主模型提醒用户去登录
+export function loginReminder(cfg, blocked = loginRequiredProviders(STATE_DIR)) {
+  const names = Object.entries(cfg.providers || {})
+    .filter(([, p]) => isEnabled(p) && loginBlocked(p, blocked))
+    .map(([name, p]) => `${p.label || name}（${p.cli?.bin || name}）`);
+  if (!names.length) return "";
+  return `⚠️ [ai-relay] ${names.join("、")} 登录已失效，已暂停派单和额度查询。本轮回复开头先提醒用户：在终端运行 ${names.map((n) => n.match(/（(.*)）/)[1]).join("、")} 重新登录；用户说登好后，你运行 relay quota --force 恢复。`;
+}
+
 export function providerPools(prov) {
   if (prov.quota?.pools) return prov.quota.pools;
   return Object.keys(prov.pools || {});
@@ -729,12 +743,13 @@ export function pickRoute(cfg, rows, role, { only } = {}) {
   if (!route) throw new Error(`未知角色 ${role}，可选：${Object.keys(cfg.routes || {}).join(", ")}`);
   const tiers = { ok: [], unknown: [], low: [] };
   const skipped = [];
+  const blocked = loginRequiredProviders(STATE_DIR);
   for (const entry of route) {
     const [provName, pool, model] = entry.split(":");
     if (only && provName !== only) continue;
     const prov = cfg.providers[provName];
     // 已停用的厂商不参与路由
-    if (!isEnabled(prov)) continue;
+    if (!isEnabled(prov) || loginBlocked(prov, blocked)) continue;
     const st = poolStatus(cfg, rows, prov.quota.provider, pool);
     const cand = { provider: provName, pool, model, via: prov.via, status: st };
     if (st.level === "blocked") skipped.push(cand);
@@ -789,9 +804,14 @@ export function expiringHint(st, now = Date.now()) {
 export function compactStatus(cfg, rows) {
   if (!rows) return "额度数据暂缺（打开 ai-relay 面板或运行 relay quota 刷新）";
   const parts = [];
+  const blocked = loginRequiredProviders(STATE_DIR);
   for (const [name, prov] of Object.entries(cfg.providers)) {
     if (!isEnabled(prov)) {
       parts.push(`  - ${name}：已停用（不要派给它）`);
+      continue;
+    }
+    if (loginBlocked(prov, blocked)) {
+      parts.push(`  - ${name}：登录已失效（不要派给它）`);
       continue;
     }
     for (const pool of providerPools(prov)) {
