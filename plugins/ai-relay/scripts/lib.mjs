@@ -830,6 +830,14 @@ export function maskSecrets(text) {
     .replace(/Bearer\s+[A-Za-z0-9_.~+/=-]{16,}/g, "Bearer ***");
 }
 
+// 系统自动送进 UserPromptSubmit 的消息：去掉首尾空白后，以 <小写字母和连字符组成的标签名> 开头。
+// 标签可以直接闭合，也可以先带属性再闭合，例如 <task-notification>、<agent-message from="…">。
+const SYSTEM_PROMPT_TAG = /^<[a-z]+(?:-[a-z]+)*(?:\s[^>]*)?>/;
+
+export function isSystemPrompt(text) {
+  return SYSTEM_PROMPT_TAG.test(String(text ?? "").trim());
+}
+
 // 记录每个会话最近一条用户输入，供 PreToolUse 钩子判断用户是否点名
 export function savePrompt(sessionId, prompt) {
   if (!sessionId) return;

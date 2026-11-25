@@ -417,6 +417,11 @@ Codex is not started by `relay run`. It goes through the official Codex plugin, 
 
 Versions are listed as "ai-relay / panel ai-relay-status".
 
+### 0.30.1 / 0.29.0 · 2026-11-25
+
+**Background notifications no longer reset the round**
+- Task notifications, sub-agent messages and other system messages are no longer treated as a new round: the user's prompt, the round's division decision, hand-written line count and read count are kept.
+
 ### 0.30.0 / 0.29.0 · 2026-11-24
 
 **Gemini 4 Carbon, panel and discovery fixes**

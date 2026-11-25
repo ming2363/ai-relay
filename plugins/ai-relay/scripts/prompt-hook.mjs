@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import {
   RELAY_SCRIPT, ULW_RE, MENTION_RE, loadConfig, getMode, getModeSeen, setModeSeen, readQuotaRows, claudeThrottle,
-  compactStatus, savePrompt, fmtPct, mentionsProvider,
+  compactStatus, savePrompt, isSystemPrompt, fmtPct, mentionsProvider,
 } from "./lib.mjs";
 
 function writeContext(additionalContext) {
@@ -14,8 +14,10 @@ function writeContext(additionalContext) {
 function main() {
   const input = JSON.parse(fs.readFileSync(0, "utf8") || "{}");
   const prompt = String(input.prompt || "");
-  // 无论什么模式都先记下这条提问，供 PreToolUse 判断用户有没有点名
-  savePrompt(input.session_id, prompt);
+  // 后台任务通知等系统消息不是用户新开的一轮，不覆盖用户原话、也不重置本轮分工和计数
+  if (!isSystemPrompt(prompt)) {
+    savePrompt(input.session_id, prompt);
+  }
 
   const mode = getMode();
   // 先读上次注入时的模式，再写下这次的。提前 return 的分支也要记下，否则切模式后对不上
