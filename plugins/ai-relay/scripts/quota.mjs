@@ -14,6 +14,21 @@ import { withFileLock, writeFileAtomic } from "./lib.mjs";
 
 const CODEX_TAIL_BYTES = 256 * 1024;
 const AGY_MIN_INTERVAL_MS = 5 * 60_000;
+// agy 登录失效时，每跑一次 /usage 它都会在浏览器里弹一个 Google 登录页。
+// 所以登录失效后不再自动重查，只有 `relay quota --force`（用户重新登录 agy 之后）才会再查
+const AGY_AUTH_RE = /authentication required|log ?in|oauth2|accounts\.google\.com/i;
+
+export function isAgyAuthError(msg) {
+  return AGY_AUTH_RE.test(String(msg || ""));
+}
+
+// 是否该现在去查 agy：距上次尝试（成功或失败都算）不足 5 分钟不查；登录失效后只认 --force
+export function shouldProbeAgy(src, now, force) {
+  if (force) return true;
+  if (src?.authRequired || (src?.error && isAgyAuthError(src.error))) return false;
+  const last = Math.max(src?.attemptAt || 0, src?.fetchedAt || 0);
+  return now - last >= AGY_MIN_INTERVAL_MS;
+}
 const AGY_GROUPS = { "Gemini Models": "gemini", "Claude and GPT models": "claude-gpt", "Gemini 4 Argon": "gemini-argon" };
 
 export function cachePath(stateDir) {
@@ -314,20 +329,17 @@ export function refreshCache({ stateDir, claudeLimits, agyBin, force = false, no
   } catch (e) {
     updates.codex = { ok: false, error: String(e.message || e).slice(0, 200) };
   }
-  if (agyBin) {
-    const last = initial.sources?.agy?.fetchedAt || 0;
-    // agy 每次要起进程，5 分钟内不重复查
-    if (force || now - last >= AGY_MIN_INTERVAL_MS || initial.sources?.agy?.error) {
-      fs.mkdirSync(path.join(stateDir, "probe"), { recursive: true });
-      try {
-        const rows = agyRows(agyBin, path.join(stateDir, "probe"), now);
-        if (rows !== null) updates.agy = { ok: true, rows };
-      } catch (e) {
-        updates.agy = { ok: false, error: String(e.message || e).slice(0, 200) };
-      }
+  fs.mkdirSync(stateDir, { recursive: true });
+  if (agyBin && shouldProbeAgy(initial.sources?.agy, now, force) && claimAgyProbe(stateDir, now, force)) {
+    fs.mkdirSync(path.join(stateDir, "probe"), { recursive: true });
+    try {
+      const rows = agyRows(agyBin, path.join(stateDir, "probe"), now);
+      if (rows !== null) updates.agy = { ok: true, rows };
+    } catch (e) {
+      const error = String(e.message || e).slice(0, 200);
+      updates.agy = { ok: false, error, authRequired: isAgyAuthError(error) };
     }
   }
-  fs.mkdirSync(stateDir, { recursive: true });
   const file = cachePath(stateDir);
   return withFileLock(file, () => {
     const cache = loadCache(stateDir);
@@ -343,14 +355,35 @@ export function refreshCache({ stateDir, claudeLimits, agyBin, force = false, no
           const kept = (prev.rows || []).filter((r) => !got.has(r.window_key));
           rows = [...rows, ...kept];
         }
-        cache.sources[name] = { rows, fetchedAt: now, error: null };
+        cache.sources[name] = { rows, fetchedAt: now, error: null, ...(name === "agy" ? { attemptAt: now } : {}) };
       } else {
         cache.sources[name] = { rows: prev.rows || [], fetchedAt: prev.fetchedAt || null, error: u.error };
+        if (name === "agy") Object.assign(cache.sources[name], { attemptAt: now, authRequired: !!u.authRequired });
       }
     }
     writeFileAtomic(file, JSON.stringify(cache, null, 2));
     return cache;
   });
+}
+
+// 多个会话同一时刻刷新时，只让一个去跑 agy：在锁里复核并写下本次尝试时间，抢到才查
+function claimAgyProbe(stateDir, now, force) {
+  const file = cachePath(stateDir);
+  try {
+    return withFileLock(file, () => {
+      const cache = loadCache(stateDir);
+      if (!cache.sources || typeof cache.sources !== "object") cache.sources = {};
+      const src = cache.sources.agy || { rows: [], fetchedAt: null, error: null };
+      if (!shouldProbeAgy(src, now, force)) return false;
+      // --force 也要防同一秒内多个会话一起查
+      if (force && src.attemptAt && now - src.attemptAt < 10_000) return false;
+      cache.sources.agy = { ...src, attemptAt: now };
+      writeFileAtomic(file, JSON.stringify(cache, null, 2));
+      return true;
+    });
+  } catch {
+    return false;
+  }
 }
 
 // 缓存中的所有额度行

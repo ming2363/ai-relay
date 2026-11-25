@@ -1319,7 +1319,8 @@ async function cmdQuota(opts) {
   if (opts.json) return console.log(JSON.stringify(cache.sources, null, 2));
   const name = { claude: "Claude（插件读取当前会话）", codex: "Codex（官方 app-server 实时额度，失败时用本地会话记录）", agy: "Antigravity（agy /usage）", grok: "Grok（grok.com 计费接口，用 CLI 登录令牌）" };
   for (const [k, v] of Object.entries(cache.sources)) {
-    console.log(`${name[k] || k}：${v.error ? `失败 — ${v.error}` : `${v.rows.length} 个窗口`}，更新于 ${v.fetchedAt ? fmtTime(v.fetchedAt) : "从未"}`);
+    const err = k === "agy" && v.authRequired ? "agy 登录已失效，重新登录后运行 relay quota --force" : v.error;
+    console.log(`${name[k] || k}：${err ? `失败 — ${err}` : `${v.rows.length} 个窗口`}，更新于 ${v.fetchedAt ? fmtTime(v.fetchedAt) : "从未"}`);
   }
   if (!cache.sources.claude) console.log("Claude：等状态插件刷新（打开桌面端或终端会话即可）");
   if (cache.sources.grok?.error) console.log("Grok 自查失败时，装了 AIQuota5h 会沿用它的数据");
