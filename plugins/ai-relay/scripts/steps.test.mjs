@@ -125,7 +125,7 @@ test("scoreRoute：困难任务和其他情况忽略 steps，行为不变", () =
   assert.equal(both.choice.provider, "midp");
 });
 
-test("scoreRoute：中等任务带 steps 时，分组为 够档位中档 → 够档位强档 → 放宽轻档，read 下强档优先于轻档", () => {
+test("scoreRoute：中等任务带 steps 时，分组为 够档位（强档与中档同组按综合分） → 放宽轻档，read 下够档位优先于轻档", () => {
   const cfg = {
     minRemaining: 0.15,
     lowRemaining: 0.3,
@@ -164,11 +164,11 @@ test("scoreRoute：中等任务带 steps 时，分组为 够档位中档 → 够
     row("grok", "supergrok-weekly", 0.9),
   ];
 
-  // 1) 三档都在时：中档 Grok → 强档 Argon / Neon → 放宽轻档 Hydrogen
+  // 1) 三档都在时：够档位同组按综合分 Argon (0.85) → Neon (0.8) → Grok (0.7)，最后才是放宽轻档 Hydrogen
   const all = scoreRoute(cfg, fullRows, "read", { now: NOW, level: "medium", steps: true });
   const tiers = [all.choice, ...all.alternatives].map((c) => c.tier);
-  assert.deepEqual(tiers, ["mid", "strong", "strong", "light"]);
-  assert.equal(all.choice.provider, "grok");
+  assert.deepEqual(tiers, ["strong", "strong", "mid", "light"]);
+  assert.equal(all.choice.model, "gemini-4-argon-high");
   assert.equal(all.alternatives.at(-1).model, "gemini-4-hydrogen-xhigh");
 
   // 2) 中档停用、只有强档和轻档时（真实 read 在线场景）：强档优先于轻档，绝不因 steps 反选轻档

@@ -417,6 +417,13 @@ Codex is not started by `relay run`. It goes through the official Codex plugin, 
 
 Versions are listed as "ai-relay / panel ai-relay-status".
 
+### 0.30.2 / 0.29.0 · 2026-11-25
+
+**Medium-task ranking and stale-pace fixes**
+- Medium tasks no longer put mid-tier subscription models in a hard group ahead of strong-tier ones: non-reserved mid and strong subscription candidates now compete in the same group by composite score.
+- Stale quota windows are skipped when calculating pace and expiring-soon urgency, preventing frozen balances from producing inflated pace as the reset time approaches.
+- Within the 5% near-tie band, pace breaks ties when both paces are known; when only one is known, it wins only if positive (quota to spend before reset), otherwise ranking falls back to the composite score instead of treating an unknown pace as `0`.
+
 ### 0.30.1 / 0.29.0 · 2026-11-25
 
 **Background notifications no longer reset the round**

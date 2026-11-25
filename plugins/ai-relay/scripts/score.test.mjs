@@ -805,3 +805,64 @@ test("27. calcReliability 跳过 quotaExhausted === true 的历史记录，不�
   const resMixed = scoreRoute(cfg, rows, "implement", { now, history: mixed });
   assert.equal(resMixed.choice?.parts.reliability, 0.76);
 });
+
+test("28. 中等任务带 steps 与 write 时：低擅长度中档不压过更高分强档，且够档位候选均优先于放宽轻档", () => {
+  const cfg = {
+    minRemaining: 0.15,
+    lowRemaining: 0.3,
+    providers: {
+      agy: {
+        via: "relay",
+        quota: { provider: "antigravity" },
+        pools: {
+          "claude-gpt": ["claude-opus-5-5-high", "claude-sonnet-5-5-high"],
+          "gemini-argon": ["gemini-4-argon-high", "gemini-4-argon-medium", "gemini-4-argon-low"],
+          gemini: [
+            "gemini-4-carbon-high",
+            "gemini-4-carbon-medium",
+            "gemini-4-carbon-low",
+            "gemini-4-neon-xhigh",
+            "gemini-4-neon-high",
+            "gemini-4-hydrogen-xhigh",
+          ],
+        },
+      },
+    },
+    routes: {
+      implement: [
+        "agy:gemini-argon:gemini-4-argon-high:0.90",
+        "agy:claude-gpt:claude-sonnet-5-5-high:0.55",
+        "agy:gemini:gemini-4-hydrogen-xhigh:0.40",
+        "agy:gemini:gemini-4-neon-xhigh:0.90",
+        "agy:gemini:gemini-4-carbon-high:0.92",
+      ],
+    },
+  };
+  const now = 1700000000000;
+  const hour = 3600000;
+  const rows = [
+    // Sonnet 所在池额度 100% 满格，但擅长度仅 0.55
+    { provider: "antigravity", pool_id: "claude-gpt", window_key: "5h", remaining_fraction: 1.0, reset_at: now + 3 * hour, allowance: "available", updated_at: now },
+    // Gemini 池额度充裕，轻微负配速 -0.04（远高于保留线）
+    { provider: "antigravity", pool_id: "gemini", window_key: "5h", remaining_fraction: 0.96, reset_at: now + 5 * hour, allowance: "available", updated_at: now },
+    { provider: "antigravity", pool_id: "gemini", window_key: "weekly", remaining_fraction: 0.92, reset_at: now + 161.28 * hour, allowance: "available", updated_at: now },
+    // Argon 池为过期周窗口数据（updated_at 在 1 小时前）
+    { provider: "antigravity", pool_id: "gemini-argon", window_key: "weekly", remaining_fraction: 0.668, reset_at: now + 79 * hour, allowance: "available", updated_at: now - hour },
+  ];
+
+  const res = scoreRoute(cfg, rows, "implement", { now, level: "medium", steps: true, write: true });
+  const ordered = [res.choice, ...res.alternatives];
+  const models = ordered.map((c) => c.model);
+
+  assert.equal(res.choice?.model, "gemini-4-carbon-high");
+  for (const alt of res.alternatives) {
+    assert.ok(res.choice.score >= alt.score, `首选分 ${res.choice.score} 应不低于备选 ${alt.model} (${alt.score})`);
+  }
+  const sonnetIdx = models.indexOf("claude-sonnet-5-5-high");
+  const hydrogenIdx = models.indexOf("gemini-4-hydrogen-xhigh");
+  assert.ok(models.indexOf("gemini-4-carbon-high") < sonnetIdx);
+  assert.ok(models.indexOf("gemini-4-neon-xhigh") < sonnetIdx);
+  assert.ok(models.indexOf("gemini-4-argon-high") < sonnetIdx);
+  // 够档位候选（强档与中档）全部排在因 --steps 放宽进来的轻档之前
+  assert.equal(hydrogenIdx, models.length - 1);
+});

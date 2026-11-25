@@ -64,7 +64,7 @@ export const LEVEL_TEXT = { easy: "简单", medium: "中等", hard: "困难" };
 const LEVEL_RULES = {
   // 擅长度权重略高于经济性：擅长度差得不多（如 0.8 对 1.0）时轻档胜出，差一大截（如 0.4 对 0.9）时擅长的模型胜出
   easy: { minTier: "light", weights: { fit: 2, reliability: 2, quota: 2, speed: 0.5, load: 0.5, cost: 1.5 }, note: "优先额度充足、便宜的模型" },
-  medium: { minTier: "mid", preferTier: "mid", weights: null, note: "中档以上按综合分" },
+  medium: { minTier: "mid", weights: null, note: "中档以上按综合分" },
   hard: { minTier: "strong", weights: { fit: 3, reliability: 3, quota: 0.1, speed: 0.25, load: 0.25 }, note: "只派强档，看擅长和可靠" },
 };
 
@@ -210,13 +210,13 @@ function calcFit(index, explicitFit) {
   return Math.max(0.4, 1 - 0.15 * index);
 }
 
-// 配速值：对每个有剩余比例和重置时间的窗口算 remaining - clamp(距重置小时数 / windowTotalHours(key), 0, 1)，取最小值；算不出返回 null
+// 配速值：对每个未过期、有剩余比例和重置时间的窗口算 remaining - clamp(距重置小时数 / windowTotalHours(key), 0, 1)，取最小值；算不出返回 null
 export function paceOf(status, now = Date.now()) {
   let minPace = null;
   for (const w of status?.windows || []) {
     if (w.remaining === null || w.remaining === undefined) continue;
     if (w.resetAt === null || w.resetAt === undefined) continue;
-    if (w.resetPassed) continue;
+    if (w.resetPassed || w.stale) continue;
     const totalHours = windowTotalHours(w.key);
     const hoursUntilReset = Math.max(0, (w.resetAt - now) / 3_600_000);
     const cycleRemaining = clamp(hoursUntilReset / totalHours, 0, 1);
@@ -229,7 +229,7 @@ export function paceOf(status, now = Date.now()) {
 // 2. quota 额度：
 //   - level 为 unknown: 0.8
 //   - 配速不为 null: clamp(0.8 + 0.6 * pace, 0.5, 1.4)，配速不为负时不打七折
-//   - 配速为 null: binding = status.remaining; expiring = 各窗口中 remaining * clamp(1 - 距重置小时数 / 窗口总小时数, 0, 1) 的最大值
+//   - 配速为 null: binding = status.remaining; expiring = 各未过期窗口中 remaining * clamp(1 - 距重置小时数 / 窗口总小时数, 0, 1) 的最大值
 //     quota = 0.6 + 0.4 * binding + 0.4 * expiring; level 为 low 时再乘 0.7
 function calcQuota(status, now) {
   if (status.level === "unknown") {
@@ -244,7 +244,7 @@ function calcQuota(status, now) {
   for (const w of status.windows || []) {
     if (w.remaining === null || w.remaining === undefined) continue;
     if (w.resetAt === null || w.resetAt === undefined) continue;
-    if (w.resetPassed) continue;
+    if (w.resetPassed || w.stale) continue;
     const totalHours = windowTotalHours(w.key);
     const hoursUntilReset = Math.max(0, (w.resetAt - now) / 3_600_000);
     const val = w.remaining * clamp(1 - hoursUntilReset / totalHours, 0, 1);
@@ -380,7 +380,7 @@ function formatReason(parts, score, status, now, running = 0) {
   const urgent = [];
   for (const w of status.windows || []) {
     if (w.remaining === null || w.remaining === undefined || w.remaining < 0.5) continue;
-    if (w.resetAt === null || w.resetAt === undefined || w.resetPassed) continue;
+    if (w.resetAt === null || w.resetAt === undefined || w.resetPassed || w.stale) continue;
     const totalHours = windowTotalHours(w.key);
     const hoursUntilReset = (w.resetAt - now) / 3_600_000;
     if (hoursUntilReset > 0 && hoursUntilReset < totalHours / 3) {
@@ -609,27 +609,25 @@ export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now
     let group = 0;
     let demoted;
     if (level === "medium") {
-      // 中等任务先保够档位，再兜底放宽进来的轻档；同档位梯队内会员（含保留池）优先于按量计费
-      // 够档位：0 会员中档 -> 1 会员强档 -> 2 保留会员 -> 3 按量够档位
-      // 放宽轻档：4 会员轻档 -> 5 保留会员轻档 -> 6 按量轻档
+      // 中等任务先保够档位，再兜底放宽进来的轻档；够档位的会员中档与强档同组按综合分竞争，会员（含保留池）优先于按量计费
+      // 够档位：0 会员够档位 -> 1 保留会员 -> 2 按量够档位
+      // 放宽轻档：3 会员轻档 -> 4 保留会员轻档 -> 5 按量轻档
       if (belowMinTier) {
         if (metered) {
-          group = 6;
+          group = 5;
           demoted = "按量计费，会员候选优先";
         } else if (reserved) {
-          group = 5;
+          group = 4;
           demoted = "用得比进度快，留给困难任务";
         } else {
-          group = 4;
+          group = 3;
         }
       } else if (metered) {
-        group = 3;
+        group = 2;
         demoted = "按量计费，会员候选优先";
       } else if (reserved) {
-        group = 2;
-        demoted = "用得比进度快，留给困难任务";
-      } else if (tier !== (rule?.preferTier || "mid")) {
         group = 1;
+        demoted = "用得比进度快，留给困难任务";
       }
     } else if (level === "easy") {
       // 简单任务：0 会员 -> 1 保留会员 -> 2 按量计费
@@ -685,9 +683,15 @@ export function scoreRoute(cfg, rows, role, { only, history = [], now = Date.now
       const aInBand = top > 0 && (top - a._rawScore) / top <= tieBand + 1e-9;
       const bInBand = top > 0 && (top - b._rawScore) / top <= tieBand + 1e-9;
       if (aInBand && bInBand) {
-        const pa = a._rawPace ?? 0;
-        const pb = b._rawPace ?? 0;
-        if (Math.abs(pb - pa) > 1e-9) return pb - pa;
+        const pa = a._rawPace ?? null;
+        const pb = b._rawPace ?? null;
+        if (pa !== null && pb !== null) {
+          if (Math.abs(pb - pa) > 1e-9) return pb - pa;
+        } else if (pa !== null || pb !== null) {
+          // 只有一方算得出配速：它额度富余要过期（配速为正）才优先；配速为负或另一方未知时按综合分比，不把未知当 0
+          const known = pa !== null ? pa : pb;
+          if (known > 1e-9) return pa !== null ? -1 : 1;
+        }
       }
     }
     if (Math.abs(b._rawScore - a._rawScore) > 1e-12) return b._rawScore - a._rawScore;

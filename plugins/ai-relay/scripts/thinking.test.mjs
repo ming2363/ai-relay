@@ -344,11 +344,11 @@ test("relay pick：默认选档、--effort 覆盖、困难下限、--write 上�
     cfg.providers.grok.enabled = false;
   });
   try {
-    // 1. implement + 中等 → 默认最高档（claude-sonnet-5-5-high，且备选 Neon 为 gemini-4-neon-xhigh），输出「思考：最高」
+    // 1. implement + 中等 → 默认最高档（首选综合分最高的 gemini-4-carbon-high，且备选 Neon 为 gemini-4-neon-xhigh），输出「思考：最高」
     const implMed = runRelay(home, ["pick", "implement", "--level", "中等"]);
     assert.equal(implMed.status, 0, implMed.stderr + implMed.stdout);
     assert.match(implMed.stdout, /思考：最高/);
-    assert.match(implMed.stdout, /→ agy \/ claude-gpt \/ claude-sonnet-5-5-high/);
+    assert.match(implMed.stdout, /→ agy \/ gemini \/ gemini-4-carbon-high/);
     assert.match(implMed.stdout, /gemini-4-neon-xhigh/);
     const implJson = JSON.parse(runRelay(home, ["pick", "implement", "--level", "中等", "--json"]).stdout);
     assert.equal(implJson.effort, "xhigh");

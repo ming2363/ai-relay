@@ -1,4 +1,4 @@
-// 配速打分、保留规则、近似同分排序、中等任务优先中档、会员优先按量兜底单元测试
+// 配速打分、保留规则、近似同分排序、中等任务够档位同组竞争、会员优先按量兜底单元测试
 import test from "node:test";
 import assert from "node:assert/strict";
 import { paceOf, scoreRoute } from "./score.mjs";
@@ -135,7 +135,7 @@ test("4. 近似同分按配速排：分数差 3% 按配速高到低排，差 10%
   assert.equal(res10pct.alternatives[0].provider, "provB");
 });
 
-test("5. 中等任务分组排序：会员中档 -> 会员强档 -> 保留池 -> 按量计费；demoted 文字写入字段与 reason", () => {
+test("5. 中等任务分组排序：会员够档位（强档与中档同组按综合分） -> 保留池 -> 按量计费；demoted 文字写入字段与 reason", () => {
   const cfg = {
     minRemaining: 0.15,
     lowRemaining: 0.3,
@@ -169,10 +169,10 @@ test("5. 中等任务分组排序：会员中档 -> 会员强档 -> 保留池 ->
     { provider: "reservedProv", pool_id: "pRes", window_key: "5h", remaining_fraction: 0.3, reset_at: NOW + 4.0 * HOUR, allowance: "available", updated_at: NOW },
   ];
 
-  // 1) 会员中档和强档都可用时：会员中档 -> 会员强档 -> 保留会员池 -> 按量计费
+  // 1) 会员中档和强档都可用时：同在够档位会员组按综合分竞争（strongProv 1.0 > midProv 0.8） -> 保留会员池 -> 按量计费
   const res1 = scoreRoute(cfg, baseRows, "implement", { now: NOW, level: "medium" });
   const order1 = [res1.choice, ...res1.alternatives].map((c) => c.provider);
-  assert.deepEqual(order1, ["midProv", "strongProv", "reservedProv", "meteredProv"]);
+  assert.deepEqual(order1, ["strongProv", "midProv", "reservedProv", "meteredProv"]);
   assert.equal(res1.choice.demoted, undefined);
   assert.equal(res1.alternatives[0].demoted, undefined);
   assert.equal(res1.alternatives[1].demoted, "用得比进度快，留给困难任务");
@@ -323,4 +323,98 @@ test("7. reserved 仅在池存在强档模型且剩余 < 0.5 时触发：纯中�
   assert.equal(res64.choice.pool, "claude-gpt");
   assert.equal(res64.choice.demoted, undefined);
   assert.ok(res64.choice.pace < -0.15);
+});
+
+test("8. stale 过期窗口：paceOf 返回 null，不产生虚高配速或快到期加分，不反超新鲜高分候选", () => {
+  // 1) 单一 stale 窗口返回 null；混合新鲜与 stale 窗口时只算新鲜窗口
+  assert.equal(
+    paceOf({ windows: [{ key: "weekly", remaining: 0.668, resetAt: NOW + 79 * HOUR, resetPassed: false, stale: true }] }, NOW),
+    null,
+  );
+  const mixedSt = {
+    windows: [
+      { key: "5h", remaining: 0.96, resetAt: NOW + 5 * HOUR, resetPassed: false, stale: false },
+      { key: "weekly", remaining: 0.2, resetAt: NOW + 160 * HOUR, resetPassed: false, stale: true },
+    ],
+  };
+  assert.ok(Math.abs(paceOf(mixedSt, NOW) - -0.04) < 1e-6);
+
+  // 2) scoreRoute：过期窗口即使距重置很近也不算虚高正配速、不加 expiring、不拼快到期文案，更不能反超新鲜高分候选
+  const cfg = {
+    minRemaining: 0.15,
+    lowRemaining: 0.3,
+    staleMinutes: 15,
+    providers: {
+      agy: {
+        via: "relay",
+        quota: { provider: "antigravity" },
+        pools: {
+          gemini: ["gemini-4-carbon-high"],
+          "gemini-argon": ["gemini-4-argon-high"],
+        },
+      },
+    },
+    routes: {
+      implement: [
+        "agy:gemini-argon:gemini-4-argon-high:0.90",
+        "agy:gemini:gemini-4-carbon-high:0.92",
+      ],
+    },
+  };
+  const rows = [
+    // gemini 新鲜数据：5h 剩 96%（距重置 5h -> pace = -0.04），周剩 92%（距重置 161.28h -> pace = -0.04）
+    { provider: "antigravity", pool_id: "gemini", window_key: "5h", remaining_fraction: 0.96, reset_at: NOW + 5 * HOUR, allowance: "available", updated_at: NOW },
+    { provider: "antigravity", pool_id: "gemini", window_key: "weekly", remaining_fraction: 0.92, reset_at: NOW + 161.28 * HOUR, allowance: "available", updated_at: NOW },
+    // gemini-argon 过期数据（1 小时前刷新 > 15 分钟）：周剩 70%，距重置仅 24h（< 168/3，若不过滤会算出虚高正配速 +0.557 与快到期紧迫度）
+    { provider: "antigravity", pool_id: "gemini-argon", window_key: "weekly", remaining_fraction: 0.70, reset_at: NOW + 24 * HOUR, allowance: "available", updated_at: NOW - HOUR },
+  ];
+
+  const stArgon = poolStatus(cfg, rows, "antigravity", "gemini-argon", NOW);
+  assert.equal(stArgon.stale, true);
+  assert.equal(paceOf(stArgon, NOW), null);
+
+  const res = scoreRoute(cfg, rows, "implement", { now: NOW, level: "medium" });
+  assert.equal(res.choice.model, "gemini-4-carbon-high");
+  assert.equal(res.alternatives[0].model, "gemini-4-argon-high");
+  assert.equal(res.alternatives[0].pace, null);
+  // quota 走 null 回退且 expiring = 0：0.6 + 0.4 * 0.70 = 0.88
+  assert.equal(res.alternatives[0].parts.quota, 0.88);
+  assert.doesNotMatch(res.alternatives[0].reason, /小时后重置，优先用掉/);
+});
+
+test("9. 同组 5% 近似同分带内：一方 pace === null、另一方为轻微负配速时按原始分选高分候选，不把 null 当 0", () => {
+  const makeCfg = (routes) => ({
+    minRemaining: 0.15,
+    lowRemaining: 0.3,
+    modelTiers: {
+      "highScore:*": "strong",
+      "nullPace:*": "strong",
+    },
+    providers: {
+      highScore: { via: "relay", quota: { provider: "highScore" } },
+      nullPace: { via: "relay", quota: { provider: "nullPace" } },
+    },
+    routes: { implement: routes },
+  });
+
+  // highScore: fit 0.92，5h 剩 96% 刚进入新周期（距重置 5h） -> pace = -0.04（高于保留线 -0.15，未保留）
+  // nullPace: fit 0.90，5h 剩 75% 无重置时间 -> pace = null；两者综合分差不到 1%（<= 5% tieBand）
+  const rows = [
+    { provider: "highScore", pool_id: "p1", window_key: "5h", remaining_fraction: 0.96, reset_at: NOW + 5 * HOUR, allowance: "available", updated_at: NOW },
+    { provider: "nullPace", pool_id: "p2", window_key: "5h", remaining_fraction: 0.75, reset_at: null, allowance: "available", updated_at: NOW },
+  ];
+
+  for (const routes of [
+    ["highScore:p1:m1:0.92", "nullPace:p2:m2:0.90"],
+    ["nullPace:p2:m2:0.90", "highScore:p1:m1:0.92"],
+  ]) {
+    const res = scoreRoute(makeCfg(routes), rows, "implement", { now: NOW, level: "medium" });
+    assert.equal(res.choice.provider, "highScore");
+    assert.equal(res.choice.pace, -0.04);
+    assert.equal(res.choice.demoted, undefined);
+    assert.equal(res.alternatives[0].provider, "nullPace");
+    assert.equal(res.alternatives[0].pace, null);
+    const diffRatio = (res.choice.score - res.alternatives[0].score) / res.choice.score;
+    assert.ok(diffRatio >= 0 && diffRatio <= 0.05, `预期分差在 5% 同分带内，实际 ${diffRatio}`);
+  }
 });
