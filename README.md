@@ -417,6 +417,11 @@ Codex is not started by `relay run`. It goes through the official Codex plugin, 
 
 Versions are listed as "ai-relay / panel ai-relay-status".
 
+### 0.30.5 / 0.29.0 · 2026-11-27
+
+**Preset records GLM-5.4 vision**
+- The custom-endpoint preset `knownModelCaps` now includes `glm-5.4` (vision: true): `provider models <name> --add glm-5.4` turns vision on automatically, so `provider caps ... vision on` is no longer needed.
+
 ### 0.30.2 / 0.29.0 · 2026-11-25
 
 **Medium-task ranking and stale-pace fixes**

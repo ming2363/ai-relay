@@ -415,6 +415,11 @@ Codex 不由 `relay run` 启动，而是走官方 Codex 插件。主管要用 Ag
 
 版本号格式为「ai-relay / 面板 ai-relay-status」。
 
+### 0.30.5 / 0.29.0 · 2026-11-27
+
+**预设收录 GLM-5.4 的看图能力**
+- 自定义接口预设 `knownModelCaps` 新增 `glm-5.4`（vision: true）：用 `provider models <厂商> --add glm-5.4` 启用时自动带上识图，不必再手动 `provider caps ... vision on`。
+
 ### 0.30.2 / 0.29.0 · 2026-11-25
 
 **修复中等任务选人与过期额度配速排序**

@@ -146,7 +146,8 @@
       "qwen3.8-max": { "vision": true },
       "kimi-k3.1-pro": { "vision": true },
       "doubao-seed-2-0-pro-260215": { "vision": true },
-      "deepseek-v4.1-flash-1017": { "vision": true }
+      "deepseek-v4.1-flash-1017": { "vision": true },
+      "glm-5.4": { "vision": true }
     },
     "modelList": {
       "format": "openai-http"
