@@ -200,3 +200,35 @@ test("Codex 额度回退读本地会话日志时保留旧快照的 updated_at，
     fs.rmSync(stateDir, { recursive: true, force: true });
   }
 });
+
+test("拉起 codex app-server 时关掉插件，避免在 ~/.codex/.tmp 遗留 git-* 临时目录", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const { fileURLToPath } = await import("node:url");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-relay-fake-codex-"));
+  try {
+    const argsFile = path.join(dir, "args.json");
+    const fake = path.join(dir, "codex");
+    // 假 codex：记下启动参数，按 JSON-RPC 回 initialize 和 rateLimits
+    fs.writeFileSync(fake, `#!${process.execPath}
+require("fs").writeFileSync(${JSON.stringify(argsFile)}, JSON.stringify(process.argv.slice(2)));
+let buf = "";
+process.stdin.on("data", (c) => {
+  buf += c;
+  let i;
+  while ((i = buf.indexOf("\\n")) >= 0) {
+    const m = JSON.parse(buf.slice(0, i));
+    buf = buf.slice(i + 1);
+    if (m.id === 1) process.stdout.write(JSON.stringify({ id: 1, result: {} }) + "\\n");
+    if (m.id === 2) process.stdout.write(JSON.stringify({ id: 2, result: { rateLimits: { limitId: "codex", primary: { usedPercent: 10, windowDurationMins: 300, resetsAt: 1 } } } }) + "\\n");
+  }
+});
+`);
+    fs.chmodSync(fake, 0o755);
+    const script = fileURLToPath(new URL("./quota.mjs", import.meta.url));
+    const res = spawnSync(process.execPath, [script, "--codex-live", fake], { encoding: "utf8", timeout: 15_000 });
+    assert.equal(JSON.parse(res.stdout.trim()).ok, true);
+    assert.deepEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["app-server", "-c", "features.plugins=false"]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

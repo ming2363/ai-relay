@@ -417,6 +417,11 @@ Codex is not started by `relay run`. It goes through the official Codex plugin, 
 
 Versions are listed as "ai-relay / panel ai-relay-status".
 
+### 0.30.6 / 0.29.0 · 2026-11-28
+
+**Quota probe no longer leaves `git-*` temp dirs in `~/.codex/.tmp`**
+- The Codex live quota probe now starts `codex app-server -c features.plugins=false`. Previously each probe made app-server run `git ls-remote` for git-sourced plugin marketplaces and stopped it before it finished, leaving an empty `git-XXXXXX` directory behind every time (about 4,000 a day).
+
 ### 0.30.5 / 0.29.0 · 2026-11-27
 
 **Preset records GLM-5.4 vision**

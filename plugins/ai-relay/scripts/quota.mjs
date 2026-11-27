@@ -194,7 +194,8 @@ function codexLiveRows(now) {
 
 // 供 `node quota.mjs --codex-live <codex 可执行文件>` 使用，刷新额度时拉起，不给别人当命令
 async function readCodexLiveSnapshot(bin) {
-  const child = spawn(bin, ["app-server"], { stdio: ["pipe", "pipe", "ignore"], detached: true });
+  // 关掉插件：避免 app-server 启动时对 git 插件市场做 ls-remote，被提前结束后在 ~/.codex/.tmp 遗留 git-* 临时目录
+  const child = spawn(bin, ["app-server", "-c", "features.plugins=false"], { stdio: ["pipe", "pipe", "ignore"], detached: true });
   const stop = () => {
     try {
       process.kill(-child.pid, "SIGTERM");

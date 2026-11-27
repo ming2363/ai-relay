@@ -415,6 +415,11 @@ Codex 不由 `relay run` 启动，而是走官方 Codex 插件。主管要用 Ag
 
 版本号格式为「ai-relay / 面板 ai-relay-status」。
 
+### 0.30.6 / 0.29.0 · 2026-11-28
+
+**额度探测不再在 `~/.codex/.tmp` 遗留 `git-*` 临时目录**
+- 实时读取 Codex 额度时改为 `codex app-server -c features.plugins=false`。原先每次探测都会让 app-server 对 git 来源的插件市场执行 `git ls-remote`，没等完成就被结束，每次都留下一个空的 `git-XXXXXX` 目录（每天约 4,000 个）。
+
 ### 0.30.5 / 0.29.0 · 2026-11-27
 
 **预设收录 GLM-5.4 的看图能力**
